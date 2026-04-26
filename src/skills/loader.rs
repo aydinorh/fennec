@@ -32,8 +32,28 @@ impl SkillsLoader {
             return Ok(skills);
         }
 
-        let entries = std::fs::read_dir(path)
-            .with_context(|| format!("reading skills directory: {}", path.display()))?;
+        // A non-existent skills directory is the normal state for a
+        // fresh install before the user has added any skills. Treat it
+        // as "no skills loaded" rather than a hard error — otherwise
+        // the agent fails to start with `~/.fennec/skills not found`,
+        // which is a worse default than starting with an empty skill
+        // catalog. We still propagate other I/O errors (permissions,
+        // I/O failures) so a misconfigured environment is loud.
+        let entries = match std::fs::read_dir(path) {
+            Ok(e) => e,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    "Skills directory {} does not exist; starting with no skills",
+                    path.display()
+                );
+                return Ok(skills);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("reading skills directory: {}", path.display())
+                });
+            }
+        };
 
         for entry in entries {
             let entry = entry?;
