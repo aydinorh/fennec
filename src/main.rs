@@ -29,7 +29,7 @@ use fennec::security::prompt_guard::{GuardAction, PromptGuard};
 use fennec::security::SecretStore;
 use fennec::tools::collective_tools::{CollectiveGetExperienceTool, CollectivePublishTool, CollectiveReportTool, CollectiveSearchTool};
 use fennec::tools::cron_tool::{CronOrigin, CronTool};
-use fennec::tools::files::{ListDirTool, ReadFileTool, WriteFileTool};
+use fennec::tools::files::{GlobTool, GrepTool, ListDirTool, ReadFileTool, WriteFileTool};
 use fennec::tools::memory_tools::{MemoryForgetTool, MemoryRecallTool, MemoryStoreTool};
 use fennec::tools::send_message_tool::SendMessageTool;
 use fennec::tools::shell::ShellTool;
@@ -502,11 +502,20 @@ async fn build_agent(
     // synchronously, capped at 10 tool iterations, with a fresh history.
     // Toolkit is intentionally read-only: anything that writes files,
     // spends money, or touches live systems stays with the main agent.
+    //
+    // We started with just file-read + web-read. That turned out to be
+    // too narrow: the most common delegate pattern is "search the
+    // codebase for X" or "summarize these files matching Y", which
+    // needs grep + glob, and "summarize this paper at <URL>" which
+    // needs pdf_read. All three are strictly read-only by definition.
     let delegate_subagent_tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadFileTool::new()),
         Arc::new(ListDirTool::new()),
+        Arc::new(GlobTool::new()),
+        Arc::new(GrepTool::new()),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new()),
+        Arc::new(PdfReadTool::new(home_dir.join("pdf_cache"))),
     ];
     builder = builder.tool(Box::new(DelegateTool::new(
         Arc::clone(&provider),
