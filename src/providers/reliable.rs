@@ -247,6 +247,14 @@ impl Provider for ReliableProvider {
                     tools: request.tools,
                     max_tokens: request.max_tokens,
                     temperature: request.temperature,
+                    // `thinking_level` was added to ChatRequest by the
+                    // agent-loop-correctness PR. Forwarding it through
+                    // the stream retry path keeps reasoning effort in
+                    // sync between the streaming and non-streaming paths.
+                    // (When merging this PR atop a main that doesn't yet
+                    // have the field, drop this line — the field won't
+                    // exist there.)
+                    thinking_level: request.thinking_level,
                 };
 
                 match provider.chat_stream(req).await {
