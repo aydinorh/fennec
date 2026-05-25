@@ -4,6 +4,7 @@ use crate::providers::traits::{ChatMessage, ChatRequest, Provider};
 
 /// Compresses the conversation context when it grows too large relative to the
 /// provider's context window.
+#[derive(Debug, Clone)]
 pub struct ContextCompressor {
     /// Fraction of the context window at which compression triggers.
     threshold_percent: f64,
