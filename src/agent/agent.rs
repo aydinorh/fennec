@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use crate::collective::search::{CollectiveSearch, RankedExperience, SearchConfidence};
 use crate::memory::decay::apply_time_decay;
 use crate::memory::traits::Memory;
-use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent};
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall};
 use crate::security::prompt_guard::{PromptGuard, ScanResult};
 use crate::tools::traits::{Tool, ToolSpec};
 
@@ -415,51 +415,11 @@ impl Agent {
             assistant_msg.tool_calls = Some(response.tool_calls.clone());
             self.history.push(assistant_msg);
 
-            // Execute each tool call and push results. Combines:
-            //  - plugin lifecycle hooks (pre/post can skip or rewrite),
-            //  - frontend callbacks (start + complete for live UI).
-            for tc in &response.tool_calls {
-                tracing::info!(tool = %tc.name, "Executing tool call");
-                self.callbacks.on_tool_start(super::callbacks::ToolStart {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    preview: preview_for_args(&tc.arguments),
-                    args: tc.arguments.clone(),
-                });
-                let started = std::time::Instant::now();
-                let (final_output, final_success) =
-                    match self.hooks.fire_pre_tool(&tc.name, &tc.arguments) {
-                        crate::plugins::PreToolResolution::Skip { reason } => {
-                            tracing::warn!(
-                                tool = %tc.name,
-                                reason = %reason,
-                                "Tool call skipped by plugin pre_tool_call hook"
-                            );
-                            (format!("[skipped by plugin: {reason}]"), false)
-                        }
-                        crate::plugins::PreToolResolution::Continue { effective_args } => {
-                            let (output, success) =
-                                self.execute_tool(&tc.name, &effective_args).await;
-                            let post = self.hooks.fire_post_tool(
-                                &tc.name,
-                                &effective_args,
-                                &output,
-                                success,
-                            );
-                            (post.output, post.success)
-                        }
-                    };
-                tracing::info!(tool = %tc.name, success = %final_success, "Tool call complete");
-                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    error: if final_success { None } else { Some(final_output.clone()) },
-                    summary: Some(truncate_summary(&final_output)),
-                });
-                self.history
-                    .push(ChatMessage::tool_result(&tc.id, &final_output));
-            }
+            // Execute the tool calls — concurrently when the batch is
+            // parallel-safe, else sequentially — running plugin pre/post-tool
+            // hooks and firing the frontend start/complete callbacks. Results
+            // are appended to history in the original order.
+            self.execute_tool_calls(&response.tool_calls, true).await;
 
             // Drain any /steer text queued during the tool
             // batch so the model sees it before its next
@@ -770,25 +730,10 @@ impl Agent {
             assistant_msg.tool_calls = Some(tool_calls.clone());
             self.history.push(assistant_msg);
 
-            for tc in &tool_calls {
-                self.callbacks.on_tool_start(super::callbacks::ToolStart {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    preview: preview_for_args(&tc.arguments),
-                    args: tc.arguments.clone(),
-                });
-                let started = std::time::Instant::now();
-                let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
-                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    error: if success { None } else { Some(output.clone()) },
-                    summary: Some(truncate_summary(&output)),
-                });
-                self.history
-                    .push(ChatMessage::tool_result(&tc.id, &output));
-            }
+            // Execute the tool calls (concurrently when parallel-safe). The
+            // streaming path does not run plugin pre/post-tool hooks, matching
+            // prior behaviour (`with_hooks = false`).
+            self.execute_tool_calls(&tool_calls, false).await;
 
             // Drain any /steer text queued during the tool batch
             // (streaming path). Same hook as turn(): inject after
@@ -920,64 +865,215 @@ impl Agent {
         Ok(text)
     }
 
-    /// Find a tool by name and execute it. Returns the formatted output string
-    /// with credentials scrubbed, plus the structured success flag from the
-    /// tool itself (`true` only when the tool reported success — tool output
-    /// containing the substring "error" must not be confused with failure).
-    async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
-        // Disabled tools must not run.
-        if self.disabled_tools.contains(name) {
-            return (
-                format!("Error: tool '{name}' is currently disabled"),
-                false,
-            );
+    /// Execute a batch of tool calls — concurrently when the batch is
+    /// parallel-safe, otherwise sequentially. Pushes one tool-result message
+    /// per call to `history` in the original order and fires the start /
+    /// complete frontend callbacks. `with_hooks` enables the plugin pre/post-
+    /// tool hooks: the `turn` path passes `true`; the streaming path passes
+    /// `false`, matching prior behaviour.
+    async fn execute_tool_calls(&mut self, tool_calls: &[ToolCall], with_hooks: bool) {
+        if self.should_parallelize(tool_calls) {
+            self.execute_tool_calls_concurrent(tool_calls, with_hooks).await;
+        } else {
+            self.execute_tool_calls_sequential(tool_calls, with_hooks).await;
+        }
+    }
+
+    /// Whether a batch of tool calls can safely run concurrently.
+    ///
+    /// A batch parallelises only when it has more than one call, contains no
+    /// interactive tool (`ask_user`), and every call is either read-only (no
+    /// shared mutable state) or a path-scoped file tool whose target path does
+    /// not overlap another path-scoped call in the same batch. Writes to
+    /// overlapping paths, non-read-only tools, and tools we can't classify all
+    /// keep the whole batch sequential — correctness over speed.
+    fn should_parallelize(&self, tool_calls: &[ToolCall]) -> bool {
+        if tool_calls.len() <= 1 {
+            return false;
+        }
+        let mut reserved: Vec<std::path::PathBuf> = Vec::new();
+        for tc in tool_calls {
+            let name = tc.name.as_str();
+            // Interactive tools block on user input — never parallel.
+            if name == "ask_user" {
+                return false;
+            }
+            // Path-scoped file tools may overlap with each other; reserve each
+            // target path and fall back to sequential on any overlap.
+            if matches!(name, "read_file" | "write_file" | "edit_file") {
+                match Self::parallel_scope_path(&tc.arguments) {
+                    Some(path) => {
+                        if reserved.iter().any(|r| Self::paths_overlap(r, &path)) {
+                            return false;
+                        }
+                        reserved.push(path);
+                    }
+                    None => return false,
+                }
+                continue;
+            }
+            // Everything else is parallel-safe only if it's read-only.
+            if !self.tool_is_read_only(name) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Read-only flag for a registered tool by name. Unknown or memory-
+    /// provider tools default to NOT read-only (conservative — keeps them
+    /// sequential).
+    fn tool_is_read_only(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.is_read_only())
+            .unwrap_or(false)
+    }
+
+    /// Normalised absolute target path for a path-scoped file tool, or `None`
+    /// when the `path` argument is missing / empty (treated as "can't tell —
+    /// don't parallelise").
+    fn parallel_scope_path(args: &serde_json::Value) -> Option<std::path::PathBuf> {
+        let raw = args.get("path").and_then(|v| v.as_str())?;
+        if raw.trim().is_empty() {
+            return None;
+        }
+        let p = std::path::Path::new(raw);
+        if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            Some(std::env::current_dir().ok()?.join(p))
+        }
+    }
+
+    /// Two paths overlap when one is a prefix of the other at component
+    /// granularity: `a/b` conflicts with `a/b/c`, but `a/b` and `a/c` don't.
+    fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
+        let ac: Vec<_> = a.components().collect();
+        let bc: Vec<_> = b.components().collect();
+        let n = ac.len().min(bc.len());
+        ac[..n] == bc[..n]
+    }
+
+    /// Clone the owned handles `run_tool_call` needs for one call — the tool
+    /// Arc (if registered), disabled flag, and memory-provider routing flag —
+    /// so the per-call future captures no `&self` borrow.
+    fn tool_call_handles(
+        &self,
+        name: &str,
+    ) -> (Option<Arc<dyn Tool>>, bool, bool) {
+        (
+            self.tools.iter().find(|t| t.name() == name).cloned(),
+            self.disabled_tools.contains(name),
+            self.memory_manager.handles_tool(name),
+        )
+    }
+
+    /// Sequential tool dispatch — one call at a time, in order.
+    async fn execute_tool_calls_sequential(
+        &mut self,
+        tool_calls: &[ToolCall],
+        with_hooks: bool,
+    ) {
+        for tc in tool_calls {
+            tracing::info!(tool = %tc.name, "Executing tool call");
+            self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                tool_id: tc.id.clone(),
+                name: tc.name.clone(),
+                preview: preview_for_args(&tc.arguments),
+                args: tc.arguments.clone(),
+            });
+            let (tool, disabled, mem_handles) = self.tool_call_handles(&tc.name);
+            let (output, success, dur) = run_tool_call(
+                Arc::clone(&self.hooks),
+                Arc::clone(&self.memory_manager),
+                tool,
+                disabled,
+                mem_handles,
+                tc.name.clone(),
+                tc.arguments.clone(),
+                with_hooks,
+            )
+            .await;
+            tracing::info!(tool = %tc.name, success = %success, "Tool call complete");
+            self.callbacks
+                .on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: dur.as_millis() as u64,
+                    error: if success { None } else { Some(output.clone()) },
+                    summary: Some(truncate_summary(&output)),
+                });
+            self.history
+                .push(ChatMessage::tool_result(&tc.id, &output));
+        }
+    }
+
+    /// Concurrent tool dispatch — runs the batch with bounded parallelism and
+    /// reassembles results in the original order. Start callbacks fire for the
+    /// whole batch up front (so every tool shows as in-flight); complete
+    /// callbacks and history pushes happen in order once results are in.
+    ///
+    /// Each per-tool future owns its handles (Arc clones), so the batch runs
+    /// without borrowing `&self` across the await — which keeps the turn future
+    /// `Send` for the gateway / channel spawn paths.
+    async fn execute_tool_calls_concurrent(
+        &mut self,
+        tool_calls: &[ToolCall],
+        with_hooks: bool,
+    ) {
+        use futures::StreamExt;
+        // Worker cap: overlaps I/O-bound tools without unbounded fan-out.
+        const MAX_TOOL_CONCURRENCY: usize = 8;
+
+        for tc in tool_calls {
+            tracing::info!(tool = %tc.name, "Executing tool call (concurrent)");
+            self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                tool_id: tc.id.clone(),
+                name: tc.name.clone(),
+                preview: preview_for_args(&tc.arguments),
+                args: tc.arguments.clone(),
+            });
         }
 
-        // Route memory-provider-contributed tools to the manager first.
-        if self.memory_manager.handles_tool(name) {
-            let (raw, success) = match self
-                .memory_manager
-                .handle_tool_call(name, args.clone())
-                .await
-            {
-                Ok(result) => {
-                    if result.success {
-                        (result.output, true)
-                    } else {
-                        (
-                            format!(
-                                "Error: {}",
-                                result.error.unwrap_or_else(|| "unknown error".to_string())
-                            ),
-                            false,
-                        )
-                    }
-                }
-                Err(e) => (format!("Memory provider tool failed: {e}"), false),
-            };
-            return (scrub::scrub_credentials(&raw), success);
-        }
+        // Build owned futures (no `&self` captured) then run them with bounded
+        // concurrency. `buffered` preserves the input order in the results.
+        let pending: Vec<_> = tool_calls
+            .iter()
+            .map(|tc| {
+                let (tool, disabled, mem_handles) = self.tool_call_handles(&tc.name);
+                run_tool_call(
+                    Arc::clone(&self.hooks),
+                    Arc::clone(&self.memory_manager),
+                    tool,
+                    disabled,
+                    mem_handles,
+                    tc.name.clone(),
+                    tc.arguments.clone(),
+                    with_hooks,
+                )
+            })
+            .collect();
+        let results: Vec<(String, bool, std::time::Duration)> =
+            futures::stream::iter(pending)
+                .buffered(MAX_TOOL_CONCURRENCY)
+                .collect()
+                .await;
 
-        let (raw, success) = match self.tools.iter().find(|t| t.name() == name) {
-            Some(t) => match t.execute(args.clone()).await {
-                Ok(result) => {
-                    if result.success {
-                        (result.output, true)
-                    } else {
-                        (
-                            format!(
-                                "Error: {}",
-                                result.error.unwrap_or_else(|| "unknown error".to_string())
-                            ),
-                            false,
-                        )
-                    }
-                }
-                Err(e) => (format!("Tool execution failed: {e}"), false),
-            },
-            None => (format!("Unknown tool: {name}"), false),
-        };
-        (scrub::scrub_credentials(&raw), success)
+        for (tc, (output, success, dur)) in tool_calls.iter().zip(results.into_iter()) {
+            tracing::info!(tool = %tc.name, success = %success, "Tool call complete (concurrent)");
+            self.callbacks
+                .on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: dur.as_millis() as u64,
+                    error: if success { None } else { Some(output.clone()) },
+                    summary: Some(truncate_summary(&output)),
+                });
+            self.history
+                .push(ChatMessage::tool_result(&tc.id, &output));
+        }
     }
 
     /// Load memory context for the given query.
@@ -1798,6 +1894,98 @@ impl AgentBuilder {
 // Callback helpers
 // ---------------------------------------------------------------------------
 
+/// Execute a single tool call end-to-end with owned handles (no `&Agent`
+/// borrow), so a batch can run concurrently and the resulting future stays
+/// `Send`. Mirrors the former `Agent::execute_tool` (disabled check →
+/// memory-provider routing → tool registry → credential scrub) wrapped with
+/// the plugin pre/post-tool hooks when `with_hooks` is set. Returns
+/// `(output, success, duration)`.
+async fn run_tool_call(
+    hooks: Arc<crate::plugins::HookRegistry>,
+    memory_manager: Arc<crate::plugins::MemoryManager>,
+    tool: Option<Arc<dyn Tool>>,
+    disabled: bool,
+    mem_handles: bool,
+    name: String,
+    args: serde_json::Value,
+    with_hooks: bool,
+) -> (String, bool, std::time::Duration) {
+    let started = std::time::Instant::now();
+
+    // Plugin pre-tool hook: may skip the call or rewrite the arguments.
+    let effective_args = if with_hooks {
+        match hooks.fire_pre_tool(&name, &args) {
+            crate::plugins::PreToolResolution::Skip { reason } => {
+                tracing::warn!(
+                    tool = %name,
+                    reason = %reason,
+                    "Tool call skipped by plugin pre_tool_call hook"
+                );
+                return (
+                    format!("[skipped by plugin: {reason}]"),
+                    false,
+                    started.elapsed(),
+                );
+            }
+            crate::plugins::PreToolResolution::Continue { effective_args } => effective_args,
+        }
+    } else {
+        args
+    };
+
+    // Core execution: disabled → memory-provider tool → tool registry. The
+    // disabled message is returned unscrubbed (it carries no credentials),
+    // matching prior behaviour; real tool output is run through the scrubber.
+    let (executed, success) = if disabled {
+        (
+            format!("Error: tool '{name}' is currently disabled"),
+            false,
+        )
+    } else if mem_handles {
+        let (raw, success) = match memory_manager
+            .handle_tool_call(&name, effective_args.clone())
+            .await
+        {
+            Ok(result) if result.success => (result.output, true),
+            Ok(result) => (
+                format!(
+                    "Error: {}",
+                    result.error.unwrap_or_else(|| "unknown error".to_string())
+                ),
+                false,
+            ),
+            Err(e) => (format!("Memory provider tool failed: {e}"), false),
+        };
+        (scrub::scrub_credentials(&raw), success)
+    } else {
+        let (raw, success) = match tool {
+            Some(t) => match t.execute(effective_args.clone()).await {
+                Ok(result) if result.success => (result.output, true),
+                Ok(result) => (
+                    format!(
+                        "Error: {}",
+                        result.error.unwrap_or_else(|| "unknown error".to_string())
+                    ),
+                    false,
+                ),
+                Err(e) => (format!("Tool execution failed: {e}"), false),
+            },
+            None => (format!("Unknown tool: {name}"), false),
+        };
+        (scrub::scrub_credentials(&raw), success)
+    };
+
+    // Plugin post-tool hook: may rewrite the output / success flag.
+    let (output, success) = if with_hooks {
+        let post = hooks.fire_post_tool(&name, &effective_args, &executed, success);
+        (post.output, post.success)
+    } else {
+        (executed, success)
+    };
+
+    (output, success, started.elapsed())
+}
+
 /// One-line preview of a tool call's args for the inline display
 /// and the TOOL LIVE panel header. We render JSON compactly and
 /// truncate aggressively — frontends show the full args in their
@@ -1821,5 +2009,35 @@ fn truncate_summary(s: &str) -> String {
         let mut out: String = single_line.chars().take(MAX - 1).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod parallel_gate_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn paths_overlap_when_one_is_prefix_of_other() {
+        assert!(Agent::paths_overlap(Path::new("/a/b"), Path::new("/a/b/c")));
+        assert!(Agent::paths_overlap(Path::new("/a/b/c"), Path::new("/a/b")));
+        assert!(Agent::paths_overlap(Path::new("/a/b"), Path::new("/a/b")));
+    }
+
+    #[test]
+    fn paths_do_not_overlap_for_siblings_or_disjoint() {
+        assert!(!Agent::paths_overlap(Path::new("/a/b"), Path::new("/a/c")));
+        assert!(!Agent::paths_overlap(Path::new("/x/y"), Path::new("/p/q")));
+    }
+
+    #[test]
+    fn parallel_scope_path_handles_absolute_and_missing() {
+        assert_eq!(
+            Agent::parallel_scope_path(&serde_json::json!({"path": "/tmp/f"})),
+            Some(std::path::PathBuf::from("/tmp/f"))
+        );
+        // Missing or blank `path` → None (treated as "can't tell, stay sequential").
+        assert!(Agent::parallel_scope_path(&serde_json::json!({})).is_none());
+        assert!(Agent::parallel_scope_path(&serde_json::json!({"path": "   "})).is_none());
     }
 }
