@@ -466,6 +466,10 @@ pub struct AgentConfig {
     pub max_tool_iterations: u32,
     pub context_window: u64,
     pub compression_threshold: f64,
+    /// Whether the agent automatically compacts conversation history mid-turn
+    /// when it exceeds `compression_threshold` of the model's context window.
+    /// Default true; set false for strict prompt-cache stability.
+    pub compression_enabled: bool,
 }
 
 impl Default for AgentConfig {
@@ -474,6 +478,7 @@ impl Default for AgentConfig {
             max_tool_iterations: 90,
             context_window: 200_000,
             compression_threshold: 0.50,
+            compression_enabled: true,
         }
     }
 }

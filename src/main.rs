@@ -1026,7 +1026,13 @@ async fn build_agent_with_callbacks(
         .memory_context_limit(config.memory.context_limit)
         .half_life_days(config.memory.half_life_days)
         .prompt_guard(prompt_guard)
-        .auxiliary_client(Arc::clone(&aux_client));
+        .auxiliary_client(Arc::clone(&aux_client))
+        .context_compressor(fennec::agent::compressor::ContextCompressor::new(
+            config.agent.compression_threshold,
+            3,
+            4,
+        ))
+        .compression_enabled(config.agent.compression_enabled);
     if let Some(handle) = callbacks {
         configured_builder = configured_builder.callbacks(handle);
     }
