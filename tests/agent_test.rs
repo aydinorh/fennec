@@ -18,13 +18,23 @@ use fennec::agent::AgentBuilder;
 /// A mock provider that returns pre-configured responses in order.
 struct MockProvider {
     responses: Mutex<Vec<ChatResponse>>,
+    /// `request.tools.is_some()` recorded for each `chat` call, in order.
+    /// Lets tests assert which calls advertised tools (e.g. the graceful
+    /// max-iterations summary call must strip tools).
+    tools_seen: Mutex<Vec<bool>>,
 }
 
 impl MockProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
+            tools_seen: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Snapshot of whether each `chat` call so far advertised tools.
+    fn tools_seen(&self) -> Vec<bool> {
+        self.tools_seen.lock().clone()
     }
 }
 
@@ -34,7 +44,8 @@ impl Provider for MockProvider {
         "mock"
     }
 
-    async fn chat(&self, _request: ChatRequest<'_>) -> Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
+        self.tools_seen.lock().push(request.tools.is_some());
         let mut responses = self.responses.lock();
         if responses.is_empty() {
             anyhow::bail!("MockProvider: no more responses");
@@ -214,11 +225,14 @@ async fn test_tool_call_and_response() {
 }
 
 #[tokio::test]
-async fn test_max_iterations_exceeded() {
-    // Create responses that always return tool calls (more than max iterations).
+async fn test_max_iterations_graceful_summary() {
+    // When the tool-iteration cap is hit, the agent must NOT hard-error. It
+    // makes one final provider call with tools stripped, asking the model to
+    // summarise, and returns that text.
     let max_iters = 3;
     let mut responses = Vec::new();
-    for i in 0..(max_iters + 1) {
+    // Every loop iteration keeps requesting tools, so the cap is hit.
+    for i in 0..max_iters {
         responses.push(ChatResponse {
             content: None,
             tool_calls: vec![ToolCall {
@@ -230,22 +244,47 @@ async fn test_max_iterations_exceeded() {
             reasoning: None,
         });
     }
+    // The final tool-less summary call returns plain text.
+    responses.push(ChatResponse {
+        content: Some("Here's what I accomplished so far.".to_string()),
+        tool_calls: vec![],
+        usage: None,
+        reasoning: None,
+    });
 
-    let provider = MockProvider::new(responses);
+    let provider = Arc::new(MockProvider::new(responses));
 
     let mut agent = AgentBuilder::new()
-        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .provider(provider.clone() as Arc<dyn Provider>)
         .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .tool(Box::new(EchoTool))
         .max_tool_iterations(max_iters)
         .build()
         .expect("agent build should succeed");
 
-    let result = agent.turn("loop forever").await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let result = agent
+        .turn("loop forever")
+        .await
+        .expect("turn should end gracefully, not error");
+    assert_eq!(result, "Here's what I accomplished so far.");
+
+    // The cap-hit produces exactly max_iters tool-advertising calls followed
+    // by one tools-stripped summary call.
+    let seen = provider.tools_seen();
+    assert_eq!(
+        seen.len(),
+        max_iters + 1,
+        "expected {} loop calls + 1 summary call, got {:?}",
+        max_iters,
+        seen
+    );
     assert!(
-        err.contains("max tool iterations"),
-        "error should mention max tool iterations, got: {err}"
+        seen[..max_iters].iter().all(|&t| t),
+        "loop calls should advertise tools, got {seen:?}"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&false),
+        "final summary call must strip tools, got {seen:?}"
     );
 }

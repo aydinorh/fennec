@@ -590,7 +590,7 @@ encrypt_secrets = true
 command_timeout_secs = 60
 
 [agent]
-max_tool_iterations = 15
+max_tool_iterations = 90
 context_window = 200000
 
 [channels.telegram]
