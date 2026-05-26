@@ -208,6 +208,7 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         // OAuth-authenticated; the provider resolves a Google bearer token
         // from stored credentials, so there's no API key to read here.
         "gemini-cloudcode" | "google-cloudcode" => return Ok(String::new()),
+        "codex" | "openai-responses" => "OPENAI_API_KEY",
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -445,6 +446,25 @@ fn build_provider(
                 home_dir.to_path_buf(),
                 Some(cc_model),
                 None,
+                None,
+            ))
+        }
+        "codex" | "openai-responses" => {
+            // Back-compat: if the user switched to Codex but kept an
+            // Anthropic-flavored default model string, fall back to a
+            // Responses-capable default rather than passing a non-OpenAI id.
+            let codex_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "gpt-5-codex".to_string()
+            } else {
+                model
+            };
+            Box::new(fennec::providers::CodexResponsesProvider::new(
+                api_key,
+                Some(codex_model),
+                base_url,
                 None,
             ))
         }

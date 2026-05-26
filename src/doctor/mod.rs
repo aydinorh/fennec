@@ -127,6 +127,7 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "google" | "gemini" => "GEMINI_API_KEY",
+        "codex" | "openai-responses" => "OPENAI_API_KEY",
         _ => "ANTHROPIC_API_KEY",
     };
     match std::env::var(env_var) {
@@ -200,7 +201,7 @@ pub async fn check_provider_reachable(
                 .header("anthropic-version", "2023-06-01");
             (url, req)
         }
-        "openai" => {
+        "openai" | "codex" | "openai-responses" => {
             let url = "https://api.openai.com/v1/models".to_string();
             let req = client.get(&url).bearer_auth(api_key);
             (url, req)
@@ -373,6 +374,7 @@ pub async fn run_all(
                     "kimi" | "moonshot" => "KIMI_API_KEY",
                     "openrouter" => "OPENROUTER_API_KEY",
                     "google" | "gemini" => "GEMINI_API_KEY",
+                    "codex" | "openai-responses" => "OPENAI_API_KEY",
                     _ => "",
                 };
                 std::env::var(env_var).unwrap_or_default()
