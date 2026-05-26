@@ -16,10 +16,12 @@
 //!     client-credentials flow (`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` /
 //!     `AZURE_CLIENT_SECRET`). Entra bearer tokens are cached and refreshed.
 //!
-//! Note: reasoning-model detection (which decides `max_completion_tokens` vs
-//! `max_tokens` and whether to send `temperature`) keys off the deployment
-//! name, so name reasoning-model deployments after their model family
-//! (`o3-mini`, `gpt-5`, …) for it to apply.
+//! The capability model (which drives reasoning-model detection —
+//! `max_completion_tokens` vs `max_tokens`, whether to send `temperature`, and
+//! `reasoning_effort`) is kept separate from the Azure deployment used for
+//! routing: `provider.model` is the model family (`gpt-5`, `o3-mini`, …) and
+//! the deployment defaults to it, overridable via `AZURE_DEPLOYMENT` when the
+//! deployment is named differently from the model.
 
 use std::time::{Duration, Instant};
 
@@ -64,7 +66,13 @@ pub struct AzureProvider {
     client: reqwest::Client,
     /// Resource endpoint, e.g. `https://my-resource.openai.azure.com`.
     base_url: String,
-    /// Azure *deployment* name (used both in the URL and as the body `model`).
+    /// Model family (`gpt-5`, `o3-mini`, …). Drives reasoning-model detection
+    /// and is sent as the body `model`. Kept separate from the deployment so
+    /// capability detection is correct regardless of how the deployment is
+    /// named.
+    model: String,
+    /// Azure *deployment* name used for URL routing. Defaults to `model`,
+    /// overridable via `AZURE_DEPLOYMENT`.
     deployment: String,
     api_version: String,
     scope: String,
@@ -81,7 +89,7 @@ impl AzureProvider {
     /// selects the service-principal flow; otherwise the Azure CLI is used.
     pub fn new(
         api_key: String,
-        deployment: Option<String>,
+        model: Option<String>,
         base_url: Option<String>,
         context_window: Option<usize>,
     ) -> Self {
@@ -89,6 +97,15 @@ impl AzureProvider {
         while base.ends_with('/') {
             base.pop();
         }
+
+        let model = model.unwrap_or_default();
+        // The deployment used for routing defaults to the model name, but can
+        // diverge (a deployment named `prod-chat` backed by `gpt-5`), so allow
+        // an explicit override.
+        let deployment = std::env::var("AZURE_DEPLOYMENT")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| model.clone());
 
         let auth = if !api_key.is_empty() {
             AzureAuth::ApiKey(api_key)
@@ -113,7 +130,8 @@ impl AzureProvider {
         Self {
             client: reqwest::Client::new(),
             base_url: base,
-            deployment: deployment.unwrap_or_default(),
+            model,
+            deployment,
             api_version: std::env::var("AZURE_OPENAI_API_VERSION")
                 .ok()
                 .filter(|v| !v.is_empty())
@@ -280,11 +298,11 @@ impl Provider for AzureProvider {
     }
 
     fn model(&self) -> &str {
-        &self.deployment
+        &self.model
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
-        let body = build_openai_request_body(&self.deployment, &request, false);
+        let body = build_openai_request_body(&self.model, &request, false);
         let req = self
             .client
             .post(self.chat_completions_url())
@@ -327,7 +345,7 @@ impl Provider for AzureProvider {
         &self,
         request: ChatRequest<'_>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
-        let body = build_openai_request_body(&self.deployment, &request, true);
+        let body = build_openai_request_body(&self.model, &request, true);
         let req = self
             .client
             .post(self.chat_completions_url())
@@ -387,19 +405,35 @@ mod tests {
     }
 
     #[test]
-    fn model_accessor_returns_deployment() {
-        let p = AzureProvider::new("k".to_string(), Some("my-deploy".to_string()), None, None);
-        assert_eq!(p.model(), "my-deploy");
+    fn model_accessor_returns_model_and_deployment_defaults_to_it() {
+        let p = AzureProvider::new("k".to_string(), Some("gpt-5".to_string()), None, None);
+        assert_eq!(p.model(), "gpt-5");
+        // With no AZURE_DEPLOYMENT override, the deployment mirrors the model.
+        assert_eq!(p.deployment, "gpt-5");
         assert_eq!(p.name(), "azure");
         assert!(p.supports_streaming());
         assert!(p.supports_tool_calling());
     }
 
     #[test]
-    fn body_reuses_openai_shape_with_deployment_as_model() {
-        // The body is built by the shared OpenAI builder with the deployment
-        // name as the `model` field.
-        let p = AzureProvider::new("k".to_string(), Some("gpt-4o".to_string()), None, None);
+    fn capability_detection_keys_off_model_not_deployment() {
+        // A reasoning model deployed under an arbitrary deployment name must
+        // still be detected as a reasoning model: the body keys off the model
+        // (o3-mini → max_completion_tokens, no temperature), while the URL
+        // routes to the deployment.
+        let p = AzureProvider {
+            client: reqwest::Client::new(),
+            base_url: "https://r.openai.azure.com".to_string(),
+            model: "o3-mini".to_string(),
+            deployment: "prod-chat".to_string(),
+            api_version: DEFAULT_API_VERSION.to_string(),
+            scope: DEFAULT_ENTRA_SCOPE.to_string(),
+            ctx_window: DEFAULT_CONTEXT_WINDOW,
+            auth: AzureAuth::ApiKey("k".to_string()),
+            cached_token: Mutex::new(None),
+        };
+        assert!(p.chat_completions_url().contains("/deployments/prod-chat/"));
+
         let messages = vec![super::super::traits::ChatMessage::user("hi")];
         let request = ChatRequest {
             system: None,
@@ -409,9 +443,10 @@ mod tests {
             temperature: 0.3,
             thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
-        let body = build_openai_request_body(&p.deployment, &request, false);
-        assert_eq!(body["model"], "gpt-4o");
-        assert_eq!(body["max_tokens"], 256);
-        assert_eq!(body["messages"][0]["role"], "user");
+        let body = build_openai_request_body(&p.model, &request, false);
+        assert_eq!(body["model"], "o3-mini");
+        assert_eq!(body["max_completion_tokens"], 256);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none(), "reasoning model must drop temperature");
     }
 }
