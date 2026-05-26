@@ -198,6 +198,20 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         return Ok(decrypted);
     }
 
+    // Azure can authenticate with an API key OR keyless Entra ID — so accept
+    // an Azure key from env if present, but don't error when absent (the
+    // provider falls back to Entra: az CLI / service principal).
+    if matches!(config.provider.name.as_str(), "azure" | "foundry") {
+        for key_var in ["AZURE_OPENAI_API_KEY", "AZURE_FOUNDRY_API_KEY"] {
+            if let Ok(v) = std::env::var(key_var) {
+                if !v.is_empty() {
+                    return Ok(v);
+                }
+            }
+        }
+        return Ok(String::new()); // Entra mode — no key
+    }
+
     // Fall back to provider-specific environment variable.
     let env_var = match config.provider.name.as_str() {
         "anthropic" => "ANTHROPIC_API_KEY",
@@ -464,6 +478,17 @@ fn build_provider(
             Box::new(fennec::providers::CodexResponsesProvider::new(
                 api_key,
                 Some(codex_model),
+                base_url,
+                None,
+            ))
+        }
+        "azure" | "foundry" => {
+            // `model` is the Azure *deployment* name; base_url is the resource
+            // endpoint (https://<resource>.openai.azure.com). Auth auto-detects
+            // API key vs keyless Entra inside the provider.
+            Box::new(fennec::providers::AzureProvider::new(
+                api_key,
+                Some(model),
                 base_url,
                 None,
             ))

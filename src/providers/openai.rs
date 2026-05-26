@@ -151,74 +151,13 @@ impl OpenAIProvider {
     }
 
     /// Build the common request body (shared by chat and chat_stream).
-    fn build_request_body(
-        &self,
-        request: &ChatRequest<'_>,
-        stream: bool,
-    ) -> (Vec<Value>, Value) {
-        let mut messages = Vec::new();
-
-        if let Some(system_text) = request.system {
-            messages.push(json!({
-                "role": "system",
-                "content": system_text
-            }));
-        }
-
-        messages.extend(Self::convert_messages(request.messages));
-
-        // Reasoning-family models (o1, o3, o4-*, gpt-5*) REJECT `max_tokens`
-        // at the Chat Completions endpoint and require `max_completion_tokens`
-        // instead. They also reject `temperature`. See Azure/OpenAI reasoning
-        // docs: "Reasoning models will only work with the
-        // max_completion_tokens parameter when using the Chat Completions API."
-        let token_field = if is_reasoning_model(&self.model) {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        };
-
-        let mut body = json!({
-            "model": self.model,
-            token_field: request.max_tokens,
-            "messages": messages,
-        });
-
-        // Only non-reasoning models accept `temperature` — reasoning models
-        // reject it at the API level.
-        if !is_reasoning_model(&self.model) {
-            body["temperature"] = json!(request.temperature);
-        }
-
-        if stream {
-            body["stream"] = json!(true);
-            // Request a usage payload in the final streaming chunk
-            // (per OpenAI's stream_options spec). Without this the
-            // streamed response doesn't carry token counts at all
-            // and `/usage` would silently report zero for every
-            // streaming turn. Servers that don't recognise the field
-            // ignore it.
-            body["stream_options"] = json!({"include_usage": true});
-        }
-
-        if let Some(tools) = request.tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(Self::convert_tools(tools));
-            }
-        }
-
-        // Apply reasoning_effort if the agent selected a thinking level.
-        crate::agent::thinking::apply_thinking_params(
-            &mut body,
-            request.thinking_level,
-            "openai",
-        );
-
-        (messages, body)
+    fn build_request_body(&self, request: &ChatRequest<'_>, stream: bool) -> Value {
+        build_openai_request_body(&self.model, request, stream)
     }
 
-    /// Parse the OpenAI response JSON into our ChatResponse.
-    fn parse_response(body: &Value) -> Result<ChatResponse> {
+    /// Parse the OpenAI response JSON into our ChatResponse. Shared with the
+    /// Azure provider, which receives the identical Chat Completions shape.
+    pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse> {
         let choice = body
             .get("choices")
             .and_then(|c| c.as_array())
@@ -301,6 +240,58 @@ impl OpenAIProvider {
             reasoning,
         })
     }
+}
+
+/// Build an OpenAI Chat Completions request body. Shared by [`OpenAIProvider`]
+/// and the Azure provider (which sends the identical body to Azure's
+/// deployment-routed endpoint) — see [`super::azure`].
+pub(crate) fn build_openai_request_body(
+    model: &str,
+    request: &ChatRequest<'_>,
+    stream: bool,
+) -> Value {
+    let mut messages = Vec::new();
+
+    if let Some(system_text) = request.system {
+        messages.push(json!({ "role": "system", "content": system_text }));
+    }
+    messages.extend(OpenAIProvider::convert_messages(request.messages));
+
+    // Reasoning-family models (o1, o3, o4-*, gpt-5*) REJECT `max_tokens` at the
+    // Chat Completions endpoint and require `max_completion_tokens` instead.
+    // They also reject `temperature`.
+    let token_field = if is_reasoning_model(model) {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+
+    let mut body = json!({
+        "model": model,
+        token_field: request.max_tokens,
+        "messages": messages,
+    });
+
+    if !is_reasoning_model(model) {
+        body["temperature"] = json!(request.temperature);
+    }
+
+    if stream {
+        body["stream"] = json!(true);
+        // Request a usage payload in the final streaming chunk (per OpenAI's
+        // stream_options spec); servers that don't recognise it ignore it.
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+
+    if let Some(tools) = request.tools {
+        if !tools.is_empty() {
+            body["tools"] = json!(OpenAIProvider::convert_tools(tools));
+        }
+    }
+
+    crate::agent::thinking::apply_thinking_params(&mut body, request.thinking_level, "openai");
+
+    body
 }
 
 /// Return `true` for OpenAI model names that belong to the "reasoning"
@@ -440,7 +431,7 @@ impl Provider for OpenAIProvider {
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
-        let (_messages, body) = self.build_request_body(&request, false);
+        let body = self.build_request_body(&request, false);
 
         let mut req = self
             .client
@@ -505,7 +496,7 @@ impl Provider for OpenAIProvider {
         &self,
         request: ChatRequest<'_>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
-        let (_messages, body) = self.build_request_body(&request, true);
+        let body = self.build_request_body(&request, true);
 
         let mut req = self
             .client
@@ -546,87 +537,97 @@ impl Provider for OpenAIProvider {
             anyhow::bail!("OpenAI API error ({}): {}", status, error_msg);
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let mut byte_stream = response.bytes_stream();
+        Ok(spawn_openai_stream(response))
+    }
+}
 
-        tokio::spawn(async move {
-            let mut sse = SseBuffer::new();
-            let mut usage_acc = UsageInfo::default();
-            let mut usage_seen = false;
-            // Emit `StreamEvent::Usage` exactly once when we have data
-            // for it. The accumulator may be populated either by an
-            // intermediate chunk that already carried `usage` or by
-            // the final chunk that arrives with empty `choices`.
-            let emit_usage = |usage: &UsageInfo,
-                              tx: &tokio::sync::mpsc::Sender<StreamEvent>,
-                              seen: &mut bool|
-             -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-                let usage = usage.clone();
-                let tx = tx.clone();
-                let seen_now = !*seen
-                    && (usage.input_tokens > 0
-                        || usage.output_tokens > 0
-                        || usage.cache_read_tokens.is_some());
+/// Spawn the SSE-processing task for an OpenAI-style streaming response and
+/// return the event receiver. Shared by [`OpenAIProvider`] and the Azure
+/// provider, whose streaming response is the identical Chat Completions SSE
+/// shape.
+pub(crate) fn spawn_openai_stream(
+    response: reqwest::Response,
+) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let mut byte_stream = response.bytes_stream();
+
+    tokio::spawn(async move {
+        let mut sse = SseBuffer::new();
+        let mut usage_acc = UsageInfo::default();
+        let mut usage_seen = false;
+        // Emit `StreamEvent::Usage` exactly once when we have data
+        // for it. The accumulator may be populated either by an
+        // intermediate chunk that already carried `usage` or by
+        // the final chunk that arrives with empty `choices`.
+        let emit_usage = |usage: &UsageInfo,
+                          tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+                          seen: &mut bool|
+         -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let usage = usage.clone();
+            let tx = tx.clone();
+            let seen_now = !*seen
+                && (usage.input_tokens > 0
+                    || usage.output_tokens > 0
+                    || usage.cache_read_tokens.is_some());
+            if seen_now {
+                *seen = true;
+            }
+            Box::pin(async move {
                 if seen_now {
-                    *seen = true;
+                    let _ = tx.send(StreamEvent::Usage(usage)).await;
                 }
-                Box::pin(async move {
-                    if seen_now {
-                        let _ = tx.send(StreamEvent::Usage(usage)).await;
-                    }
-                })
+            })
+        };
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                    return;
+                }
             };
+            sse.extend(&chunk);
 
-            while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                        return;
-                    }
+            while let Some(line_bytes) = sse.next_line() {
+                let line = match std::str::from_utf8(&line_bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
                 };
-                sse.extend(&chunk);
 
-                while let Some(line_bytes) = sse.next_line() {
-                    let line = match std::str::from_utf8(&line_bytes) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
+                let data_str = match line.strip_prefix("data: ") {
+                    Some(s) => s,
+                    None => continue,
+                };
 
-                    let data_str = match line.strip_prefix("data: ") {
-                        Some(s) => s,
-                        None => continue,
-                    };
+                if data_str == "[DONE]" {
+                    emit_usage(&usage_acc, &tx, &mut usage_seen).await;
+                    let _ = tx.send(StreamEvent::Done).await;
+                    return;
+                }
 
-                    if data_str == "[DONE]" {
-                        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
-                        let _ = tx.send(StreamEvent::Done).await;
-                        return;
-                    }
+                let data: Value = match serde_json::from_str(data_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
 
-                    let data: Value = match serde_json::from_str(data_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    if dispatch_openai_chunk(&data, &tx, &mut usage_acc).await {
-                        // finish_reason observed — still prefer [DONE] as
-                        // the authoritative terminator when the server
-                        // sends it, but close now so we don't hang if it
-                        // doesn't.
-                        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
-                        let _ = tx.send(StreamEvent::Done).await;
-                        return;
-                    }
+                if dispatch_openai_chunk(&data, &tx, &mut usage_acc).await {
+                    // finish_reason observed — still prefer [DONE] as
+                    // the authoritative terminator when the server
+                    // sends it, but close now so we don't hang if it
+                    // doesn't.
+                    emit_usage(&usage_acc, &tx, &mut usage_seen).await;
+                    let _ = tx.send(StreamEvent::Done).await;
+                    return;
                 }
             }
+        }
 
-            emit_usage(&usage_acc, &tx, &mut usage_seen).await;
-            let _ = tx.send(StreamEvent::Done).await;
-        });
+        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
+        let _ = tx.send(StreamEvent::Done).await;
+    });
 
-        Ok(rx)
-    }
+    rx
 }
 
 #[cfg(test)]
@@ -804,7 +805,7 @@ mod tests {
             temperature: 0.42,
             thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
-        let (_, body) = p.build_request_body(&req, false);
+        let body = p.build_request_body(&req, false);
         assert_eq!(body["max_tokens"], 1234);
         assert!(body.get("max_completion_tokens").is_none());
         assert_eq!(body["temperature"], 0.42);
@@ -821,7 +822,7 @@ mod tests {
             temperature: 0.42,
             thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
-        let (_, body) = p.build_request_body(&req, false);
+        let body = p.build_request_body(&req, false);
         assert_eq!(body["max_completion_tokens"], 1234);
         assert!(body.get("max_tokens").is_none());
         // Reasoning models reject `temperature`; we must not send it.
@@ -839,7 +840,7 @@ mod tests {
             temperature: 0.7,
             thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
-        let (_, body) = p.build_request_body(&req, false);
+        let body = p.build_request_body(&req, false);
         assert_eq!(body["max_completion_tokens"], 100);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("temperature").is_none());
