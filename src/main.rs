@@ -223,6 +223,9 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         // from stored credentials, so there's no API key to read here.
         "gemini-cloudcode" | "google-cloudcode" => return Ok(String::new()),
         "codex" | "openai-responses" => "OPENAI_API_KEY",
+        // Bedrock authenticates with AWS credentials (resolved by the provider
+        // from env/IMDS), not a single API key.
+        "bedrock" | "aws" => return Ok(String::new()),
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -488,6 +491,17 @@ fn build_provider(
             // API key vs keyless Entra inside the provider.
             Box::new(fennec::providers::AzureProvider::new(
                 api_key,
+                Some(model),
+                base_url,
+                None,
+            ))
+        }
+        "bedrock" | "aws" => {
+            // `model` is the Bedrock model / inference-profile id; auth comes
+            // from AWS credentials (env vars or IMDS instance role). base_url,
+            // if set, overrides the derived bedrock-runtime endpoint.
+            let _ = api_key; // Bedrock uses AWS creds, not the api_key.
+            Box::new(fennec::providers::BedrockProvider::new(
                 Some(model),
                 base_url,
                 None,
