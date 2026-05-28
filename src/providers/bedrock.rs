@@ -37,11 +37,21 @@ const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
 const IMDS_TIMEOUT: Duration = Duration::from_secs(2);
 const CRED_SKEW: Duration = Duration::from_secs(120);
 
-/// Where the provider's AWS credentials come from.
+/// Where the provider's AWS credentials come from. Resolved once at
+/// construction, mirroring (a useful subset of) boto3's default chain:
+/// env static keys → web-identity (EKS IRSA) → named profile → IMDS instance
+/// role. SSO / assume-role profiles are a follow-up.
 enum CredSource {
-    /// Static credentials from the environment.
+    /// Long-lived static credentials (env vars or a named profile's keys).
     Static(AwsCredentials),
-    /// EC2/EKS instance role via IMDSv2 (fetched + cached lazily).
+    /// Web-identity federation (EKS IRSA): a projected token file exchanged
+    /// for temporary credentials via STS AssumeRoleWithWebIdentity.
+    WebIdentity {
+        token_file: String,
+        role_arn: String,
+        session_name: String,
+    },
+    /// EC2/EKS instance role via IMDSv2.
     Imds,
 }
 
@@ -53,8 +63,9 @@ pub struct BedrockProvider {
     host: String,
     ctx_window: usize,
     cred_source: CredSource,
-    /// Cached IMDS credentials + their expiry (unused for static creds).
-    cached_imds: Mutex<Option<(AwsCredentials, Instant)>>,
+    /// Cached temporary credentials + expiry (for the WebIdentity / IMDS
+    /// sources; unused for static creds).
+    cached_temp: Mutex<Option<(AwsCredentials, Instant)>>,
 }
 
 impl BedrockProvider {
@@ -77,41 +88,81 @@ impl BedrockProvider {
             None => format!("bedrock-runtime.{region}.amazonaws.com"),
         };
 
-        let cred_source = match (
-            std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|v| !v.is_empty()),
-            std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|v| !v.is_empty()),
-        ) {
-            (Some(access_key_id), Some(secret_access_key)) => {
-                CredSource::Static(AwsCredentials {
-                    access_key_id,
-                    secret_access_key,
-                    session_token: std::env::var("AWS_SESSION_TOKEN").ok().filter(|v| !v.is_empty()),
-                })
-            }
-            _ => CredSource::Imds,
-        };
-
         Self {
             client: reqwest::Client::new(),
             model: model.unwrap_or_default(),
             region,
             host,
             ctx_window: context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
-            cred_source,
-            cached_imds: Mutex::new(None),
+            cred_source: resolve_cred_source(),
+            cached_temp: Mutex::new(None),
         }
     }
 
     async fn credentials(&self) -> Result<AwsCredentials> {
         match &self.cred_source {
             CredSource::Static(c) => Ok(c.clone()),
+            CredSource::WebIdentity {
+                token_file,
+                role_arn,
+                session_name,
+            } => self.web_identity_credentials(token_file, role_arn, session_name).await,
             CredSource::Imds => self.imds_credentials().await,
         }
     }
 
+    /// Exchange a web-identity token (EKS IRSA) for temporary credentials via
+    /// STS AssumeRoleWithWebIdentity. The call is unsigned — the token is the
+    /// credential. Results are cached until shortly before expiry.
+    async fn web_identity_credentials(
+        &self,
+        token_file: &str,
+        role_arn: &str,
+        session_name: &str,
+    ) -> Result<AwsCredentials> {
+        if let Some((creds, expiry)) = self.cached_temp.lock().as_ref() {
+            if *expiry > Instant::now() {
+                return Ok(creds.clone());
+            }
+        }
+
+        let token = std::fs::read_to_string(token_file)
+            .with_context(|| format!("reading web identity token file {token_file}"))?;
+        let token = token.trim();
+
+        let url = format!("https://sts.{}.amazonaws.com/", self.region);
+        let resp = self
+            .client
+            .post(&url)
+            .form(&[
+                ("Action", "AssumeRoleWithWebIdentity"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", session_name),
+                ("WebIdentityToken", token),
+            ])
+            .send()
+            .await
+            .context("calling STS AssumeRoleWithWebIdentity")?;
+        let status = resp.status();
+        let xml = resp.text().await.context("reading STS response")?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "STS AssumeRoleWithWebIdentity failed ({status}): {}",
+                xml.chars().take(300).collect::<String>()
+            );
+        }
+
+        let creds = parse_sts_credentials(&xml)?;
+        let ttl = sts_ttl(&xml);
+        let expiry = Instant::now() + ttl.saturating_sub(CRED_SKEW);
+        *self.cached_temp.lock() = Some((creds.clone(), expiry));
+        Ok(creds)
+    }
+
     /// Fetch (and cache) instance-role credentials via IMDSv2.
     async fn imds_credentials(&self) -> Result<AwsCredentials> {
-        if let Some((creds, expiry)) = self.cached_imds.lock().as_ref() {
+        if let Some((creds, expiry)) = self.cached_temp.lock().as_ref() {
             if *expiry > Instant::now() {
                 return Ok(creds.clone());
             }
@@ -182,7 +233,7 @@ impl BedrockProvider {
             })
             .unwrap_or(Duration::from_secs(300));
         let expiry = Instant::now() + ttl.saturating_sub(CRED_SKEW);
-        *self.cached_imds.lock() = Some((creds.clone(), expiry));
+        *self.cached_temp.lock() = Some((creds.clone(), expiry));
         Ok(creds)
     }
 
@@ -229,6 +280,119 @@ impl BedrockProvider {
         }
         Ok(req)
     }
+}
+
+/// Resolve the credential source, mirroring a useful subset of boto3's default
+/// chain: env static keys → web-identity (EKS IRSA) → named profile → IMDS.
+fn resolve_cred_source() -> CredSource {
+    // 1. Explicit static keys in the environment.
+    if let (Some(access_key_id), Some(secret_access_key)) = (
+        std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|v| !v.is_empty()),
+        std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|v| !v.is_empty()),
+    ) {
+        return CredSource::Static(AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token: std::env::var("AWS_SESSION_TOKEN").ok().filter(|v| !v.is_empty()),
+        });
+    }
+    // 2. Web-identity federation (EKS IRSA), injected via env vars.
+    if let (Some(token_file), Some(role_arn)) = (
+        std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok().filter(|v| !v.is_empty()),
+        std::env::var("AWS_ROLE_ARN").ok().filter(|v| !v.is_empty()),
+    ) {
+        return CredSource::WebIdentity {
+            token_file,
+            role_arn,
+            session_name: std::env::var("AWS_ROLE_SESSION_NAME")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "fennec".to_string()),
+        };
+    }
+    // 3. A named profile's static keys from the shared credentials file.
+    if let Some(creds) = load_profile_credentials() {
+        return CredSource::Static(creds);
+    }
+    // 4. EC2/EKS instance role via IMDS.
+    CredSource::Imds
+}
+
+/// Load static credentials for `AWS_PROFILE` (or `default`) from the shared
+/// credentials file. Returns `None` when the profile is absent or lacks static
+/// keys (e.g. an SSO / assume-role profile — those are a follow-up).
+fn load_profile_credentials() -> Option<AwsCredentials> {
+    let profile = std::env::var("AWS_PROFILE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let path = std::env::var("AWS_SHARED_CREDENTIALS_FILE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".aws").join("credentials")))?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let section = parse_ini_section(&content, &profile)?;
+    let get = |key: &str| section.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+    let access_key_id = get("aws_access_key_id").filter(|v| !v.is_empty())?;
+    let secret_access_key = get("aws_secret_access_key").filter(|v| !v.is_empty())?;
+    Some(AwsCredentials {
+        access_key_id,
+        secret_access_key,
+        session_token: get("aws_session_token").filter(|v| !v.is_empty()),
+    })
+}
+
+/// Extract the `[section]` key/value pairs from a minimal INI document.
+fn parse_ini_section(content: &str, section: &str) -> Option<Vec<(String, String)>> {
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_section = name.trim() == section;
+            continue;
+        }
+        if in_section {
+            if let Some((k, v)) = line.split_once('=') {
+                out.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Extract the inner text of the first `<tag>…</tag>` in an XML string.
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// Parse STS temporary credentials from an `AssumeRole*` XML response.
+fn parse_sts_credentials(xml: &str) -> Result<AwsCredentials> {
+    Ok(AwsCredentials {
+        access_key_id: extract_xml_tag(xml, "AccessKeyId")
+            .context("STS response missing AccessKeyId")?,
+        secret_access_key: extract_xml_tag(xml, "SecretAccessKey")
+            .context("STS response missing SecretAccessKey")?,
+        session_token: extract_xml_tag(xml, "SessionToken"),
+    })
+}
+
+/// Time-to-live from the STS `<Expiration>` (RFC3339), defaulting to ~50 min.
+fn sts_ttl(xml: &str) -> Duration {
+    extract_xml_tag(xml, "Expiration")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|exp| {
+            Duration::from_secs((exp.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)
+        })
+        .unwrap_or(Duration::from_secs(50 * 60))
 }
 
 fn map_thinking_temperature(level: ThinkingLevel, base: f64) -> f64 {
@@ -966,6 +1130,44 @@ mod tests {
         assert!(matches!(&events[1], StreamEvent::ToolCallDelta { id, arguments_delta } if id == "tu_1" && arguments_delta.contains("\"x\"")));
         assert!(matches!(&events[2], StreamEvent::ToolCallEnd { id } if id == "tu_1"));
         assert!(current.is_none());
+    }
+
+    #[test]
+    fn ini_section_extracts_profile_keys() {
+        let content = "\
+[default]
+aws_access_key_id = AKIA_DEFAULT
+aws_secret_access_key = secret_default
+
+[work]
+# a comment
+aws_access_key_id = AKIA_WORK
+aws_secret_access_key = secret_work
+aws_session_token = tok_work
+";
+        let default = parse_ini_section(content, "default").unwrap();
+        assert!(default.iter().any(|(k, v)| k == "aws_access_key_id" && v == "AKIA_DEFAULT"));
+        let work = parse_ini_section(content, "work").unwrap();
+        assert!(work.iter().any(|(k, v)| k == "aws_session_token" && v == "tok_work"));
+        assert!(parse_ini_section(content, "missing").is_none());
+    }
+
+    #[test]
+    fn sts_xml_parsing() {
+        let xml = "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult>\
+            <Credentials><AccessKeyId>AKIA_STS</AccessKeyId>\
+            <SecretAccessKey>sts_secret</SecretAccessKey>\
+            <SessionToken>sts_token</SessionToken>\
+            <Expiration>2030-01-01T00:00:00Z</Expiration></Credentials>\
+            </AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>";
+        let creds = parse_sts_credentials(xml).unwrap();
+        assert_eq!(creds.access_key_id, "AKIA_STS");
+        assert_eq!(creds.secret_access_key, "sts_secret");
+        assert_eq!(creds.session_token.as_deref(), Some("sts_token"));
+        // Expiration is far in the future → a large positive TTL.
+        assert!(sts_ttl(xml) > Duration::from_secs(60));
+        // Missing fields → error.
+        assert!(parse_sts_credentials("<x/>").is_err());
     }
 
     #[tokio::test]

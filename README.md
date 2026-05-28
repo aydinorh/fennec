@@ -151,10 +151,11 @@ the Azure CLI (`az login`). Override `AZURE_OPENAI_API_VERSION` /
 SigV4-signed requests — no AWS SDK dependency. Set `provider.model` to the
 Bedrock model or inference-profile id (e.g.
 `anthropic.claude-3-5-sonnet-20241022-v2:0` or `us.anthropic.claude-…`).
-Credentials resolve from the standard AWS env vars (`AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY` / optional `AWS_SESSION_TOKEN`) or, when absent, the
-EC2/EKS instance role via IMDSv2; region from `AWS_REGION` / `AWS_DEFAULT_REGION`
-(default `us-east-1`). SSO / named-profile resolution is a follow-up.
+Credentials resolve through a chain (env static keys → web-identity / EKS IRSA
+via `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` → named profile from
+`~/.aws/credentials` (`AWS_PROFILE`) → EC2/EKS instance role via IMDSv2); region
+from `AWS_REGION` / `AWS_DEFAULT_REGION` (default `us-east-1`). SSO /
+assume-role profiles are a follow-up.
 
 ## Tools
 
