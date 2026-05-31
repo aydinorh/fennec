@@ -129,6 +129,29 @@ pub struct CronJob {
     /// consistently. Mirrors upstream's `profile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Where to deliver this job's response. Tokens (single or
+    /// comma-separated):
+    /// - `"local"` — no delivery (output saved locally only).
+    /// - `"origin"` — deliver to the channel/chat the job was
+    ///   created from (`origin_channel` / `origin_chat_id`).
+    /// - `"<platform>"` — deliver to the platform's configured home
+    ///   channel (`FENNEC_<PLATFORM>_HOME_CHANNEL` env var).
+    /// - `"<platform>:<chat_id>"` (optionally `:<thread_id>`) —
+    ///   explicit target.
+    /// - `"all"` — fan-out to every platform with a configured
+    ///   home channel.
+    ///
+    /// Default is set at create time: `"origin"` when the job has an
+    /// origin, `"local"` otherwise (matches upstream's
+    /// `create_job` default).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub deliver: String,
+    /// Whether to wrap delivered responses with a `Cron Response`
+    /// header / footer noting the job name + ID so users on busy
+    /// channels can tell which scheduled task spoke. `None` defers
+    /// to the global default (wrap on, matching upstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_response: Option<bool>,
 }
 
 impl CronJob {
@@ -193,6 +216,8 @@ pub struct JobUpdates {
     pub enabled_toolsets: Option<Option<Vec<String>>>,
     pub workdir: Option<Option<String>>,
     pub profile: Option<Option<String>>,
+    pub deliver: Option<String>,
+    pub wrap_response: Option<Option<bool>>,
 }
 
 /// Error returned by [`JobStore::resolve_job_ref`] when a name matches
@@ -474,6 +499,12 @@ impl JobStore {
             }
             if let Some(profile) = updates.profile {
                 job.profile = profile;
+            }
+            if let Some(deliver) = updates.deliver {
+                job.deliver = deliver;
+            }
+            if let Some(wrap_response) = updates.wrap_response {
+                job.wrap_response = wrap_response;
             }
         }
 
@@ -1475,6 +1506,8 @@ mod tests {
             enabled_toolsets: None,
             workdir: None,
             profile: None,
+            deliver: String::new(),
+            wrap_response: None,
         });
         store.save().unwrap();
         // After a clean save, the parent directory must contain exactly
@@ -1556,6 +1589,8 @@ mod tests {
             enabled_toolsets: None,
             workdir: None,
             profile: None,
+            deliver: String::new(),
+            wrap_response: None,
         });
         store.save().unwrap();
 
