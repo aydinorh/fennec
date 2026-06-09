@@ -21,6 +21,17 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
+/// Default scripts directory derived from a `jobs.json` path. Lives
+/// alongside the jobs file at `<jobs_dir>/scripts/` so a single Fennec
+/// home has a single scripts tree (matches the upstream's
+/// `HERMES_HOME/scripts/` convention).
+pub fn default_scripts_dir_for(jobs_path: &Path) -> PathBuf {
+    jobs_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("scripts")
+}
+
 /// Default script timeout (matches the upstream's
 /// `_DEFAULT_SCRIPT_TIMEOUT`). A script with no output within this many
 /// seconds is killed and reported as a failure.

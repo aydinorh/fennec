@@ -12,6 +12,7 @@ use crate::cron::jobs::{
     parse_schedule_kind, schedule_display_for, CronJob, JobStore, JobUpdates, RepeatConfig,
 };
 use crate::cron::output::{cleanup_job_output, default_output_dir_for};
+use crate::cron::script::{default_scripts_dir_for, resolve_script_path};
 
 use super::traits::{Tool, ToolResult};
 
@@ -76,6 +77,114 @@ impl CronTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    /// Tri-state model+provider extraction for update-style nullable
+    /// semantics. Returns `(provider_update, model_update)` where each
+    /// element follows the standard outer-`Option` convention: `None`
+    /// = leave unchanged, `Some(None)` = clear, `Some(Some(v))` = set.
+    ///
+    /// Accepts `model` as plain string or `{provider, model}` object
+    /// (matches upstream). Object form's `provider` overrides the
+    /// top-level `provider` arg; missing fields in the object are
+    /// treated as "clear that field" (consistent with the object being
+    /// a self-contained model spec, matching upstream's
+    /// `_resolve_model_override` semantics).
+    fn resolve_model_update(
+        args: &serde_json::Value,
+    ) -> (
+        Option<Option<String>>,
+        Option<Option<String>>,
+    ) {
+        let provider_top = Self::arg_outer_str(args, "provider");
+        let model_val = args.get("model");
+        let model_update: Option<Option<String>> = match model_val {
+            None => None,
+            Some(v) if v.is_null() => Some(None),
+            Some(v) if v.is_string() => {
+                let s = v.as_str().unwrap_or("").trim();
+                if s.is_empty() {
+                    Some(None)
+                } else {
+                    Some(Some(s.to_string()))
+                }
+            }
+            Some(v) if v.is_object() => {
+                let obj_model = v
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                Some(obj_model)
+            }
+            _ => None,
+        };
+        let provider_update: Option<Option<String>> = match model_val {
+            Some(v) if v.is_object() => {
+                let obj_provider = v
+                    .get("provider")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                match obj_provider {
+                    Some(p) => Some(Some(p)),
+                    None => provider_top,
+                }
+            }
+            _ => provider_top,
+        };
+        (provider_update, model_update)
+    }
+
+    /// Resolve the per-job model override. Accepts two shapes (matches
+    /// the upstream's `model` param, which is documented as an object
+    /// but agents commonly pass a bare string):
+    ///
+    /// - `model: "claude-sonnet-4-6"` (string) — sets the model name;
+    ///   provider is left to the top-level `provider` arg.
+    /// - `model: { "provider": "...", "model": "..." }` (object) — sets
+    ///   both. When the object has `model` but no `provider`, Fennec
+    ///   does NOT auto-pin a provider (its architecture uses a provider
+    ///   chain at startup, not a single "main provider" config to
+    ///   reference at create time — the upstream's auto-pin behaviour
+    ///   doesn't translate cleanly). Callers that want to pin a
+    ///   provider should set it explicitly via the top-level `provider`
+    ///   arg or the `model.provider` field.
+    ///
+    /// Returns `(provider, model)`. Either side can be `None`.
+    fn resolve_model_override(
+        args: &serde_json::Value,
+    ) -> (Option<String>, Option<String>) {
+        let model_val = args.get("model");
+        let top_provider = Self::arg_str(args, "provider");
+        match model_val {
+            None => (top_provider, None),
+            Some(v) if v.is_null() => (top_provider, None),
+            Some(v) if v.is_string() => {
+                let model_str = v
+                    .as_str()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                (top_provider, model_str)
+            }
+            Some(v) if v.is_object() => {
+                let obj_provider = v
+                    .get("provider")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let obj_model = v
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                // The object's provider wins over the top-level arg
+                // when both are given — the object form is the pinned
+                // pair, so its provider field is the authoritative one.
+                (obj_provider.or(top_provider), obj_model)
+            }
+            _ => (top_provider, None),
+        }
     }
 
     fn arg_bool(args: &serde_json::Value, key: &str) -> Option<bool> {
@@ -289,8 +398,9 @@ impl CronTool {
 
         // --------- Optional per-job parameters ---------
         let name_opt = Self::arg_str(args, "name");
-        let model = Self::arg_str(args, "model");
-        let provider = Self::arg_str(args, "provider");
+        // model accepts a plain string or a {provider, model} object;
+        // resolve_model_override picks the right split.
+        let (provider, model) = Self::resolve_model_override(args);
         let base_url = normalize_optional_str(
             Self::arg_str(args, "base_url").as_deref(),
             true,
@@ -331,6 +441,57 @@ impl CronTool {
                     "no_agent=true requires `script` to be set — with no agent and no script, there is nothing for the job to run.".to_string(),
                 ),
             });
+        }
+
+        // Validate the script path at create time so a typo'd path
+        // surfaces as a clear error here rather than at fire time.
+        // Matches the upstream's `_validate_cron_script_path` gate.
+        if let Some(path) = &script {
+            let scripts_dir = default_scripts_dir_for(&self.store_path);
+            if let Err(e) = resolve_script_path(&scripts_dir, path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "invalid script path '{path}': {e}. Place the script under {} and pass a relative path.",
+                        scripts_dir.display()
+                    )),
+                });
+            }
+        }
+
+        // Validate context_from references — each ID must resolve to an
+        // existing job. Matches the upstream's
+        // `if not _get_job(ref_id): return tool_error(...)` check at
+        // create time. Caught early so a typo doesn't silently produce
+        // a job that runs without the context the user expected.
+        if let Some(refs) = &context_from {
+            // Use a load-only store snapshot for the existence check.
+            // We can't reuse the eventual `mut store` below because we
+            // haven't created it yet at this point in the flow.
+            let mut peek = JobStore::new(self.store_path.clone());
+            peek.load()?;
+            for ref_id in refs {
+                match peek.resolve_job_ref(ref_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "context_from job '{ref_id}' not found. Use action='list' to see available jobs."
+                            )),
+                        });
+                    }
+                    Err(ambiguity) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("context_from: {ambiguity}")),
+                        });
+                    }
+                }
+            }
         }
 
         // Delivery routing token. Default mirrors upstream: `origin`
@@ -731,6 +892,54 @@ impl CronTool {
             opt.and_then(|s| normalize_optional_str(Some(&s), true))
         });
 
+        // model + provider come through the unified resolver so update
+        // accepts the same `{provider, model}` object form as create.
+        let (provider_update, model_update) = Self::resolve_model_update(args);
+
+        // Script path validation on update: if the caller is setting a
+        // new script (non-null, non-empty), verify it resolves under
+        // the scripts dir — same gate as create.
+        let script_update = Self::arg_outer_str(args, "script");
+        if let Some(Some(path)) = &script_update {
+            let scripts_dir = default_scripts_dir_for(&self.store_path);
+            if let Err(e) = resolve_script_path(&scripts_dir, path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "invalid script path '{path}': {e}. Place the script under {} and pass a relative path.",
+                        scripts_dir.display()
+                    )),
+                });
+            }
+        }
+
+        // context_from validation on update: each new ref must exist.
+        let context_from_update = Self::arg_outer_list(args, "context_from");
+        if let Some(Some(refs)) = &context_from_update {
+            for ref_id in refs {
+                match store.resolve_job_ref(ref_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "context_from job '{ref_id}' not found. Use action='list' to see available jobs."
+                            )),
+                        });
+                    }
+                    Err(ambiguity) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("context_from: {ambiguity}")),
+                        });
+                    }
+                }
+            }
+        }
+
         let repeat_update = if args
             .as_object()
             .map(|o| o.contains_key("repeat"))
@@ -769,11 +978,11 @@ impl CronTool {
             paused_reason: None,
             repeat: repeat_update,
             schedule_display: None,
-            script: Self::arg_outer_str(args, "script"),
+            script: script_update,
             no_agent: Self::arg_bool(args, "no_agent"),
-            context_from: Self::arg_outer_list(args, "context_from"),
-            model: Self::arg_outer_str(args, "model"),
-            provider: Self::arg_outer_str(args, "provider"),
+            context_from: context_from_update,
+            model: model_update,
+            provider: provider_update,
             base_url: base_url_update,
             enabled_toolsets: Self::arg_outer_list(args, "enabled_toolsets"),
             workdir: workdir_update,
@@ -861,8 +1070,25 @@ impl Tool for CronTool {
                     "description": "Other job IDs whose most recent output is prepended to this job's prompt as context (data-pipeline pattern)."
                 },
                 "model": {
-                    "type": ["string", "null"],
-                    "description": "Per-job model override (e.g. 'claude-sonnet-4-6')."
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "provider": {
+                                    "type": "string",
+                                    "description": "Provider name to pin alongside the model (e.g. 'anthropic', 'openrouter'). Overrides the top-level `provider` arg when both are given."
+                                },
+                                "model": {
+                                    "type": "string",
+                                    "description": "Model name (e.g. 'claude-sonnet-4-6')."
+                                }
+                            },
+                            "required": ["model"]
+                        },
+                        {"type": "null"}
+                    ],
+                    "description": "Per-job model override. Accepts a bare string (sets the model name; provider is taken from the separate `provider` arg if given) or a `{provider, model}` object that pins both at once. Pass null on update to clear."
                 },
                 "provider": {
                     "type": ["string", "null"],
@@ -1175,6 +1401,30 @@ mod tests {
         std::fs::create_dir_all(&workdir).unwrap();
         let tool = make_tool(&dir);
 
+        // context_from references are validated at create time — first
+        // create the upstream jobs so the downstream job can chain off
+        // them.
+        let up_a = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "upstream a",
+                "schedule": "every 1h",
+                "name": "upstream-a"
+            }))
+            .await
+            .unwrap();
+        let up_a_id = id_from_create(&up_a.output);
+        let up_b = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "upstream b",
+                "schedule": "every 1h",
+                "name": "upstream-b"
+            }))
+            .await
+            .unwrap();
+        let up_b_id = id_from_create(&up_b.output);
+
         let result = tool
             .execute(json!({
                 "action": "create",
@@ -1189,7 +1439,7 @@ mod tests {
                 "workdir": workdir.to_string_lossy(),
                 "profile": "audit",
                 "wrap_response": false,
-                "context_from": ["abc123", "def456"],
+                "context_from": [&up_a_id, &up_b_id],
                 "repeat": 7
             }))
             .await
@@ -1210,8 +1460,156 @@ mod tests {
         assert!(out.contains("Base URL override: https://api.example.com"), "{out}");
         assert!(out.contains("Enabled toolsets: filesystem, web"), "{out}");
         assert!(out.contains("Profile: audit"), "{out}");
-        assert!(out.contains("Context from: abc123, def456"), "{out}");
+        assert!(out.contains(&up_a_id), "{out}");
+        assert!(out.contains(&up_b_id), "{out}");
         assert!(out.contains("Repeat: 0/7"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_missing_context_from_ref() {
+        // Mirrors upstream's `_get_job(ref_id)` existence check at
+        // create time — a typo'd reference must fail loudly here, not
+        // silently leak into the prompt at fire time.
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "downstream consumer",
+                "schedule": "every 1h",
+                "context_from": ["never-existed-id"]
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("never-existed-id") && err.contains("not found"),
+            "expected 'not found' error pointing at the bad ref, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_script_outside_scripts_dir() {
+        // Script path validation at create time — typo'd / escaped
+        // paths must fail here, not at fire time.
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "watchdog",
+                "schedule": "every 5m",
+                "script": "../../etc/passwd"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("invalid script path"),
+            "expected script-path error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_accepts_script_under_scripts_dir() {
+        let dir = TempDir::new().unwrap();
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("hello.sh"), "#!/bin/bash\necho hi\n").unwrap();
+        let tool = make_tool(&dir);
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "watchdog",
+                "schedule": "every 5m",
+                "script": "hello.sh",
+                "no_agent": true
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "valid script should pass: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn create_accepts_model_object_with_pinned_provider() {
+        // Upstream's `model` is documented as a `{provider, model}`
+        // object; PR 6 originally only accepted plain strings. This
+        // verifies both shapes work and the object form's provider
+        // wins over a separately-passed top-level provider.
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "x",
+                "schedule": "every 1h",
+                "model": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4-6"
+                },
+                "provider": "ignored-because-object-form-wins"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let id = id_from_create(&result.output);
+        let get = tool
+            .execute(json!({"action": "get", "job_id": &id}))
+            .await
+            .unwrap();
+        let out = get.output;
+        assert!(
+            out.contains("Model override: anthropic/claude-sonnet-4-6"),
+            "{out}"
+        );
+        assert!(out.contains("Provider override: openrouter"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn update_accepts_model_object_and_null_clears() {
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let create = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "x",
+                "schedule": "every 1h",
+                "model": "claude-sonnet-4-6",
+                "provider": "anthropic"
+            }))
+            .await
+            .unwrap();
+        let id = id_from_create(&create.output);
+
+        // Update to a {provider, model} pair.
+        let upd = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": &id,
+                "model": {"provider": "openrouter", "model": "x-ai/grok"}
+            }))
+            .await
+            .unwrap();
+        assert!(upd.success, "{:?}", upd.error);
+        assert!(upd.output.contains("Model override: x-ai/grok"));
+        assert!(upd.output.contains("Provider override: openrouter"));
+
+        // Clear the model via null.
+        let upd2 = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": &id,
+                "model": null
+            }))
+            .await
+            .unwrap();
+        assert!(upd2.success);
+        assert!(!upd2.output.contains("Model override"));
     }
 
     #[tokio::test]
