@@ -13,6 +13,7 @@ use crate::cron::jobs::{
 };
 use crate::cron::output::{cleanup_job_output, default_output_dir_for};
 use crate::cron::script::{default_scripts_dir_for, resolve_script_path};
+use crate::cron::skill_inject::canonical_skills;
 
 use super::traits::{Tool, ToolResult};
 
@@ -343,6 +344,10 @@ impl CronTool {
         if let Some(context_from) = &job.context_from {
             lines.push(format!("  Context from: {}", context_from.join(", ")));
         }
+        let skills_view = canonical_skills(job.skill.as_deref(), job.skills.as_deref());
+        if !skills_view.is_empty() {
+            lines.push(format!("  Skills: {}", skills_view.join(", ")));
+        }
         if let Some(times) = job.repeat.times {
             lines.push(format!(
                 "  Repeat: {}/{}",
@@ -353,14 +358,6 @@ impl CronTool {
     }
 
     fn execute_create(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let Some(prompt) = Self::arg_str(args, "prompt") else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("missing required parameter: prompt".to_string()),
-            });
-        };
-
         let Some(schedule_raw) = Self::arg_str(args, "schedule") else {
             return Ok(ToolResult {
                 success: false,
@@ -368,6 +365,14 @@ impl CronTool {
                 error: Some("missing required parameter: schedule".to_string()),
             });
         };
+        // Prompt is required UNLESS the job ships skills (skill-only
+        // jobs are valid: the assembled prompt is the loaded skill
+        // content). Matches upstream's `if not prompt and not
+        // canonical_skills` gate.
+        let prompt = Self::arg_str(args, "prompt").unwrap_or_default();
+        let skill_legacy = Self::arg_str(args, "skill");
+        let skills_list = Self::arg_list(args, "skills");
+        let canonical = canonical_skills(skill_legacy.as_deref(), skills_list.as_deref());
 
         // No auto-`every`-prefix: bare durations are one-shot, `every X`
         // is recurring, `0 9 * * *` is a cron expression, and an ISO
@@ -439,6 +444,21 @@ impl CronTool {
                 output: String::new(),
                 error: Some(
                     "no_agent=true requires `script` to be set — with no agent and no script, there is nothing for the job to run.".to_string(),
+                ),
+            });
+        }
+
+        // Agent jobs require either a prompt or at least one skill so
+        // the assembled prompt has something for the agent to do.
+        // Matches upstream's `elif not prompt and not canonical_skills`
+        // gate. no_agent jobs don't need a prompt (the script is the
+        // job) so the check only applies to the LLM path.
+        if !no_agent && prompt.trim().is_empty() && canonical.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "create requires either `prompt` or at least one entry in `skills` (a skill-only job is fine — the skill content becomes the prompt).".to_string(),
                 ),
             });
         }
@@ -543,13 +563,15 @@ impl CronTool {
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or(now);
 
-        // Friendly name: explicit `name` arg, else first 60 chars of
-        // the prompt (or "cron job" for prompts without printable
-        // content). Falls back to the script path when there's no
-        // prompt + no_agent.
+        // Friendly name: explicit `name` arg, else the first 60 chars
+        // of the prompt; for skill-only or no_agent jobs falls back
+        // to the first skill name or the script path. "cron job" as
+        // a last resort.
         let name = name_opt.unwrap_or_else(|| {
             let candidate = if !prompt.is_empty() {
                 prompt.clone()
+            } else if let Some(first) = canonical.first() {
+                first.clone()
             } else if let Some(s) = &script {
                 s.clone()
             } else {
@@ -588,6 +610,14 @@ impl CronTool {
             profile,
             deliver,
             wrap_response,
+            // Legacy single-skill field tracks the first canonical
+            // name; the plural `skills` is the authoritative list.
+            skill: canonical.first().cloned(),
+            skills: if canonical.is_empty() {
+                None
+            } else {
+                Some(canonical.clone())
+            },
         };
 
         let mut store = self.load_store()?;
@@ -989,6 +1019,53 @@ impl CronTool {
             profile: Self::arg_outer_str(args, "profile"),
             deliver: Self::arg_str(args, "deliver"),
             wrap_response: Self::arg_outer_bool(args, "wrap_response"),
+            // skill+skills support all three states:
+            //   - absent → leave both unchanged
+            //   - explicit empty list `skills: []` → clear both
+            //   - explicit list `skills: ["a", "b"]` → set canonical
+            //   - explicit string `skill: "x"` → set canonical
+            // The plural list wins when both are passed; the legacy
+            // single field tracks the first canonical entry.
+            skill: {
+                let skill_present = args
+                    .as_object()
+                    .map(|o| o.contains_key("skill"))
+                    .unwrap_or(false);
+                let skills_present = args
+                    .as_object()
+                    .map(|o| o.contains_key("skills"))
+                    .unwrap_or(false);
+                if !skill_present && !skills_present {
+                    None
+                } else {
+                    let legacy = Self::arg_str(args, "skill");
+                    let list = Self::arg_list(args, "skills");
+                    let canonical = canonical_skills(legacy.as_deref(), list.as_deref());
+                    Some(canonical.into_iter().next())
+                }
+            },
+            skills: {
+                let skill_present = args
+                    .as_object()
+                    .map(|o| o.contains_key("skill"))
+                    .unwrap_or(false);
+                let skills_present = args
+                    .as_object()
+                    .map(|o| o.contains_key("skills"))
+                    .unwrap_or(false);
+                if !skill_present && !skills_present {
+                    None
+                } else {
+                    let legacy = Self::arg_str(args, "skill");
+                    let list = Self::arg_list(args, "skills");
+                    let canonical = canonical_skills(legacy.as_deref(), list.as_deref());
+                    Some(if canonical.is_empty() {
+                        None
+                    } else {
+                        Some(canonical)
+                    })
+                }
+            },
         };
 
         match store.update_job(&resolved_id, updates)? {
@@ -1068,6 +1145,15 @@ impl Tool for CronTool {
                     "type": ["array", "null"],
                     "items": {"type": "string"},
                     "description": "Other job IDs whose most recent output is prepended to this job's prompt as context (data-pipeline pattern)."
+                },
+                "skill": {
+                    "type": ["string", "null"],
+                    "description": "Legacy single-skill name. Folded into the canonical `skills` list. Prefer `skills` for new jobs."
+                },
+                "skills": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": "Ordered list of skill names to load before running. Each skill's content is prepended to the prompt with a `[IMPORTANT: invoked the \"X\" skill]` header. Missing skills produce a `'⚠️ Skill(s) not found and skipped'` notice the agent repeats. Skill-only jobs (no prompt) are allowed when `skills` is non-empty — the skill content becomes the prompt. On update, pass an empty array to clear."
                 },
                 "model": {
                     "oneOf": [
@@ -1568,6 +1654,124 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("Provider override: openrouter"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn create_accepts_skills_list_and_skill_only_jobs() {
+        // Matches upstream's `if not prompt and not canonical_skills`
+        // gate: a skill-only job is valid when at least one skill is
+        // attached.
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "schedule": "every 1h",
+                "skills": ["nightly-review", "summarize"]
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "skill-only create failed: {:?}", result.error);
+        let id = id_from_create(&result.output);
+        let get = tool
+            .execute(json!({"action": "get", "job_id": &id}))
+            .await
+            .unwrap();
+        let out = get.output;
+        assert!(
+            out.contains("Skills: nightly-review, summarize"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_no_prompt_and_no_skills() {
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "schedule": "every 1h"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("requires either `prompt` or at least one entry in `skills`")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_canonicalises_legacy_skill_with_plural_list() {
+        // Legacy `skill` + plural `skills` with overlap → ordered
+        // unique list (matches upstream's `_canonical_skills`).
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "do thing",
+                "schedule": "every 1h",
+                "skill": "alpha",
+                "skills": ["alpha", "beta", "gamma"]
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let id = id_from_create(&result.output);
+        let get = tool
+            .execute(json!({"action": "get", "job_id": &id}))
+            .await
+            .unwrap();
+        assert!(
+            get.output.contains("Skills: alpha, beta, gamma"),
+            "{}",
+            get.output
+        );
+    }
+
+    #[tokio::test]
+    async fn update_skills_set_and_clear_via_empty_list() {
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+        let create = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "x",
+                "schedule": "every 1h",
+                "skills": ["one"]
+            }))
+            .await
+            .unwrap();
+        let id = id_from_create(&create.output);
+
+        // Replace the skill list.
+        let upd = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": &id,
+                "skills": ["two", "three"]
+            }))
+            .await
+            .unwrap();
+        assert!(upd.success, "{:?}", upd.error);
+        assert!(upd.output.contains("Skills: two, three"), "{}", upd.output);
+
+        // Clear via empty list — matches upstream's "On update, pass an
+        // empty array to clear" convention.
+        let upd2 = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": &id,
+                "skills": []
+            }))
+            .await
+            .unwrap();
+        assert!(upd2.success);
+        assert!(!upd2.output.contains("Skills:"), "{}", upd2.output);
     }
 
     #[tokio::test]
