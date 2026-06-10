@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
 use crate::providers::openai::is_reasoning_model as openai_is_reasoning_model;
-use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str_resolved};
 use crate::security::PathSandbox;
 
 use super::traits::{Tool, ToolResult};
@@ -92,7 +92,7 @@ impl VisionTool {
     /// fetched via reqwest; paths are read from disk.
     async fn load_image(&self, source: &str) -> Result<(Vec<u8>, String)> {
         if source.starts_with("http://") || source.starts_with("https://") {
-            validate_url_str(source)?;
+            validate_url_str_resolved(source).await?;
             let resp = self.client.get(source).send().await?;
             if !resp.status().is_success() {
                 anyhow::bail!("HTTP {} fetching image", resp.status());

@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str_resolved};
 
 use super::traits::{Tool, ToolResult};
 
@@ -82,7 +82,7 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(50_000) as usize;
 
-        if let Err(e) = validate_url_str(url) {
+        if let Err(e) = validate_url_str_resolved(url).await {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
