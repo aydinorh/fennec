@@ -1222,7 +1222,7 @@ impl Tool for CronTool {
                 },
                 "workdir": {
                     "type": ["string", "null"],
-                    "description": "Absolute project directory the job runs from. Validated at create / update time (must exist + be a directory). Project context files (AGENTS.md / CLAUDE.md / .cursorrules) get injected into the system prompt downstream."
+                    "description": "Absolute project directory the job runs from. Validated at create / update time (must exist + be a directory). Stored on the job and propagated to the agent run via metadata."
                 },
                 "profile": {
                     "type": ["string", "null"],
