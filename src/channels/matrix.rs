@@ -1027,8 +1027,17 @@ impl MatrixChannel {
     }
 
     fn is_dm_sender_allowed(&self, sender: &str) -> bool {
+        // Default-DENY: an empty allowlist refuses everyone ("*" opts
+        // into allow-everyone). See the telegram channel for rationale.
         let allow = &self.config.allowed_users;
         if allow.is_empty() {
+            tracing::warn!(
+                "Matrix: refusing DM from '{sender}' — no allowed_users configured. \
+                 Add your user id to [channels.matrix].allowed_users (or \"*\" to allow everyone)."
+            );
+            return false;
+        }
+        if allow.iter().any(|s| s == "*") {
             return true;
         }
         allow.iter().any(|s| s.eq_ignore_ascii_case(sender))
@@ -2887,9 +2896,19 @@ mod tests {
     // -- Allowlists ----------------------------------------------
 
     #[test]
-    fn dm_allowlist_empty_allows_all() {
+    fn dm_allowlist_empty_denies_all() {
+        // Default-deny: an unconfigured allowlist must refuse everyone;
+        // "*" is the explicit allow-everyone opt-in.
         let ch = channel();
-        assert!(ch.is_dm_sender_allowed("@alice:example.org"));
+        assert!(!ch.is_dm_sender_allowed("@alice:example.org"));
+    }
+
+    #[test]
+    fn dm_allowlist_wildcard_allows_all() {
+        let mut c = cfg();
+        c.allowed_users = vec!["*".into()];
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        assert!(ch.is_dm_sender_allowed("@anyone:example.org"));
     }
 
     #[test]
@@ -3214,8 +3233,10 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_passes_dm_when_no_allowlist() {
-        let ch = channel();
+    fn handle_event_passes_dm_with_wildcard_allowlist() {
+        let mut c = cfg();
+        c.allowed_users = vec!["*".into()];
+        let ch = MatrixChannel::from_config(&c).unwrap();
         // Mark room as DM.
         ch.state.dm_rooms.lock().insert("!dm:example.org".into());
         let event = evt(json!({

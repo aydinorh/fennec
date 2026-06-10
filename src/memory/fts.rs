@@ -24,11 +24,26 @@
 //! OR-joins the surviving quoted phrases. The result is either a safe
 //! MATCH expression or `None` if no usable tokens remained.
 
-/// Build a safe FTS5 MATCH expression from free-form user input.
+/// Build a safe FTS5 MATCH expression from free-form user input,
+/// OR-joining the tokens (ANY token matches). Used by memory recall and
+/// the collective cache, where forgiving multi-word recall beats
+/// precision.
 ///
 /// Returns `None` if the input produces no usable tokens — callers
 /// should treat this as "no matches" rather than running the query.
 pub fn build_match_query(query: &str) -> Option<String> {
+    join_sanitized(query, " OR ")
+}
+
+/// Build a safe FTS5 MATCH expression AND-joining the tokens (ALL
+/// tokens must match). Used by session search: a user searching
+/// "docker timeout" wants the conversation about docker timeouts, not
+/// every session mentioning either word.
+pub fn build_match_query_all(query: &str) -> Option<String> {
+    join_sanitized(query, " AND ")
+}
+
+fn join_sanitized(query: &str, op: &str) -> Option<String> {
     let parts: Vec<String> = query
         .split_whitespace()
         .filter_map(sanitize_token)
@@ -36,7 +51,7 @@ pub fn build_match_query(query: &str) -> Option<String> {
     if parts.is_empty() {
         None
     } else {
-        Some(parts.join(" OR "))
+        Some(parts.join(op))
     }
 }
 
@@ -73,6 +88,23 @@ mod tests {
     fn empty_input_returns_none() {
         assert!(build_match_query("").is_none());
         assert!(build_match_query("   ").is_none());
+        assert!(build_match_query_all("").is_none());
+    }
+
+    /// Session search AND-joins: every term must match. (Upstream's
+    /// session search defaults to AND; OR made multi-word searches
+    /// return every session mentioning any single word.)
+    #[test]
+    fn all_variant_and_joins() {
+        assert_eq!(
+            build_match_query_all("docker timeout"),
+            Some("\"docker\" AND \"timeout\"".into())
+        );
+        // Same sanitization as the OR variant.
+        assert_eq!(
+            build_match_query_all("foo\"bar baz*"),
+            Some("\"foobar\" AND \"baz\"".into())
+        );
     }
 
     /// Regression for the headline FTS5 injection bug: `foo"bar`

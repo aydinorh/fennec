@@ -559,7 +559,12 @@ fn build_config_toml(
     let plurum_key_lit = toml_str(plurum_key);
 
     let allowed_users_line = if telegram_user_id.is_empty() {
-        "allowed_users = []".to_string()
+        // Channels default-DENY on an empty allowlist. Leave the empty
+        // list (secure default) but tell the user how to open it up —
+        // otherwise the bot silently ignores them and the only clue is
+        // a gateway log line.
+        "# Empty = nobody may talk to the bot. Add your Telegram user ID,\n# or \"*\" to allow everyone.\nallowed_users = []"
+            .to_string()
     } else {
         format!("allowed_users = [{}]", toml_str(telegram_user_id))
     };

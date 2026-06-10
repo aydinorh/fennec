@@ -94,6 +94,7 @@ impl SessionStore {
         // pointing at a deleted or never-created session can accumulate.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;",
@@ -401,9 +402,11 @@ impl SessionStore {
     }
 
     /// Full-text search across all session messages. Returns results ranked by
-    /// BM25 relevance score.
+    /// BM25 relevance score. Terms are AND-joined: every word must match,
+    /// so "docker timeout" finds the docker-timeout conversation instead
+    /// of every session mentioning either word.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let Some(fts_query) = crate::memory::fts::build_match_query(query) else {
+        let Some(fts_query) = crate::memory::fts::build_match_query_all(query) else {
             return Ok(vec![]);
         };
 

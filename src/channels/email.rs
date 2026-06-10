@@ -316,8 +316,14 @@ impl Channel for EmailChannel {
     }
 
     fn allows_sender(&self, sender_id: &str) -> bool {
+        // Default-DENY: an empty allowlist refuses everyone ("*" opts
+        // into allow-everyone). See the telegram channel for rationale.
         if self.allowed_senders.is_empty() {
-            return true;
+            tracing::warn!(
+                "Email: refusing message from '{sender_id}' — no allowed_senders configured. \
+                 Add the address to [channels.email].allowed_senders (or \"*\" to allow everyone)."
+            );
+            return false;
         }
         if self.allowed_senders.iter().any(|u| u == "*") {
             return true;
@@ -367,7 +373,9 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_sender_empty() {
+    fn test_allows_sender_empty_denies() {
+        // Default-deny: an unconfigured allowlist must refuse everyone;
+        // "*" is the explicit allow-everyone opt-in.
         let ch = EmailChannel::new(
             "imap.example.com".to_string(),
             993,
@@ -381,7 +389,7 @@ mod tests {
             vec![],
             30,
         );
-        assert!(ch.allows_sender("anyone@example.com"));
+        assert!(!ch.allows_sender("anyone@example.com"));
     }
 
     #[test]
