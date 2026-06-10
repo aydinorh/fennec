@@ -705,10 +705,7 @@ impl Agent {
                     }
                     StreamEvent::ToolCallEnd { id: _ } => {
                         if let Some((id, name, args)) = current_tool.take() {
-                            let arguments: serde_json::Value =
-                                serde_json::from_str(&args).unwrap_or_else(|_| {
-                                    serde_json::Value::Object(serde_json::Map::new())
-                                });
+                            let arguments = parse_streamed_tool_args(&name, &args);
                             tool_calls.push(ToolCall {
                                 id,
                                 name,
@@ -1999,6 +1996,23 @@ async fn run_tool_call(
 ) -> (String, bool, std::time::Duration) {
     let started = std::time::Instant::now();
 
+    // `Null` arguments are the sentinel for "the provider sent argument
+    // JSON that did not parse" (truncated stream, malformed output — see
+    // `parse_streamed_tool_args` and the providers' non-streaming
+    // parsers). Executing anyway would run the tool with arguments the
+    // model never chose; surface a retryable error instead.
+    if args.is_null() {
+        return (
+            format!(
+                "Error: the arguments for tool '{name}' were not valid JSON \
+                 (the stream may have been truncated). The call was NOT \
+                 executed — re-issue it with complete arguments."
+            ),
+            false,
+            started.elapsed(),
+        );
+    }
+
     // Plugin pre-tool hook: may skip the call or rewrite the arguments.
     let effective_args = if with_hooks {
         match hooks.fire_pre_tool(&name, &args) {
@@ -2096,6 +2110,63 @@ fn truncate_summary(s: &str) -> String {
         let mut out: String = single_line.chars().take(MAX - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// Parse the accumulated argument buffer of a streamed tool call.
+///
+/// - Empty buffer → `{}`: providers legitimately send no argument deltas
+///   for parameter-less tools.
+/// - Valid JSON → parsed as-is.
+/// - Non-empty but unparseable (truncated stream, malformed provider
+///   output) → `Value::Null`, the sentinel `run_tool_call` refuses to run.
+///   The old behavior coerced this case to `{}` and executed the tool
+///   with arguments the model never chose.
+fn parse_streamed_tool_args(name: &str, buf: &str) -> serde_json::Value {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "streamed tool-call '{}' arguments did not parse ({}); \
+                 marking the call malformed instead of executing with empty args",
+                name,
+                e
+            );
+            serde_json::Value::Null
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_arg_tests {
+    use super::parse_streamed_tool_args;
+
+    #[test]
+    fn empty_buffer_is_valid_no_arg_call() {
+        let v = parse_streamed_tool_args("noop", "");
+        assert!(v.as_object().is_some_and(|m| m.is_empty()));
+        let v = parse_streamed_tool_args("noop", "   ");
+        assert!(v.as_object().is_some_and(|m| m.is_empty()));
+    }
+
+    #[test]
+    fn valid_json_parses() {
+        let v = parse_streamed_tool_args("shell", r#"{"command": "ls"}"#);
+        assert_eq!(v["command"], "ls");
+    }
+
+    #[test]
+    fn truncated_json_becomes_null_sentinel() {
+        // A stream cut mid-arguments must NOT become {} (which would
+        // execute the tool with args the model never chose).
+        let v = parse_streamed_tool_args("write_file", r#"{"path": "/tmp/x", "conte"#);
+        assert!(v.is_null());
+        let v = parse_streamed_tool_args("shell", "not json at all");
+        assert!(v.is_null());
     }
 }
 
