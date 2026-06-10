@@ -78,7 +78,7 @@ pub fn run_oauth_login(fennec_home: &Path) -> Result<OAuthCredentials> {
     let challenge = compute_challenge(&verifier);
 
     // 2. Build authorization URL.
-    // Build authorization URL — matches Hermes's exact parameter set.
+    // Build authorization URL — matches the upstream's exact parameter set.
     // The "code=true" param and "state=verifier" are required by Anthropic.
     let auth_url = format!(
         "{}?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",

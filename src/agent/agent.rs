@@ -74,7 +74,7 @@ pub struct Agent {
     /// Image attachments queued by `/image` and `/paste` for
     /// the next user turn. Drained at the top of `turn` /
     /// `turn_streaming` and attached to the outbound user
-    /// `ChatMessage`. Mirrors Hermes'
+    /// `ChatMessage`. Mirrors the upstream's
     /// `session["attached_images"]` (`tui_gateway/server.py:3361-3401`).
     pending_attachments: Vec<super::attachment::ImageAttachment>,
     /// Steer text queued via `/steer` while a turn is running
@@ -1066,7 +1066,7 @@ impl Agent {
     /// in that case).
     ///
     /// Used by `/undo` (to drop the last exchange) and `/retry`
-    /// (to drop + re-submit the user message). Mirrors Hermes'
+    /// (to drop + re-submit the user message). Mirrors the upstream's
     /// `session.undo` (`tui_gateway/server.py:2424-2449`) which
     /// pops in reverse until a user-role row is found.
     pub fn pop_last_turn(&mut self) -> Option<(usize, String)> {
@@ -1336,7 +1336,7 @@ impl Agent {
     /// Append `text` to the pending-steer queue. Multiple calls
     /// before the next tool batch concatenate with newlines, so
     /// the model sees them as one block. Returns `true` if the
-    /// text was accepted (matches Hermes' `agent.steer` return
+    /// text was accepted (matches the upstream's `agent.steer` return
     /// at `run_agent.py:4493-4527`).
     pub fn steer(&mut self, text: &str) -> bool {
         let trimmed = text.trim();
@@ -1361,7 +1361,7 @@ impl Agent {
 
     /// Drain any pending steer text onto the most recent tool
     /// result message in `history`, formatted with the
-    /// "User guidance:" marker that mirrors Hermes'
+    /// "User guidance:" marker that mirrors the upstream's
     /// `_apply_pending_steer_to_tool_results`
     /// (`run_agent.py:4545-4600`). Returns `true` if a steer
     /// was applied — callers can use this to decide whether to

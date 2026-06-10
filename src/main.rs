@@ -1809,7 +1809,7 @@ async fn handle_command_outcome(
 
 /// `/title` worker — reads or writes the current session's
 /// title via the SessionStore. `payload = None` reads, `Some`
-/// writes. Mirrors Hermes' `session.title` RPC: read returns
+/// writes. Mirrors the upstream's `session.title` RPC: read returns
 /// "title: <name>" or "no title set"; write returns "session
 /// title set: <name>" with an optional "(queued while session
 /// initializes)" suffix when the row hasn't been created yet.
@@ -1857,7 +1857,7 @@ async fn handle_session_title(
 
 /// `/resume` worker — looks up the target session by id, then
 /// by exact title, fetches its message history, and replays
-/// it into the agent. Mirrors Hermes' `session.resume`
+/// it into the agent. Mirrors the upstream's `session.resume`
 /// (`tui_gateway/server.py:2180-2221`): reset agent, load
 /// messages as conversation, re-emit a system line so the
 /// chat shows what was loaded. Empty store / unknown id
@@ -1973,7 +1973,7 @@ async fn handle_session_resume(
 /// user can pick one. `Some(name)` rebuilds the provider with
 /// the new model, swaps it on the live agent, and confirms.
 ///
-/// Mid-turn swap is rejected (matching Hermes'
+/// Mid-turn swap is rejected (matching the upstream's
 /// `_apply_model_switch` at server.py:1067-1145, which raises
 /// "session busy"). Detection here is a `try_lock` on the
 /// agent's tokio mutex — if it's held, a turn is in flight.
@@ -2043,7 +2043,7 @@ async fn handle_switch_model(
             agent_lock.set_provider(provider);
             drop(agent_lock);
             // Persist the new model to disk so the change survives
-            // a restart, mirroring Hermes' `_persist_model_switch`.
+            // a restart, mirroring the upstream's `_persist_model_switch`.
             // A failure here is non-fatal — the live agent already
             // has the swap applied; we just warn the user.
             let mut persisted = config.clone();
@@ -2064,7 +2064,7 @@ async fn handle_switch_model(
 /// enabled/disabled status, or toggle the listed names. After
 /// any toggle, persist the new disabled set to
 /// `~/.fennec/config.toml` and clear the agent's chat history
-/// (matching Hermes' `_reset_session_agent` behavior on
+/// (matching the upstream's `_reset_session_agent` behavior on
 /// tools.configure: previously-fired tool_calls in history
 /// would otherwise reference tools the model can no longer
 /// invoke). Mid-turn toggles are rejected.
@@ -2125,11 +2125,11 @@ async fn handle_tools_toggle(
                 }
                 // If the tool exists but is already in the requested
                 // state, set_tool_enabled returns false — no error,
-                // just no-op (matches Hermes' silent idempotence).
+                // just no-op (matches the upstream's silent idempotence).
             }
             // Capture the new disabled set for persistence.
             let new_disabled = agent_lock.disabled_tool_names();
-            // Tool change must clear chat history (Hermes' behavior).
+            // Tool change must clear chat history (the upstream's behavior).
             if !changed.is_empty() {
                 agent_lock.clear_history();
             }
@@ -2144,7 +2144,7 @@ async fn handle_tools_toggle(
             }
 
             // Reset visible chat history too so the user sees the
-            // reset Hermes also performs.
+            // reset the upstream also performs.
             if !changed.is_empty() {
                 let mut g = app.lock();
                 g.chat.clear();
@@ -2171,7 +2171,7 @@ async fn handle_tools_toggle(
 /// `/reload` worker — re-read `~/.fennec/.env` into the
 /// running process. Newly-set keys take effect on the next
 /// provider call without a restart. Already-built provider
-/// Arcs keep their cached credentials, same as Hermes (which
+/// Arcs keep their cached credentials, same as the upstream (which
 /// docstrings this same caveat at server.py:4147-4165).
 fn handle_reload_env(
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
@@ -2624,7 +2624,7 @@ async fn handle_reload_skills(
 /// after the next tool batch with the "User guidance:" marker.
 /// If a turn isn't currently running (try_lock succeeds), the
 /// queued text still lands on the next tool result of whatever
-/// turn fires next, mirroring Hermes' "no active turn — queued
+/// turn fires next, mirroring the upstream's "no active turn — queued
 /// for next" fallback (`core.ts:527-563`).
 ///
 /// `/steer` itself returns immediately — actual injection
@@ -2658,7 +2658,7 @@ async fn handle_steer(
             Err(_) => {
                 // Turn is mid-flight. We still want the steer to
                 // land — fall back to a non-blocking lock that
-                // suspends the submit task briefly. Hermes' RPC
+                // suspends the submit task briefly. the upstream's RPC
                 // path takes the agent lock unconditionally, same
                 // shape.
                 let mut g = agent.lock().await;
@@ -2679,7 +2679,7 @@ async fn handle_steer(
 
 /// `/undo` worker — drop the last user / assistant exchange
 /// from the agent's history. Mid-turn rejection via try_lock
-/// matches Hermes' "session busy" guard at server.py:2424-2449.
+/// matches the upstream's "session busy" guard at server.py:2424-2449.
 /// The chat-side cleanup (popping ChatLines) was done by the
 /// command handler before we got here.
 async fn handle_undo(
@@ -2718,7 +2718,7 @@ async fn handle_undo(
 /// then re-submit the user message as a fresh streaming turn.
 /// Mid-turn rejection via try_lock. If there's no prior user
 /// message to retry, surfaces "nothing to retry" rather than
-/// silently no-op (matches Hermes' core.ts:587-610).
+/// silently no-op (matches the upstream's core.ts:587-610).
 async fn handle_retry(
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
     agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
@@ -2906,7 +2906,7 @@ fn handle_copy_assistant(
 /// `/image` worker — load + base64-encode the file, queue it
 /// on the agent for the next user turn, and echo metadata back
 /// to the chat (filename, dimensions, token estimate). Mirrors
-/// Hermes' image.attach RPC (`tui_gateway/server.py:3361-3401`).
+/// the upstream's image.attach RPC (`tui_gateway/server.py:3361-3401`).
 async fn handle_attach_image(
     path: std::path::PathBuf,
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
@@ -2941,7 +2941,7 @@ async fn handle_attach_image(
     });
 }
 
-/// `/reload_mcp` worker — Hermes calls
+/// `/reload_mcp` worker — the upstream calls
 /// `shutdown_mcp_servers` + `discover_mcp_tools` against the
 /// active session's MCP clients. Fennec's agent doesn't
 /// currently boot MCP clients (the `mcp` module exists but

@@ -658,7 +658,7 @@ pub struct App {
     /// Per-section overrides set via `/details <section> <mode>`.
     /// When a key (e.g. `"thinking"`) is present, the renderer
     /// uses that mode for the matching section instead of the
-    /// global `details_mode`. Mirrors Hermes' `ui.sections`
+    /// global `details_mode`. Mirrors the upstream's `ui.sections`
     /// (`domain/details.ts:51-74`).
     pub details_section_overrides: std::collections::HashMap<String, DetailsMode>,
     /// `/mouse` toggle — drives crossterm's mouse-tracking
@@ -1075,7 +1075,7 @@ impl App {
     }
 
     /// Whether a modal overlay is currently consuming input.
-    /// Mirrors Hermes' `$isBlocked` computed atom: when `true`,
+    /// Mirrors the upstream's `$isBlocked` computed atom: when `true`,
     /// the global key router sends input to the modal handler
     /// instead of focus-dependent panes.
     pub fn is_blocked(&self) -> bool {
@@ -1245,7 +1245,7 @@ impl App {
     }
 
     /// Modal-active key handler. Each variant has a distinct key
-    /// map matching Hermes' per-modal `useInput` handlers in
+    /// map matching the upstream's per-modal `useInput` handlers in
     /// `prompts.tsx`. On resolve the modal is removed from
     /// `self.modal` and (for callback-driven modals) the user's
     /// choice is sent through the oneshot.
@@ -1917,7 +1917,7 @@ impl App {
             KeyCode::Char('y') if ctrl => self.input.redo(),
 
             // Open $EDITOR with the current input pre-filled.
-            // Hermes uses Cmd-G (macOS) / Ctrl-G (Linux/Windows)
+            // the upstream uses Cmd-G (macOS) / Ctrl-G (Linux/Windows)
             // with Alt-G as the VSCode/Cursor fallback (those
             // terminals intercept Ctrl-G as "Find Next" before
             // we see it). Crossterm reports Alt as the META

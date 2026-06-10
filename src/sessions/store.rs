@@ -530,7 +530,7 @@ impl SessionStore {
     }
 
     /// Look up a single session by exact id, then by exact title
-    /// as a fallback. Mirrors Hermes' `db.get_session_by_title()`
+    /// as a fallback. Mirrors the upstream's `db.get_session_by_title()`
     /// fallback (`tui_gateway/server.py:2180-2221`) so users who
     /// type `/resume my-experiment` instead of the UUID can still
     /// land on the right session. Returns `None` when neither
@@ -608,7 +608,7 @@ impl SessionStore {
     /// Fetch every persisted message for `session_id` in
     /// chronological order. Used by `/resume` to repopulate
     /// `Agent::history` so the next turn sees the full prior
-    /// context, matching Hermes' `db.get_messages_as_conversation`
+    /// context, matching the upstream's `db.get_messages_as_conversation`
     /// (`tui_gateway/server.py:2180-2221`).
     pub async fn get_session_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let conn = Arc::clone(&self.conn);

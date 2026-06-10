@@ -255,7 +255,7 @@ impl SubagentObserver {
             is_error: false,
         });
         // Best-effort file tracking — extract a `path` arg when
-        // the tool is one of the canonical file tools. Hermes
+        // the tool is one of the canonical file tools. The upstream
         // does this server-side via a `file_state` registry; the
         // names match what `src/tools/files.rs` exposes.
         if let Some(path) = start.args.get("path").and_then(|v| v.as_str()) {

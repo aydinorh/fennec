@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Three endpoints (per signal-cli's `signal-cli-jsonrpc.5` man
-//! page, verified against upstream Hermes' production
+//! page, verified against the upstream's production
 //! implementation):
 //!
 //!   POST /api/v1/rpc    JSON-RPC 2.0 — outbound sends, contact

@@ -5,7 +5,7 @@
 //! composer contents, and pastes the saved result back into the
 //! input buffer when the editor exits.
 //!
-//! Mirrors Hermes' `lib/editor.ts` + `useComposerState.ts:267-297`
+//! Mirrors the upstream's `lib/editor.ts` + `useComposerState.ts:267-297`
 //! flow: `$VISUAL > $EDITOR > nano/pico/vi/emacs > vi` priority,
 //! shell-tokenised so `EDITOR="code --wait"` works, tempdir
 //! cleaned unconditionally on Drop.
@@ -26,7 +26,7 @@ use anyhow::{Context, Result, anyhow};
 /// 4. Fallback floor: `vi` (Unix) / `notepad.exe` (Windows)
 ///
 /// Empty / whitespace-only env vars are treated as unset, matching
-/// Hermes' `editor.ts:29-47`.
+/// the upstream's `editor.ts:29-47`.
 pub fn resolve_editor() -> Vec<String> {
     for env_var in ["VISUAL", "EDITOR"] {
         if let Ok(v) = std::env::var(env_var) {
@@ -52,7 +52,7 @@ pub fn resolve_editor() -> Vec<String> {
     vec![floor]
 }
 
-/// Whitespace tokeniser for `$EDITOR`-style values. Hermes uses
+/// Whitespace tokeniser for `$EDITOR`-style values. the upstream uses
 /// the same simple split — no shell-quoting handling, so something
 /// like `EDITOR="code 'with space'"` doesn't survive correctly,
 /// matching upstream.
