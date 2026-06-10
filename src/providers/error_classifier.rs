@@ -118,18 +118,25 @@ pub fn classify(err: &anyhow::Error) -> ErrorClass {
         return ErrorClass::Auth;
     }
 
+    // ModelNotFound requires model-specific phrasing. A bare 404 is NOT
+    // enough: local / OpenAI-compatible endpoints (Ollama, LM Studio,
+    // vLLM behind a proxy) return 404 for a wrong base_url path or a
+    // briefly-restarting server, and the upstream deliberately treats
+    // generic 404 as retryable-unknown for exactly that reason —
+    // classifying it as ModelNotFound permanently skips the provider in
+    // failover.
     if contains_any(
         &msg,
         &[
-            "(404)",
             "model not found",
             "invalid model",
             "no such model",
-            "does not exist",
             "model_not_found",
             "unknown model",
         ],
-    ) {
+    ) || (msg.contains("(404)") && msg.contains("model"))
+        || (msg.contains("does not exist") && msg.contains("model"))
+    {
         return ErrorClass::ModelNotFound;
     }
 
@@ -196,6 +203,23 @@ mod tests {
         assert_eq!(classify(&err("error (402): insufficient_quota")), ErrorClass::InsufficientCredits);
         assert_eq!(classify(&err("API error (404): model not found")), ErrorClass::ModelNotFound);
         assert_eq!(classify(&err("API error (400): invalid_request_error")), ErrorClass::FormatError);
+    }
+
+    /// A bare 404 with no model-specific phrasing must NOT classify as
+    /// ModelNotFound: local / OpenAI-compatible endpoints return 404
+    /// for wrong base_url paths and mid-restart windows, and a
+    /// ModelNotFound verdict permanently skips the provider in
+    /// failover. It stays retryable Unknown instead.
+    #[test]
+    fn bare_404_is_not_model_not_found() {
+        let e = err("API error (404): Not Found");
+        assert_eq!(classify(&e), ErrorClass::Unknown);
+        assert!(classify(&e).retryable());
+        // 404 + model phrasing still classifies.
+        assert_eq!(
+            classify(&err("API error (404): The model `x` does not exist")),
+            ErrorClass::ModelNotFound
+        );
     }
 
     #[test]
