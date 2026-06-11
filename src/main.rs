@@ -1017,6 +1017,7 @@ async fn build_agent_with_callbacks(
     builder = builder.memory_manager(Arc::new(runtime.memory_manager));
     builder = builder.home_dir(home_dir.to_path_buf());
 
+    let guard_cfg = &config.agent.tool_loop_guardrails;
     let mut configured_builder = builder
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)
@@ -1032,7 +1033,17 @@ async fn build_agent_with_callbacks(
             3,
             4,
         ))
-        .compression_enabled(config.agent.compression_enabled);
+        .compression_enabled(config.agent.compression_enabled)
+        .loop_guard_config(fennec::agent::loop_::LoopGuardConfig {
+            warnings_enabled: guard_cfg.warnings_enabled,
+            hard_stop_enabled: guard_cfg.hard_stop_enabled,
+            exact_failure_warn_after: guard_cfg.exact_failure_warn_after,
+            exact_failure_block_after: guard_cfg.exact_failure_block_after,
+            same_tool_failure_warn_after: guard_cfg.same_tool_failure_warn_after,
+            same_tool_failure_halt_after: guard_cfg.same_tool_failure_halt_after,
+            no_progress_warn_after: guard_cfg.no_progress_warn_after,
+            no_progress_block_after: guard_cfg.no_progress_block_after,
+        });
     if let Some(handle) = callbacks {
         configured_builder = configured_builder.callbacks(handle);
     }

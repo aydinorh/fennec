@@ -72,6 +72,10 @@ pub struct Agent {
     /// but are filtered out of `tool_specs` shown to the model
     /// and rejected at dispatch time.
     disabled_tools: HashSet<String>,
+    /// Per-turn tool-call loop guardrails (repeated failures,
+    /// read-only no-progress). Warnings by default; block/halt only
+    /// when `[agent.tool_loop_guardrails] hard_stop_enabled` opts in.
+    loop_guard: super::loop_::LoopGuard,
     /// Image attachments queued by `/image` and `/paste` for
     /// the next user turn. Drained at the top of `turn` /
     /// `turn_streaming` and attached to the outbound user
@@ -350,6 +354,7 @@ impl Agent {
         if let Some(ref flag) = self.interrupt_flag {
             flag.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+        self.loop_guard.reset_for_turn();
         let turn_start = std::time::Instant::now();
         let tokens_before_input = self.total_input_tokens;
         let tokens_before_output = self.total_output_tokens;
@@ -441,6 +446,17 @@ impl Agent {
             // point — the loop body ran), apply_pending_steer
             // is a no-op.
             self.apply_pending_steer_to_tool_results();
+
+            // Loop-guardrail halt: a circuit-breaker decision fired
+            // during this batch (hard_stop_enabled only). End the
+            // turn in a controlled way instead of letting the model
+            // keep burning iterations on a stuck path.
+            if let Some(msg) = self.loop_guard.halt_message() {
+                let text = format!("⚠️ Tool loop guardrail halted this turn: {msg}");
+                self.history.push(ChatMessage::assistant(&text));
+                self.callbacks.on_turn_complete(&text);
+                return Ok(text);
+            }
         }
 
         // Budget exhausted: end gracefully with a tool-less summary instead of
@@ -646,6 +662,7 @@ impl Agent {
         if let Some(ref flag) = self.interrupt_flag {
             flag.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+        self.loop_guard.reset_for_turn();
 
         // Tool-iteration loop, streaming each LLM call.
         for _iteration in 0..self.max_tool_iterations {
@@ -753,6 +770,15 @@ impl Agent {
             // (streaming path). Same hook as turn(): inject after
             // tool results before looping for the next provider call.
             self.apply_pending_steer_to_tool_results();
+
+            // Loop-guardrail halt — same controlled turn end as turn().
+            if let Some(msg) = self.loop_guard.halt_message() {
+                let text = format!("⚠️ Tool loop guardrail halted this turn: {msg}");
+                self.history.push(ChatMessage::assistant(&text));
+                self.callbacks.on_text_delta(&text);
+                self.callbacks.on_turn_complete(&text);
+                return Ok(text);
+            }
         }
 
         // Budget exhausted (streaming path): same graceful tool-less summary.
@@ -933,7 +959,16 @@ impl Agent {
     /// tool hooks: the `turn` path passes `true`; the streaming path passes
     /// `false`, matching prior behaviour.
     async fn execute_tool_calls(&mut self, tool_calls: &[ToolCall], with_hooks: bool) {
-        if self.should_parallelize(tool_calls) {
+        // Loop-guard pre-check: if ANY call in the batch is currently
+        // blocked (hard-stop mode), run the whole batch sequentially —
+        // the sequential path handles per-call block/halt resolution.
+        let any_blocked = tool_calls.iter().any(|tc| {
+            !self
+                .loop_guard
+                .before_call(&tc.name, &tc.arguments)
+                .allows_execution()
+        });
+        if !any_blocked && self.should_parallelize(tool_calls) {
             self.execute_tool_calls_concurrent(tool_calls, with_hooks).await;
         } else {
             self.execute_tool_calls_sequential(tool_calls, with_hooks).await;
@@ -1045,18 +1080,46 @@ impl Agent {
                 preview: preview_for_args(&tc.arguments),
                 args: tc.arguments.clone(),
             });
-            let (tool, disabled, mem_handles) = self.tool_call_handles(&tc.name);
-            let (output, success, dur) = run_tool_call(
-                Arc::clone(&self.hooks),
-                Arc::clone(&self.memory_manager),
-                tool,
-                disabled,
-                mem_handles,
-                tc.name.clone(),
-                tc.arguments.clone(),
-                with_hooks,
-            )
-            .await;
+            // Loop guardrails: a blocked call is NOT executed — the
+            // guard's message becomes the (failed) tool result so the
+            // model learns why. Warnings ride along on the result.
+            let (output, success, dur) =
+                match self.loop_guard.before_call(&tc.name, &tc.arguments) {
+                    super::loop_::GuardAction::Block(msg)
+                    | super::loop_::GuardAction::Halt(msg) => {
+                        (format!("Error: {msg}"), false, std::time::Duration::ZERO)
+                    }
+                    _ => {
+                        let (tool, disabled, mem_handles) = self.tool_call_handles(&tc.name);
+                        let (mut output, success, dur) = run_tool_call(
+                            Arc::clone(&self.hooks),
+                            Arc::clone(&self.memory_manager),
+                            tool,
+                            disabled,
+                            mem_handles,
+                            tc.name.clone(),
+                            tc.arguments.clone(),
+                            with_hooks,
+                        )
+                        .await;
+                        let read_only = self.tool_is_read_only(&tc.name);
+                        match self.loop_guard.after_call(
+                            &tc.name,
+                            &tc.arguments,
+                            &output,
+                            !success,
+                            read_only,
+                        ) {
+                            super::loop_::GuardAction::Warn(msg)
+                            | super::loop_::GuardAction::Halt(msg) => {
+                                output.push_str("\n\n⚠️ ");
+                                output.push_str(&msg);
+                            }
+                            _ => {}
+                        }
+                        (output, success, dur)
+                    }
+                };
             tracing::info!(tool = %tc.name, success = %success, "Tool call complete");
             self.callbacks
                 .on_tool_complete(super::callbacks::ToolComplete {
@@ -1122,7 +1185,24 @@ impl Agent {
                 .collect()
                 .await;
 
-        for (tc, (output, success, dur)) in tool_calls.iter().zip(results.into_iter()) {
+        for (tc, (mut output, success, dur)) in tool_calls.iter().zip(results.into_iter()) {
+            // Loop-guard accounting runs post-batch in original order —
+            // identical counting semantics to the sequential path.
+            let read_only = self.tool_is_read_only(&tc.name);
+            match self.loop_guard.after_call(
+                &tc.name,
+                &tc.arguments,
+                &output,
+                !success,
+                read_only,
+            ) {
+                super::loop_::GuardAction::Warn(msg)
+                | super::loop_::GuardAction::Halt(msg) => {
+                    output.push_str("\n\n⚠️ ");
+                    output.push_str(&msg);
+                }
+                _ => {}
+            }
             tracing::info!(tool = %tc.name, success = %success, "Tool call complete (concurrent)");
             self.callbacks
                 .on_tool_complete(super::callbacks::ToolComplete {
@@ -1693,6 +1773,7 @@ pub struct AgentBuilder {
     interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     context_compressor: Option<ContextCompressor>,
     compression_enabled: Option<bool>,
+    loop_guard_config: Option<super::loop_::LoopGuardConfig>,
 }
 
 impl AgentBuilder {
@@ -1719,7 +1800,15 @@ impl AgentBuilder {
             interrupt_flag: None,
             context_compressor: None,
             compression_enabled: None,
+            loop_guard_config: None,
         }
+    }
+
+    /// Configure the per-turn tool-loop guardrails (thresholds +
+    /// warn/hard-stop switches). Defaults: warnings on, hard stops off.
+    pub fn loop_guard_config(mut self, config: super::loop_::LoopGuardConfig) -> Self {
+        self.loop_guard_config = Some(config);
+        self
     }
 
     /// Set the automatic context compactor. Defaults to
@@ -1921,6 +2010,9 @@ impl AgentBuilder {
             tools: self.tools,
             tool_specs,
             disabled_tools: HashSet::new(),
+            loop_guard: super::loop_::LoopGuard::new(
+                self.loop_guard_config.unwrap_or_default(),
+            ),
             context_compressor: self
                 .context_compressor
                 .unwrap_or_default(),
