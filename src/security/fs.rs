@@ -84,6 +84,59 @@ pub fn write_secure(path: &Path, content: &[u8]) -> Result<()> {
     }
 }
 
+/// Atomically write `content` to `path`, preserving the target's
+/// existing permissions (new files get umask defaults).
+///
+/// For WORKSPACE files written by the agent's file tools: writes to a
+/// same-directory tempfile, fsyncs, then `rename(2)`s into place — a
+/// crash or concurrent reader never observes a truncated/half-written
+/// file, and an overwrite that fails midway leaves the original
+/// intact. The upstream's write_file does the same (temp + rename,
+/// preserving the existing file's mode).
+///
+/// Secret-bearing Fennec-internal files should use [`write_secure`]
+/// (0600 from the first byte) instead — this helper deliberately does
+/// NOT clamp permissions, because a user's project file written 0600
+/// breaks anything else that reads it.
+pub fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("write_atomic: path has no parent directory"))?;
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent dir {}", parent.display()))?;
+    }
+
+    let base = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let temp_path = parent.join(format!(".{}.tmp.{}", base, std::process::id()));
+
+    let result = (|| -> Result<()> {
+        std::fs::write(&temp_path, content)
+            .with_context(|| format!("writing tempfile {}", temp_path.display()))?;
+        // Preserve the existing target's permissions across the swap
+        // (Unix). New files keep the tempfile's umask-default mode.
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&temp_path, meta.permissions());
+        }
+        let f = std::fs::File::open(&temp_path)
+            .with_context(|| format!("reopening {}", temp_path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("syncing {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, path)
+            .with_context(|| format!("renaming into place: {}", path.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
 /// Create `path` (and missing parents) with 0700 permissions on Unix.
 ///
 /// Unlike `std::fs::create_dir_all` which uses the umask default (typically
@@ -170,6 +223,46 @@ mod tests {
         write_secure(&path, b"new").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn write_atomic_writes_and_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("file.txt");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    }
+
+    /// Unlike write_secure, write_atomic preserves the target's
+    /// existing permissions — a user's 0755 script must stay 0755
+    /// after the agent edits it.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("script.sh");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_atomic(&path, b"#!/bin/sh\necho hi\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "existing mode must survive the atomic swap");
+    }
+
+    #[test]
+    fn write_atomic_cleans_up_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Target is an existing directory — the rename must fail.
+        let path = tmp.path().to_path_buf();
+        let _ = write_atomic(&path, b"x");
+        let orphans: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(orphans.is_empty(), "tempfiles left behind: {:?}", orphans);
     }
 
     #[test]

@@ -217,7 +217,10 @@ impl Tool for WriteFileTool {
             }
         }
 
-        match tokio::fs::write(&resolved, content).await {
+        // Atomic temp+rename write: a crash or concurrent reader never
+        // sees a half-written file, and a failed overwrite leaves the
+        // original intact.
+        match crate::security::fs::write_atomic(&resolved, content.as_bytes()) {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("wrote {} bytes to {path}", content.len()),
@@ -440,7 +443,8 @@ impl Tool for EditFileTool {
         }
 
         let new_content = content.replacen(old_text, new_text, 1);
-        match tokio::fs::write(&resolved, &new_content).await {
+        // Atomic swap — same rationale as write_file above.
+        match crate::security::fs::write_atomic(&resolved, new_content.as_bytes()) {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("edited {path}: replaced 1 occurrence"),

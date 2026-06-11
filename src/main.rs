@@ -3421,6 +3421,23 @@ async fn run_gateway(
         })
     };
 
+    // 5c. Heartbeat — proactive agent wake-ups. The HeartbeatService
+    //     (publish a "check pending work" prompt every 30 minutes, with
+    //     the prompt overridable via ~/.fennec/HEARTBEAT.md and [SILENT]
+    //     suppression downstream) was fully implemented + tested but
+    //     never started. `cron.enabled` is its documented gate —
+    //     default OFF, so nothing changes for existing users until
+    //     they opt in.
+    let _heartbeat_handle = if config.cron.enabled {
+        let svc = fennec::heartbeat::HeartbeatService::new(None, bus.clone(), None);
+        tracing::info!("Heartbeat service started (cron.enabled = true)");
+        Some(tokio::spawn(async move {
+            svc.run().await;
+        }))
+    } else {
+        None
+    };
+
     // 6. Start GatewayServer in a background task.
     let host = host_override.unwrap_or_else(|| config.gateway.host.clone());
     let port = port_override.unwrap_or(config.gateway.port);
