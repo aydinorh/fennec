@@ -3397,6 +3397,30 @@ async fn run_gateway(
         }))
     };
 
+    // 5b. Curator auto-run ticker. Long-running gateways get periodic
+    //     skill maintenance without restarts — the upstream wires this
+    //     the same way, piggy-backed on its gateway ticker. The hourly
+    //     poll only bounds latency; the REAL gate (paused flag +
+    //     interval_hours, default one week) lives in should_auto_run,
+    //     so work fires at most once per configured interval. The idle
+    //     gate is bypassed (None), matching the upstream's gateway
+    //     call which passes an infinite idle measurement.
+    let _curator_handle = {
+        let config = config.clone();
+        let home_dir = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(e) = maybe_auto_run_curator(&config, &home_dir).await {
+                    tracing::debug!("curator auto-run check failed: {e}");
+                }
+            }
+        })
+    };
+
     // 6. Start GatewayServer in a background task.
     let host = host_override.unwrap_or_else(|| config.gateway.host.clone());
     let port = port_override.unwrap_or(config.gateway.port);
@@ -4194,6 +4218,57 @@ async fn run_curator_command(
     }
 
     Ok(())
+}
+
+/// One curator auto-run gate check, called periodically by the
+/// gateway's curator ticker. Loads the persisted curator state, asks
+/// [`should_auto_run`] whether the interval/paused gates pass, and on
+/// `Run` executes the same runner the manual `fennec curator run`
+/// command uses (which records the run into the state store, arming
+/// the next interval).
+async fn maybe_auto_run_curator(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) -> Result<()> {
+    use fennec::skills::curator::{
+        run_curator, AutoRunDecision, CuratorScheduleConfig, CuratorStateStore, RunContext,
+    };
+    use fennec::skills::UsageStore;
+
+    let skills_dir = home_dir.join("skills");
+    if !skills_dir.exists() {
+        return Ok(()); // nothing to curate
+    }
+    let state = Arc::new(CuratorStateStore::open(&skills_dir));
+    let sched = CuratorScheduleConfig::default();
+    match fennec::skills::curator::should_auto_run(
+        &sched,
+        &state.snapshot(),
+        None,
+        chrono::Utc::now(),
+    ) {
+        AutoRunDecision::Skip(reason) => {
+            tracing::debug!("curator auto-run skipped: {}", reason.as_human_string());
+            Ok(())
+        }
+        AutoRunDecision::Run => {
+            tracing::info!("curator auto-run: interval gate passed, starting run");
+            let usage = Arc::new(UsageStore::open(&skills_dir));
+            let logs_dir = home_dir.join("logs");
+            let aux = build_provider_for_curator(config, home_dir)
+                .await?
+                .map(Arc::new);
+            let mut ctx = RunContext::new(skills_dir, logs_dir, usage, state);
+            ctx.aux = aux;
+            let summary = run_curator(&ctx).await?;
+            tracing::info!(
+                "curator auto-run finished in {:.2}s: {}",
+                summary.duration_seconds,
+                summary.one_line_summary
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Build the auxiliary client for the curator CLI command. Returns
