@@ -305,6 +305,7 @@ fn plan_failover_chain(provider_cfg: &fennec::config::ProviderConfig) -> Vec<Pla
 /// must not prevent startup.
 fn build_failover_providers(
     config: &FennecConfig,
+    home_dir: &std::path::Path,
     chain: &[PlannedFallback],
 ) -> Vec<Box<dyn Provider>> {
     let mut providers: Vec<Box<dyn Provider>> = Vec::new();
@@ -325,9 +326,98 @@ fn build_failover_providers(
         let mut cfg = config.clone();
         cfg.provider.name = entry.provider.clone();
         cfg.provider.base_url = entry.base_url.clone();
-        providers.push(build_provider(&cfg, api_key, Some(entry.model.clone())));
+        providers.push(build_provider(&cfg, home_dir, api_key, Some(entry.model.clone())));
     }
     providers
+}
+
+#[cfg(test)]
+mod failover_chain_tests {
+    use super::{plan_failover_chain, PlannedFallback};
+    use fennec::config::{FallbackEntry, ProviderConfig};
+
+    fn cfg() -> ProviderConfig {
+        ProviderConfig {
+            name: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_config_yields_empty_chain() {
+        assert!(plan_failover_chain(&cfg()).is_empty());
+    }
+
+    #[test]
+    fn fallback_models_use_primary_provider() {
+        let mut c = cfg();
+        c.fallback_models = vec!["claude-haiku-4-5".into()];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(
+            chain,
+            vec![PlannedFallback {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5".into(),
+                base_url: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn cross_provider_entries_follow_same_provider_shorthand() {
+        let mut c = cfg();
+        c.fallback_models = vec!["claude-haiku-4-5".into()];
+        c.fallbacks = vec![FallbackEntry {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].provider, "anthropic");
+        assert_eq!(chain[1].provider, "openai");
+    }
+
+    /// Entries equal to the primary backend are dropped — falling back
+    /// to the backend that just failed only loops the failure (mirrors
+    /// the upstream's same-backend dedup).
+    #[test]
+    fn primary_backend_and_duplicates_are_deduped() {
+        let mut c = cfg();
+        c.fallback_models = vec![
+            "claude-sonnet-4-6".into(), // == primary → dropped
+            "claude-haiku-4-5".into(),
+            "claude-haiku-4-5".into(), // duplicate → dropped
+        ];
+        c.fallbacks = vec![FallbackEntry {
+            provider: "ANTHROPIC".into(), // case-normalized
+            model: "claude-haiku-4-5".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain.len(), 1, "{chain:?}");
+        assert_eq!(chain[0].model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn empty_provider_in_entry_means_primary() {
+        let mut c = cfg();
+        c.fallbacks = vec![FallbackEntry {
+            provider: String::new(),
+            model: "claude-haiku-4-5".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain[0].provider, "anthropic");
+    }
+
+    #[test]
+    fn entries_without_model_are_skipped() {
+        let mut c = cfg();
+        c.fallbacks = vec![FallbackEntry::default()];
+        assert!(plan_failover_chain(&c).is_empty());
+    }
 }
 
 /// Build the auxiliary client. Used by background tasks (curator,
@@ -725,7 +815,7 @@ async fn build_agent_with_callbacks(
         if chain.is_empty() {
             provider
         } else {
-            let fallback_providers = build_failover_providers(config, &chain);
+            let fallback_providers = build_failover_providers(config, home_dir, &chain);
             if fallback_providers.is_empty() {
                 tracing::warn!(
                     "failover configured but no chain entry was buildable; running without failover"
@@ -3949,95 +4039,6 @@ async fn run_gateway(
     dispatch_handle.abort();
 
     Ok(())
-}
-
-#[cfg(test)]
-mod failover_chain_tests {
-    use super::{plan_failover_chain, PlannedFallback};
-    use fennec::config::{FallbackEntry, ProviderConfig};
-
-    fn cfg() -> ProviderConfig {
-        ProviderConfig {
-            name: "anthropic".into(),
-            model: "claude-sonnet-4-6".into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn empty_config_yields_empty_chain() {
-        assert!(plan_failover_chain(&cfg()).is_empty());
-    }
-
-    #[test]
-    fn fallback_models_use_primary_provider() {
-        let mut c = cfg();
-        c.fallback_models = vec!["claude-haiku-4-5".into()];
-        let chain = plan_failover_chain(&c);
-        assert_eq!(
-            chain,
-            vec![PlannedFallback {
-                provider: "anthropic".into(),
-                model: "claude-haiku-4-5".into(),
-                base_url: String::new(),
-            }]
-        );
-    }
-
-    #[test]
-    fn cross_provider_entries_follow_same_provider_shorthand() {
-        let mut c = cfg();
-        c.fallback_models = vec!["claude-haiku-4-5".into()];
-        c.fallbacks = vec![FallbackEntry {
-            provider: "openai".into(),
-            model: "gpt-4o".into(),
-            base_url: String::new(),
-        }];
-        let chain = plan_failover_chain(&c);
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].provider, "anthropic");
-        assert_eq!(chain[1].provider, "openai");
-    }
-
-    /// Entries equal to the primary backend are dropped — falling back
-    /// to the backend that just failed only loops the failure (mirrors
-    /// the upstream's same-backend dedup).
-    #[test]
-    fn primary_backend_and_duplicates_are_deduped() {
-        let mut c = cfg();
-        c.fallback_models = vec![
-            "claude-sonnet-4-6".into(), // == primary → dropped
-            "claude-haiku-4-5".into(),
-            "claude-haiku-4-5".into(), // duplicate → dropped
-        ];
-        c.fallbacks = vec![FallbackEntry {
-            provider: "ANTHROPIC".into(), // case-normalized
-            model: "claude-haiku-4-5".into(),
-            base_url: String::new(),
-        }];
-        let chain = plan_failover_chain(&c);
-        assert_eq!(chain.len(), 1, "{chain:?}");
-        assert_eq!(chain[0].model, "claude-haiku-4-5");
-    }
-
-    #[test]
-    fn empty_provider_in_entry_means_primary() {
-        let mut c = cfg();
-        c.fallbacks = vec![FallbackEntry {
-            provider: String::new(),
-            model: "claude-haiku-4-5".into(),
-            base_url: String::new(),
-        }];
-        let chain = plan_failover_chain(&c);
-        assert_eq!(chain[0].provider, "anthropic");
-    }
-
-    #[test]
-    fn entries_without_model_are_skipped() {
-        let mut c = cfg();
-        c.fallbacks = vec![FallbackEntry::default()];
-        assert!(plan_failover_chain(&c).is_empty());
-    }
 }
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM and log which one fired.
