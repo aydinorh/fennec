@@ -3176,10 +3176,25 @@ async fn run_gateway(
         )
         .filter(|t| !t.is_empty())
         {
+            // Pairing flow: a fresh 6-digit code each gateway boot lets
+            // a new user pair by DM-ing the code, instead of editing
+            // allowed_users in config. Paired users persist across
+            // restarts (pairing.json, 0600). 5 wrong codes → lockout.
+            let pairing = {
+                let mut guard =
+                    fennec::security::PairingGuard::new(Some(home_dir.join("pairing.json")));
+                let code = guard.generate_code();
+                tracing::info!(
+                    "Telegram pairing code for this session: {code} — share it \
+                     out-of-band with anyone who should be able to DM the bot."
+                );
+                Arc::new(parking_lot::Mutex::new(guard))
+            };
             let ch = fennec::channels::TelegramChannel::new(
                 token,
                 ch_config.telegram.allowed_users.clone(),
-            );
+            )
+            .with_pairing(pairing);
             channels.push(Arc::new(ch));
             tracing::info!("Telegram channel enabled");
         }
