@@ -68,9 +68,8 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         ),
         4 => ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
         5 => ("gemini-cloudcode", "gemini-2.5-flash", ""),
-        6 => ("ollama", "llama3.1", ""),
-        4 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
-        5 => ("ollama", "llama3.1", ""),
+        6 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
+        7 => ("ollama", "llama3.1", ""),
         _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
     frame.complete_step(StepSummary::done(
@@ -355,9 +354,8 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         ),
         4 => ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
         5 => ("gemini-cloudcode", "gemini-2.5-flash", ""),
-        6 => ("ollama", "llama3.1", ""),
-        4 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
-        5 => ("ollama", "llama3.1", ""),
+        6 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
+        7 => ("ollama", "llama3.1", ""),
         _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
 
