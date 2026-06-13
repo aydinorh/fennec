@@ -166,6 +166,7 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
         "google" | "gemini" => "GEMINI_API_KEY",
         "codex" | "openai-responses" => "OPENAI_API_KEY",
         _ => "ANTHROPIC_API_KEY",
@@ -272,6 +273,11 @@ pub async fn check_provider_reachable(
         }
         "openrouter" => {
             let url = "https://openrouter.ai/api/v1/models".to_string();
+            let req = client.get(&url).bearer_auth(api_key);
+            (url, req)
+        }
+        "deepseek" => {
+            let url = "https://api.deepseek.com/v1/models".to_string();
             let req = client.get(&url).bearer_auth(api_key);
             (url, req)
         }
@@ -437,6 +443,7 @@ pub async fn run_all(
                     "openai" => "OPENAI_API_KEY",
                     "kimi" | "moonshot" => "KIMI_API_KEY",
                     "openrouter" => "OPENROUTER_API_KEY",
+                    "deepseek" => "DEEPSEEK_API_KEY",
                     "google" | "gemini" => "GEMINI_API_KEY",
                     "codex" | "openai-responses" => "OPENAI_API_KEY",
                     _ => "",
