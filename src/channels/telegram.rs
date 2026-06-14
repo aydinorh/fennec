@@ -27,6 +27,34 @@ const MAX_RETRY_AFTER_ATTEMPTS: u32 = 3;
 /// rather surface the failure than block a listener for many minutes.
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 
+/// Redact the bot token embedded in a Telegram Bot API URL before it is
+/// logged or surfaced in an error. The token sits between `/bot` and the
+/// next `/` (e.g. `…/bot123456:ABC-DEF…/sendMessage`); leaking it into a
+/// WARN line or a bailed error message hands an attacker full control of
+/// the bot. We replace only the secret segment and keep the method name
+/// (`sendMessage`, `getUpdates`, …) intact, which is the part that
+/// actually helps when debugging. Upstream sidesteps this entirely by
+/// using a Telegram client library that never logs URL-embedded tokens;
+/// since Fennec constructs URLs by hand, it scrubs them explicitly.
+fn redact_telegram_url(url: &str) -> String {
+    const MARKER: &str = "/bot";
+    let Some(start) = url.find(MARKER) else {
+        return url.to_string();
+    };
+    let token_start = start + MARKER.len();
+    // The token runs until the next path separator (the method) or the
+    // end of the string.
+    let token_end = url[token_start..]
+        .find('/')
+        .map(|rel| token_start + rel)
+        .unwrap_or(url.len());
+    let mut redacted = String::with_capacity(url.len());
+    redacted.push_str(&url[..token_start]);
+    redacted.push_str("<redacted>");
+    redacted.push_str(&url[token_end..]);
+    redacted
+}
+
 /// Telegram channel using the Bot API with long-polling and streaming edits.
 pub struct TelegramChannel {
     bot_token: String,
@@ -98,7 +126,7 @@ impl TelegramChannel {
                     .min(RETRY_AFTER_CAP_SECS);
                 tracing::warn!(
                     "Telegram 429 on {}: sleeping {}s (attempt {}/{})",
-                    url,
+                    redact_telegram_url(url),
                     retry_after,
                     attempt + 1,
                     MAX_RETRY_AFTER_ATTEMPTS
@@ -108,7 +136,12 @@ impl TelegramChannel {
                 continue;
             }
 
-            anyhow::bail!("Telegram POST {} returned {}: {}", url, status, text);
+            anyhow::bail!(
+                "Telegram POST {} returned {}: {}",
+                redact_telegram_url(url),
+                status,
+                text
+            );
         }
     }
 
@@ -140,7 +173,7 @@ impl TelegramChannel {
                     .min(RETRY_AFTER_CAP_SECS);
                 tracing::warn!(
                     "Telegram 429 on {}: sleeping {}s (attempt {}/{})",
-                    url,
+                    redact_telegram_url(url),
                     retry_after,
                     attempt + 1,
                     MAX_RETRY_AFTER_ATTEMPTS
@@ -150,7 +183,12 @@ impl TelegramChannel {
                 continue;
             }
 
-            anyhow::bail!("Telegram GET {} returned {}: {}", url, status, text);
+            anyhow::bail!(
+                "Telegram GET {} returned {}: {}",
+                redact_telegram_url(url),
+                status,
+                text
+            );
         }
     }
 
@@ -716,5 +754,31 @@ mod tests {
         let ch = TelegramChannel::new("token".to_string(), vec!["123".to_string()]);
         assert!(ch.allows_sender("123"));
         assert!(!ch.allows_sender("456"));
+    }
+
+    #[test]
+    fn redact_telegram_url_hides_token_keeps_method() {
+        let url = "https://api.telegram.org/bot123456:ABC-DEF1234ghIkl/sendMessage";
+        let red = redact_telegram_url(url);
+        assert_eq!(
+            red,
+            "https://api.telegram.org/bot<redacted>/sendMessage"
+        );
+        assert!(!red.contains("123456:ABC-DEF1234ghIkl"));
+    }
+
+    #[test]
+    fn redact_telegram_url_handles_no_trailing_method() {
+        let url = "https://api.telegram.org/bot123456:SECRET";
+        assert_eq!(
+            redact_telegram_url(url),
+            "https://api.telegram.org/bot<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_telegram_url_passthrough_when_no_token() {
+        let url = "https://example.com/health";
+        assert_eq!(redact_telegram_url(url), url);
     }
 }
