@@ -1,7 +1,51 @@
 use crate::onboard::frame::{existing_config_at, FinalSummary, StepSummary, WizardFrame};
 use crate::security::fs::{create_dir_private, write_secure};
+use crate::security::SecretStore;
 use console::style;
 use dialoguer::{Confirm, Input, Select};
+
+/// Encrypt the secrets destined for `config.toml` so the file honors its
+/// own `encrypt_secrets = true` declaration.
+///
+/// The wizard previously wrote API keys and bot tokens in plaintext while
+/// the config it generated declared `encrypt_secrets = true`. That left
+/// real secrets readable on disk and made the runtime log a "value lacks
+/// 'enc2:' prefix … now unauthenticated" warning on every start. We now
+/// run each non-empty secret through [`SecretStore::encrypt`], producing
+/// an `enc2:` blob the runtime decrypts with the same key file under
+/// `fennec_home` (the gateway constructs its `SecretStore` from the same
+/// home, so the round-trip is guaranteed).
+///
+/// Empty values are passed through unchanged: an empty `api_key` means
+/// the user chose Anthropic OAuth or relies on a provider env var, and an
+/// empty channel token means the channel is unconfigured. The runtime
+/// only decrypts non-empty values, so leaving these empty preserves the
+/// OAuth / env-var fallbacks and avoids a spurious decrypt warning.
+fn encrypt_onboard_secrets(
+    fennec_home: &std::path::Path,
+    api_key: &str,
+    telegram_token: &str,
+    discord_token: &str,
+    plurum_key: &str,
+) -> anyhow::Result<(String, String, String, String)> {
+    // `SecretStore::new` creates `fennec_home` (and the 0600 key file) if
+    // they don't yet exist, so this is safe to call before the wizard's
+    // own `create_dir_all`.
+    let store = SecretStore::new(fennec_home.to_path_buf())?;
+    let enc = |v: &str| -> anyhow::Result<String> {
+        if v.is_empty() {
+            Ok(String::new())
+        } else {
+            store.encrypt(v)
+        }
+    };
+    Ok((
+        enc(api_key)?,
+        enc(telegram_token)?,
+        enc(discord_token)?,
+        enc(plurum_key)?,
+    ))
+}
 
 /// Run the interactive setup wizard that creates `~/.fennec/config.toml`.
 ///
@@ -252,6 +296,16 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         frame.complete_step(StepSummary::done("Collective", collective_summary));
     }
 
+    // Encrypt secrets before they touch disk so the generated config
+    // actually honors its own `encrypt_secrets = true`.
+    let (api_key, telegram_token, discord_token, plurum_key) = encrypt_onboard_secrets(
+        fennec_home,
+        &api_key,
+        &telegram_token,
+        &discord_token,
+        &plurum_key,
+    )?;
+
     // Write config (byte-identical output to the classic path).
     let config = build_config_toml(
         &agent_name,
@@ -455,6 +509,16 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         String::new()
     };
 
+    // Encrypt secrets before they touch disk so the generated config
+    // actually honors its own `encrypt_secrets = true`.
+    let (api_key, telegram_token, discord_token, plurum_key) = encrypt_onboard_secrets(
+        fennec_home,
+        &api_key,
+        &telegram_token,
+        &discord_token,
+        &plurum_key,
+    )?;
+
     let config = build_config_toml(
         &agent_name,
         provider_name,
@@ -650,6 +714,48 @@ search_enabled = true
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypt_onboard_secrets_round_trips_and_keeps_empty_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        let (api, tg, dc, plurum) =
+            encrypt_onboard_secrets(home, "sk-secret", "telegram-tok", "", "plurum-tok").unwrap();
+
+        // Non-empty secrets are encrypted (enc2: prefix, ciphertext does
+        // not contain the plaintext).
+        assert!(api.starts_with("enc2:"), "api key should be encrypted");
+        assert!(!api.contains("sk-secret"));
+        assert!(tg.starts_with("enc2:"));
+        assert!(plurum.starts_with("enc2:"));
+        // Empty stays empty (channel unconfigured / OAuth provider).
+        assert_eq!(dc, "");
+
+        // The runtime decrypts with a SecretStore on the same home: the
+        // blobs round-trip back to the original plaintext.
+        let store = SecretStore::new(home.to_path_buf()).unwrap();
+        assert_eq!(store.decrypt(&api).unwrap(), "sk-secret");
+        assert_eq!(store.decrypt(&tg).unwrap(), "telegram-tok");
+        assert_eq!(store.decrypt(&plurum).unwrap(), "plurum-tok");
+    }
+
+    #[test]
+    fn encrypt_onboard_secrets_embeds_no_plaintext_in_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let (api, tg, _dc, _plurum) =
+            encrypt_onboard_secrets(home, "sk-plain", "tg-plain", "", "").unwrap();
+        let config = build_config_toml(
+            "Bot", "openai", "gpt-4o", &api, &tg, "123", "", "",
+        );
+        // The generated config must not contain the raw secrets, and the
+        // channel must still be flagged enabled (encrypted token is
+        // non-empty).
+        assert!(!config.contains("sk-plain"));
+        assert!(!config.contains("tg-plain"));
+        assert!(config.contains("[channels.telegram]\nenabled = true"));
+    }
 
     #[test]
     fn test_build_config_toml_defaults() {
