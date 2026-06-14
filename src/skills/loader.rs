@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::format::{
-    RESERVED_DIR_ENTRIES, SkillLayout, SkillProvenance, SkillState, validate_category,
-    validate_skill_name,
+    is_reserved_flat_file, RESERVED_DIR_ENTRIES, SkillLayout, SkillProvenance, SkillState,
+    validate_category, validate_skill_name,
 };
 use super::manifest::{BundledManifest, HubLock};
 
@@ -179,6 +179,13 @@ impl SkillsLoader {
 
             if ft.is_file() {
                 if entry_path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                // README.md and friends are documentation, not skills. In
+                // Fennec's flat single-file skill format they would parse
+                // as a skill named after the file and fail validation,
+                // emitting a noisy warning on every load. Skip them.
+                if is_reserved_flat_file(file_name) {
                     continue;
                 }
                 if meta.len() > MAX_SKILL_FILE_BYTES {
@@ -752,6 +759,39 @@ After
             skills.is_empty(),
             "symlink should be skipped, got: {:?}",
             skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A README.md (or other doc file) in the skills root must not be
+    /// treated as a flat skill — it should be skipped silently, while
+    /// genuine flat skills alongside it still load.
+    #[test]
+    fn load_from_directory_skips_readme_and_doc_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().to_path_buf();
+
+        std::fs::write(
+            skills_dir.join("README.md"),
+            "# Skills\n\nThis directory holds skills.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("CHANGELOG.md"),
+            "# Changelog\n\n- stuff\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("real-skill.md"),
+            "---\nname: real-skill\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = SkillsLoader::load_from_directory(&skills_dir).unwrap();
+        let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["real-skill"],
+            "only the genuine flat skill should load; doc files skipped"
         );
     }
 

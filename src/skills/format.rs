@@ -36,6 +36,31 @@ pub const RESERVED_DIR_ENTRIES: &[&str] = &[
     ".curator_state",
 ];
 
+/// Documentation files that commonly live alongside skills but are NOT
+/// skills themselves. Fennec supports a flat single-file skill format
+/// (`<home>/skills/<name>.md`), so a `README.md` dropped into the skills
+/// root would otherwise be parsed as a skill named "README" and rejected
+/// with a confusing "name must start with lowercase" warning on every
+/// load. We skip these well-known doc filenames up front instead. Matched
+/// case-insensitively (`README.md`, `readme.md`, …). The upstream avoids
+/// this entirely by only ever globbing files literally named `SKILL.md`,
+/// but Fennec keeps its flat-skill convenience and excludes docs by name.
+pub const RESERVED_FLAT_FILES: &[&str] = &[
+    "readme.md",
+    "description.md",
+    "changelog.md",
+    "license.md",
+    "contributing.md",
+    "agents.md",
+];
+
+/// Returns true if `file_name` is a documentation file that must not be
+/// treated as a flat skill. Case-insensitive over [`RESERVED_FLAT_FILES`].
+pub fn is_reserved_flat_file(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    RESERVED_FLAT_FILES.contains(&lower.as_str())
+}
+
 /// Lifecycle state of a skill. State lives in the usage sidecar
 /// (`<home>/skills/.usage.json`), not in the skill's frontmatter — this
 /// keeps skills' on-disk content stable across automated transitions.
