@@ -204,6 +204,21 @@ impl CronScheduler {
             }
         };
 
+        // Reload jobs from disk under the tick lock before scanning for
+        // due work. The scheduler and the agent's `cronjob` tool hold
+        // SEPARATE `JobStore` instances backed by the same file: the tool
+        // writes new/updated jobs to disk on each call, but the
+        // scheduler's in-memory list is only loaded once at boot. Without
+        // this reload a job created while the gateway is running is
+        // invisible to the scheduler and never fires (it only fires after
+        // a restart re-reads the file). Matches the upstream, whose
+        // `get_due_jobs()` reads the jobs file fresh every tick. Errors
+        // are non-fatal — `load()` is already graceful on a missing or
+        // corrupt file — so a transient read failure just skips this tick.
+        if let Err(e) = self.store.load() {
+            tracing::warn!("Cron tick: failed to reload job store from disk: {e}");
+        }
+
         let due_jobs = self.store.get_due_jobs();
         if due_jobs.is_empty() {
             return;
@@ -777,6 +792,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_added_to_disk_after_boot_fires_on_next_tick() {
+        // Regression: the scheduler and the agent's `cronjob` tool hold
+        // separate `JobStore` instances over the same file. A job written
+        // by the tool after the gateway booted must be picked up on the
+        // next tick — not only after a restart. The scheduler reloads the
+        // store from disk at the top of each tick to make this work.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("jobs.json");
+
+        // Scheduler boots with an empty store.
+        let store = JobStore::new(path.clone());
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+
+        // A *separate* store (mimicking the cronjob tool) writes a due job
+        // to the same file after the scheduler is already running.
+        let mut tool_store = JobStore::new(path.clone());
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        tool_store.add_job(job("late", "every 1h", None, Some(&past)));
+        tool_store.save().unwrap();
+
+        scheduler.tick().await;
+
+        let msg = rx
+            .inbound_rx
+            .try_recv()
+            .expect("job created after boot should fire on next tick");
+        assert_eq!(msg.sender, "cron:late");
+    }
+
+    #[tokio::test]
     async fn stale_recurring_job_is_fast_forwarded_not_fired() {
         // "every 1h" missed by 2h — more than the half-period grace
         // (30min, clamped to [120s, 7200s]). Must be fast-forwarded
@@ -871,10 +917,14 @@ mod tests {
         // Fire 1.
         scheduler.tick().await;
         let _ = rx.inbound_rx.try_recv().expect("fire 1");
-        // Re-arm next_run_at to past for fire 2.
+        // Re-arm next_run_at to past for fire 2. Must persist to disk:
+        // each tick reloads the store from disk at the top, so an
+        // in-memory-only mutation would be overwritten by the state the
+        // previous tick saved.
         if let Some(j) = scheduler.store.get_mut("limit") {
             j.next_run_at = Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
         }
+        scheduler.store.save().unwrap();
         scheduler.tick().await;
         let _ = rx.inbound_rx.try_recv().expect("fire 2");
 
