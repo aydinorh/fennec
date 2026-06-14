@@ -3184,6 +3184,23 @@ async fn run_gateway(
                 let mut guard =
                     fennec::security::PairingGuard::new(Some(home_dir.join("pairing.json")));
                 let code = guard.generate_code();
+                // Surface the code on stdout, not just via tracing. The
+                // operator MUST see it to share it out-of-band — but the
+                // default tracing filter (EnvFilter with RUST_LOG unset)
+                // drops everything below ERROR, so a `tracing::info!` line
+                // is invisible in a normal `fennec gateway` run and the
+                // pairing flow becomes unusable. A plain stdout banner is
+                // reliable on both an interactive console and under
+                // systemd (journald captures stdout regardless of
+                // RUST_LOG). The tracing line is kept for structured-log
+                // capture when INFO logging is explicitly enabled.
+                println!(
+                    "\n┌─ Telegram pairing ────────────────────────────────────────┐\n\
+                     │  Pairing code for this session: {code}\n\
+                     │  Share it out-of-band with anyone who should DM the bot.\n\
+                     │  A new code is generated each time the gateway starts.\n\
+                     └───────────────────────────────────────────────────────────┘\n"
+                );
                 tracing::info!(
                     "Telegram pairing code for this session: {code} — share it \
                      out-of-band with anyone who should be able to DM the bot."
