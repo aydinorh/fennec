@@ -1036,7 +1036,8 @@ async fn build_agent_with_callbacks(
             3,
             4,
         ))
-        .compression_enabled(config.agent.compression_enabled);
+        .compression_enabled(config.agent.compression_enabled)
+        .context_window_cap(config.agent.context_window as usize);
     if let Some(handle) = callbacks {
         configured_builder = configured_builder.callbacks(handle);
     }

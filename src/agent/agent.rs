@@ -95,6 +95,16 @@ pub struct Agent {
     /// operator wants strict prompt-cache stability and accepts the risk of
     /// hitting the context limit on very long turns).
     compression_enabled: bool,
+    /// Upper bound on the context window used for compaction and usage math,
+    /// independent of the (often optimistic) figure the provider reports.
+    /// `None` means "trust the provider". Set from `[agent] context_window`.
+    ///
+    /// Some providers advertise an enormous window — deepseek-chat reports
+    /// 1,000,000 — so a percentage-of-window compaction trigger effectively
+    /// never fires (50% of 1M = 500K tokens), letting a session bloat
+    /// unbounded. Capping the effective window at the configured budget
+    /// makes compaction trigger at a sane point.
+    context_window_cap: Option<usize>,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
     max_tool_iterations: usize,
@@ -155,6 +165,22 @@ pub struct Agent {
 pub struct TurnWithHistoryResult {
     pub response: String,
     pub new_messages: Vec<ChatMessage>,
+}
+
+/// The provider's reported context window, capped at `cap` when one is set
+/// and non-zero. When the provider reports `0` (unknown) the cap is used as
+/// the window. Pure helper behind [`Agent::effective_context_window`].
+fn capped_context_window(provider_window: usize, cap: Option<usize>) -> usize {
+    match cap {
+        Some(c) if c > 0 => {
+            if provider_window == 0 {
+                c
+            } else {
+                provider_window.min(c)
+            }
+        }
+        _ => provider_window,
+    }
 }
 
 impl Agent {
@@ -888,11 +914,23 @@ impl Agent {
     /// history is still under threshold. On a successful compaction the cached
     /// system prompt is left untouched — compaction alters message history, not
     /// the system prefix, so the provider's prompt cache stays valid.
+    /// The context window to measure history against: the provider's
+    /// reported window, capped at the configured `[agent] context_window`
+    /// when one is set. See [`context_window_cap`](Self::context_window_cap).
+    fn effective_context_window(&self) -> usize {
+        // Base window comes from per-model metadata (models.dev overlay →
+        // static baseline), falling back to the provider's own default;
+        // then capped at the configured [agent] context_window.
+        let base = super::model_metadata::context_window(self.provider.model())
+            .unwrap_or_else(|| self.provider.context_window());
+        capped_context_window(base, self.context_window_cap)
+    }
+
     async fn maybe_compact(&mut self) {
         if !self.compression_enabled {
             return;
         }
-        let ctx_window = self.provider.context_window();
+        let ctx_window = self.effective_context_window();
         if ctx_window == 0 {
             return;
         }
@@ -1328,10 +1366,13 @@ impl Agent {
 
     pub fn token_usage(&self) -> TokenUsage {
         let model = self.provider.model().to_string();
-        // Prefer the per-model context window (models.dev overlay → static
-        // baseline); fall back to the provider's own default when unknown.
-        let context_max = super::model_metadata::context_window(&model)
-            .unwrap_or_else(|| self.provider.context_window());
+        // Effective (capped) per-model window: model_metadata supplies the
+        // accurate base (models.dev overlay → static baseline → provider
+        // default) inside effective_context_window(), which then caps it at
+        // the configured [agent] context_window. So /usage reflects the same
+        // budget compaction measures against. Cost uses models.dev pricing.
+        // (Reconciles the compaction cap with the per-model metadata work.)
+        let context_max = self.effective_context_window();
         let cost_usd = super::model_metadata::estimate_cost(
             &model,
             self.total_input_tokens,
@@ -1699,6 +1740,7 @@ pub struct AgentBuilder {
     interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     context_compressor: Option<ContextCompressor>,
     compression_enabled: Option<bool>,
+    context_window_cap: Option<usize>,
 }
 
 impl AgentBuilder {
@@ -1725,6 +1767,7 @@ impl AgentBuilder {
             interrupt_flag: None,
             context_compressor: None,
             compression_enabled: None,
+            context_window_cap: None,
         }
     }
 
@@ -1740,6 +1783,13 @@ impl AgentBuilder {
     /// `true`.
     pub fn compression_enabled(mut self, enabled: bool) -> Self {
         self.compression_enabled = Some(enabled);
+        self
+    }
+
+    /// Cap the context window used for compaction and usage math at the
+    /// configured `[agent] context_window`. `0` is treated as "no cap".
+    pub fn context_window_cap(mut self, cap: usize) -> Self {
+        self.context_window_cap = if cap > 0 { Some(cap) } else { None };
         self
     }
 
@@ -1931,6 +1981,7 @@ impl AgentBuilder {
                 .context_compressor
                 .unwrap_or_default(),
             compression_enabled: self.compression_enabled.unwrap_or(true),
+            context_window_cap: self.context_window_cap,
             pending_attachments: Vec::new(),
             pending_steer: None,
             memory,
@@ -2129,5 +2180,22 @@ mod parallel_gate_tests {
         // Missing or blank `path` → None (treated as "can't tell, stay sequential").
         assert!(Agent::parallel_scope_path(&serde_json::json!({})).is_none());
         assert!(Agent::parallel_scope_path(&serde_json::json!({"path": "   "})).is_none());
+    }
+
+    #[test]
+    fn capped_context_window_caps_optimistic_provider_window() {
+        // deepseek-chat reports 1,000,000; the configured cap is 200,000.
+        // The effective window must be the cap so compaction triggers at a
+        // sane point (50% of 200K, not 50% of 1M).
+        assert_eq!(capped_context_window(1_000_000, Some(200_000)), 200_000);
+        // A genuinely smaller provider window wins over a larger cap (never
+        // claim more room than the model actually has).
+        assert_eq!(capped_context_window(128_000, Some(200_000)), 128_000);
+        // No cap → trust the provider.
+        assert_eq!(capped_context_window(1_000_000, None), 1_000_000);
+        // Cap of 0 is treated as "no cap".
+        assert_eq!(capped_context_window(1_000_000, Some(0)), 1_000_000);
+        // Provider reports unknown (0) → fall back to the cap.
+        assert_eq!(capped_context_window(0, Some(200_000)), 200_000);
     }
 }
