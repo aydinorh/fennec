@@ -672,7 +672,11 @@ bot_token = ""
 app_token = ""
 
 [gateway]
-host = "0.0.0.0"
+# Loopback by default: a freshly onboarded gateway has no auth token, so
+# binding 0.0.0.0 would expose an unauthenticated agent to the whole
+# network. Set host = "0.0.0.0" (and an auth_token) once you intend to
+# accept remote connections.
+host = "127.0.0.1"
 port = 8990
 
 [cron]
