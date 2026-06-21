@@ -68,7 +68,42 @@ pub fn parse_thinking_directive(message: &str) -> (Option<ThinkingLevel>, String
         }
     }
 
+    // Bare `/think` (no `:level`) — enable thinking at a sensible default
+    // (High) so the command is recognized instead of being passed to the
+    // agent as text (which replied "no command by that name"). The
+    // `:level` forms are matched first, so this only fires for a standalone
+    // `/think` token.
+    if let Some(pos) = find_bare_think(message) {
+        let token_len = "/think".len();
+        let mut cleaned = String::with_capacity(message.len());
+        cleaned.push_str(&message[..pos]);
+        cleaned.push_str(&message[pos + token_len..]);
+        let cleaned = cleaned.trim().to_string();
+        return (Some(ThinkingLevel::High), cleaned);
+    }
+
     (None, message.to_string())
+}
+
+/// Find a standalone `/think` token — not the `/think:` prefix of a
+/// `:level` form (handled earlier) and not a longer word like `/thinking`.
+/// Requires the character after `/think` to be absent or a non-`:`,
+/// non-alphanumeric boundary.
+fn find_bare_think(message: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(rel) = message[search_from..].find("/think") {
+        let pos = search_from + rel;
+        let after = message[pos + "/think".len()..].chars().next();
+        let is_boundary = match after {
+            None => true,
+            Some(c) => c != ':' && !c.is_ascii_alphanumeric(),
+        };
+        if is_boundary {
+            return Some(pos);
+        }
+        search_from = pos + "/think".len();
+    }
+    None
 }
 
 /// Mutate a JSON request body to apply thinking / reasoning parameters based
@@ -115,6 +150,31 @@ mod tests {
         let (level, cleaned) = parse_thinking_directive("/think:high Solve this complex problem");
         assert_eq!(level, Some(ThinkingLevel::High));
         assert_eq!(cleaned, "Solve this complex problem");
+    }
+
+    #[test]
+    fn parse_bare_think_enables_high() {
+        // Bare `/think` (no :level) is now recognized and defaults to High.
+        let (level, cleaned) = parse_thinking_directive("/think");
+        assert_eq!(level, Some(ThinkingLevel::High));
+        assert_eq!(cleaned, "");
+
+        let (level, cleaned) = parse_thinking_directive("/think please solve this");
+        assert_eq!(level, Some(ThinkingLevel::High));
+        assert_eq!(cleaned, "please solve this");
+    }
+
+    #[test]
+    fn bare_think_does_not_shadow_level_forms_or_words() {
+        // The `:level` forms still win over the bare token.
+        let (level, _) = parse_thinking_directive("/think:off quiet please");
+        assert_eq!(level, Some(ThinkingLevel::Off));
+        let (level, _) = parse_thinking_directive("/think:max");
+        assert_eq!(level, Some(ThinkingLevel::Max));
+        // A longer word like "/thinking" must NOT trigger the bare token.
+        let (level, cleaned) = parse_thinking_directive("/thinking about it");
+        assert!(level.is_none());
+        assert_eq!(cleaned, "/thinking about it");
     }
 
     #[test]
