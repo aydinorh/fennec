@@ -37,7 +37,7 @@ use anyhow::{Context, Result};
 use include_dir::{Dir, File, include_dir};
 use sha2::{Digest, Sha256};
 
-use super::format::validate_skill_name;
+use super::format::{is_reserved_flat_file, validate_skill_name};
 use super::manifest::BundledManifest;
 
 /// The bundled-skill set, embedded from `skills/` at compile time. The
@@ -221,6 +221,18 @@ fn iter_bundled_md_files<'a>(source: &'a Dir<'a>) -> impl Iterator<Item = &'a Fi
     source
         .files()
         .filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("md"))
+        // Exclude documentation files (README.md, etc.) the same way the
+        // on-disk loader does. `skills/README.md` is embedded by include_dir
+        // alongside the real bundled skills; without this it was parsed as a
+        // skill named "README", failed name validation, and bumped the boot
+        // error count on every start. It's documentation, not a skill.
+        .filter(|f| {
+            !f.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(is_reserved_flat_file)
+                .unwrap_or(false)
+        })
 }
 
 /// Skill name = file stem of a `.md` at the top level. Returns `None`
@@ -285,6 +297,22 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, DirEntry::File(_)))
             .count()
+    }
+
+    /// The real embedded bundle must sync with **zero** errors. `skills/`
+    /// ships a README.md alongside the skills; before the reserved-file
+    /// exclusion it was parsed as a skill named "README", failed name
+    /// validation, and bumped `errors` on every boot.
+    #[test]
+    fn real_bundled_set_syncs_without_errors() {
+        let tmp = TempDir::new().unwrap();
+        let counts = sync_with_source(tmp.path(), &BUNDLED).unwrap();
+        assert_eq!(
+            counts.errors, 0,
+            "bundled sync reported {} error(s); a doc file is likely being treated as a skill",
+            counts.errors
+        );
+        assert!(counts.considered > 0, "expected real bundled skills");
     }
 
     /// First-run seed: every bundled skill lands on disk.
