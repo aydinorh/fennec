@@ -1437,6 +1437,18 @@ impl Agent {
         self.thinking_level
     }
 
+    /// The reasoning trace of the most recent assistant message that
+    /// carried one, if any. Lets a non-streaming caller (the gateway)
+    /// surface a reasoning model's thinking, which is otherwise only
+    /// delivered via the streaming `on_reasoning_delta` callback.
+    pub fn last_turn_reasoning(&self) -> Option<String> {
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && m.reasoning.as_deref().is_some_and(|r| !r.trim().is_empty()))
+            .and_then(|m| m.reasoning.clone())
+    }
+
     /// Set the thinking level programmatically.
     pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
         self.thinking_level = level;

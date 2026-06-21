@@ -221,6 +221,30 @@ fn build_status_text(
     lines.join("\n")
 }
 
+/// Max characters of a reasoning trace surfaced ahead of the answer.
+/// Reasoning can run to thousands of tokens; we show a labeled, truncated
+/// preview so `/think` is observable without burying the actual reply.
+const MAX_REASONING_PREVIEW: usize = 1200;
+
+/// Prepend a labeled, truncated reasoning block to a response when one is
+/// present. No-op when `reasoning` is `None` or blank.
+fn prepend_reasoning_block(response: String, reasoning: Option<String>) -> String {
+    match reasoning {
+        Some(r) if !r.trim().is_empty() => {
+            let trimmed = r.trim();
+            let preview: String = if trimmed.chars().count() > MAX_REASONING_PREVIEW {
+                let mut s: String = trimmed.chars().take(MAX_REASONING_PREVIEW).collect();
+                s.push('…');
+                s
+            } else {
+                trimmed.to_string()
+            };
+            format!("💭 Thinking:\n{preview}\n\n{response}")
+        }
+        _ => response,
+    }
+}
+
 /// Extract the leading slash-command token from a message, stripping any
 /// `@botname` suffix Telegram appends in groups (`/help@mybot` → `/help`).
 /// Returns `""` when the message doesn't begin with a token.
@@ -3802,6 +3826,18 @@ async fn run_gateway(
                     }
                     let history_before = agent_lock.history_len();
                     let r = agent_lock.turn(&msg.content).await;
+                    // Capture the reasoning trace + whether thinking is on
+                    // while still holding the lock. The gateway runs the
+                    // non-streaming turn(), so the streaming
+                    // on_reasoning_delta callback never fires here; without
+                    // this, /think had no observable effect.
+                    let reasoning = if agent_lock.thinking_level()
+                        != fennec::agent::thinking::ThinkingLevel::Off
+                    {
+                        agent_lock.last_turn_reasoning()
+                    } else {
+                        None
+                    };
                     // Snapshot every message this turn appended (user prompt,
                     // assistant + tool_calls, tool results) while the lock is
                     // held, so we can record the full structured transcript.
@@ -3810,7 +3846,7 @@ async fn run_gateway(
                         .iter()
                         .cloned()
                         .collect();
-                    (r, new_msgs)
+                    (r.map(|resp| (resp, reasoning)), new_msgs)
                 };
 
                 // Record the structured turn (mirrors the upstream's per-turn
@@ -3821,7 +3857,7 @@ async fn run_gateway(
                 }
 
                 match turn_result {
-                    Ok(response) => {
+                    Ok((response, reasoning)) => {
                         // Stop typing indicator.
                         typing_handle.abort();
 
@@ -3833,6 +3869,13 @@ async fn run_gateway(
                             );
                             return;
                         }
+
+                        // Surface the reasoning trace (labeled, truncated)
+                        // ahead of the answer so /think is observable on
+                        // channels that only receive the final text. (The
+                        // clean reply is already recorded via record_turn
+                        // above, without this preview.)
+                        let response = prepend_reasoning_block(response, reasoning);
 
                         // Check if the channel supports streaming and use
                         // streaming delivery for a progressive typing effect.
@@ -4722,5 +4765,37 @@ mod gateway_session_tests {
         let title = session_title_from(&long);
         assert_eq!(title.chars().count(), 61); // 60 + ellipsis
         assert!(title.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_render_tests {
+    use super::{prepend_reasoning_block, MAX_REASONING_PREVIEW};
+
+    #[test]
+    fn no_reasoning_returns_response_unchanged() {
+        assert_eq!(prepend_reasoning_block("answer".into(), None), "answer");
+        assert_eq!(
+            prepend_reasoning_block("answer".into(), Some("   ".into())),
+            "answer"
+        );
+    }
+
+    #[test]
+    fn reasoning_is_labeled_and_prepended() {
+        let out = prepend_reasoning_block("the answer".into(), Some("step 1\nstep 2".into()));
+        assert!(out.starts_with("💭 Thinking:\n"));
+        assert!(out.contains("step 1\nstep 2"));
+        assert!(out.trim_end().ends_with("the answer"));
+    }
+
+    #[test]
+    fn long_reasoning_is_truncated() {
+        let long = "x".repeat(MAX_REASONING_PREVIEW + 500);
+        let out = prepend_reasoning_block("ans".into(), Some(long));
+        assert!(out.contains('…'), "over-long reasoning should be elided");
+        // The preview portion is capped (plus the label/answer/ellipsis).
+        let xs = out.chars().filter(|&c| c == 'x').count();
+        assert_eq!(xs, MAX_REASONING_PREVIEW);
     }
 }
