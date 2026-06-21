@@ -177,6 +177,14 @@ fn decrypt_channel_secret(
     }
 }
 
+/// Extract the leading slash-command token from a message, stripping any
+/// `@botname` suffix Telegram appends in groups (`/help@mybot` → `/help`).
+/// Returns `""` when the message doesn't begin with a token.
+fn leading_command_token(content: &str) -> &str {
+    let first = content.trim_start().split_whitespace().next().unwrap_or("");
+    first.split('@').next().unwrap_or(first)
+}
+
 /// Resolve the API key from config or provider-specific environment variable.
 fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<String> {
     // Try config value first.
@@ -3439,6 +3447,22 @@ async fn run_gateway(
     });
 
     // 7. Main loop: consume inbound messages from bus, run agent, publish outbound.
+    // Static responses for the /status and /help commands, built once.
+    // Without real handlers these commands fell through to the agent,
+    // which improvised an unverified (and sometimes over-promising) reply.
+    let status_text = format!(
+        "🦊 Fennec v{} — online\nProvider: {}\nModel: {}",
+        env!("CARGO_PKG_VERSION"),
+        config.provider.name,
+        config.provider.model,
+    );
+    let help_text = "Commands:\n\
+         /new or /reset — start a fresh session (clears history)\n\
+         /status — show agent status\n\
+         /help — show this message\n\n\
+         Otherwise just send a message and I'll respond."
+        .to_string();
+
     let agent_loop = {
         let agent = Arc::clone(&agent);
         let bus = bus.clone();
@@ -3494,7 +3518,32 @@ async fn run_gateway(
                 let bus = bus.clone();
                 let manager_ref = Arc::clone(&manager_ref);
                 let cron_origin = Arc::clone(&cron_origin);
+                let status_text = status_text.clone();
+                let help_text = help_text.clone();
                 tokio::spawn(async move {
+                // /status and /help get real, static answers instead of
+                // being passed to the agent (which would improvise an
+                // unverified reply). Matched on the leading token so a bot
+                // mention suffix (/help@bot) or trailing args still hit.
+                let first_token = leading_command_token(&msg.content);
+                if matches!(first_token, "/status" | "/help") {
+                    let content = if first_token == "/status" {
+                        status_text.clone()
+                    } else {
+                        help_text.clone()
+                    };
+                    let outbound = fennec::bus::OutboundMessage {
+                        content,
+                        channel: msg.channel.clone(),
+                        chat_id: msg.chat_id.clone(),
+                        reply_to: Some(msg.id.clone()),
+                        metadata: std::collections::HashMap::new(),
+                        attachments: Vec::new(),
+                    };
+                    let _ = bus.publish_outbound(outbound).await;
+                    return;
+                }
+
                 // Handle /new and /reset commands: clear agent history and
                 // send a confirmation instead of running a full agent turn.
                 if msg.metadata.get("command").map(|s| s.as_str()) == Some("reset") {
@@ -4313,4 +4362,20 @@ async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod slash_command_tests {
+    use super::leading_command_token;
+
+    #[test]
+    fn leading_command_token_strips_mention_and_args() {
+        assert_eq!(leading_command_token("/help"), "/help");
+        assert_eq!(leading_command_token("  /status  "), "/status");
+        assert_eq!(leading_command_token("/help@FennecBot"), "/help");
+        assert_eq!(leading_command_token("/status extra args"), "/status");
+        assert_eq!(leading_command_token("/help@bot now"), "/help");
+        assert_eq!(leading_command_token("hello there"), "hello");
+        assert_eq!(leading_command_token(""), "");
+    }
 }
