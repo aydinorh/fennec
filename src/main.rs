@@ -229,6 +229,65 @@ fn leading_command_token(content: &str) -> &str {
     first.split('@').next().unwrap_or(first)
 }
 
+/// Per-(channel, chat_id) session recording for the gateway dispatch loop.
+///
+/// The gateway never wrote to `sessions.db`, so `session_search` /
+/// `session_list` operated on an empty store in production. This records
+/// each user prompt and assistant reply into a per-conversation session so
+/// those features become functional. Cheap to clone — everything is behind
+/// an `Arc`. All writes are best-effort: a recording failure is logged and
+/// never disrupts the turn.
+#[derive(Clone)]
+struct GatewaySessions {
+    store: Arc<fennec::sessions::SessionStore>,
+    /// (channel, chat_id) → session_id, created lazily on first message.
+    map: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+}
+
+impl GatewaySessions {
+    /// Resolve the session id for a chat, creating one on first contact.
+    /// The map lock is held across `create_session` so two concurrent
+    /// turns from the same chat can't create duplicate sessions.
+    async fn session_for(&self, channel: &str, chat_id: &str) -> Option<String> {
+        let key = (channel.to_string(), chat_id.to_string());
+        let mut map = self.map.lock().await;
+        if let Some(id) = map.get(&key) {
+            return Some(id.clone());
+        }
+        match self.store.create_session(channel).await {
+            Ok(id) => {
+                map.insert(key, id.clone());
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!("session recording: create_session failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Append one message to the chat's session.
+    async fn record(&self, channel: &str, chat_id: &str, role: &str, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        if let Some(id) = self.session_for(channel, chat_id).await {
+            if let Err(e) = self.store.add_message(&id, role, content).await {
+                tracing::warn!("session recording: add_message failed: {e}");
+            }
+        }
+    }
+
+    /// End the chat's session (on /reset) so the next message starts fresh.
+    async fn reset(&self, channel: &str, chat_id: &str) {
+        let key = (channel.to_string(), chat_id.to_string());
+        let id = self.map.lock().await.remove(&key);
+        if let Some(id) = id {
+            let _ = self.store.end_session(&id, None).await;
+        }
+    }
+}
+
 /// Resolve the API key from config or provider-specific environment variable.
 fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<String> {
     // Try config value first.
@@ -3491,6 +3550,21 @@ async fn run_gateway(
     });
 
     // 7. Main loop: consume inbound messages from bus, run agent, publish outbound.
+    // Session recording for the dispatch loop, so session_search/list see
+    // real data. Best-effort: if the store won't open, recording is simply
+    // disabled and the gateway runs normally.
+    let gateway_sessions: Option<GatewaySessions> =
+        match fennec::sessions::SessionStore::new(&home_dir.join("sessions.db")) {
+            Ok(store) => Some(GatewaySessions {
+                store: Arc::new(store),
+                map: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            }),
+            Err(e) => {
+                tracing::warn!("session recording disabled: {e}");
+                None
+            }
+        };
+
     // Real handlers for /status and /help. Without them these commands fell
     // through to the agent, which improvised an unverified (and sometimes
     // over-promising) reply. /status is a live cockpit (built per request
@@ -3512,6 +3586,7 @@ async fn run_gateway(
         let cron_origin = Arc::clone(&cron_origin);
         let pending_replies = pending_replies.clone();
         let chat_directory = chat_directory.clone();
+        let gateway_sessions = gateway_sessions.clone();
         tokio::spawn(async move {
             while let Some(msg) = receiver.inbound_rx.recv().await {
                 // Always record the (channel, chat_id) pair in the
@@ -3562,6 +3637,7 @@ async fn run_gateway(
                 let cron_origin = Arc::clone(&cron_origin);
                 let provider_name = provider_name.clone();
                 let help_text = help_text.clone();
+                let gateway_sessions = gateway_sessions.clone();
                 tokio::spawn(async move {
                 // /status and /help get real answers instead of being passed
                 // to the agent (which would improvise an unverified reply).
@@ -3600,6 +3676,11 @@ async fn run_gateway(
                         let mut agent_lock = agent.lock().await;
                         agent_lock.clear_history();
                     }
+                    // End the recorded session so the next message opens a
+                    // fresh one, mirroring the cleared agent history.
+                    if let Some(s) = &gateway_sessions {
+                        s.reset(&msg.channel, &msg.chat_id).await;
+                    }
                     let outbound = fennec::bus::OutboundMessage {
                         content: "Session reset! Starting fresh.".to_string(),
                         channel: msg.channel.clone(),
@@ -3610,6 +3691,12 @@ async fn run_gateway(
                     };
                     let _ = bus.publish_outbound(outbound).await;
                     return;
+                }
+
+                // Record the user prompt before the turn so it lands in the
+                // session even if the turn errors.
+                if let Some(s) = &gateway_sessions {
+                    s.record(&msg.channel, &msg.chat_id, "user", &msg.content).await;
                 }
 
                 // Spawn continuous typing indicator that fires every 4 seconds
@@ -3662,6 +3749,12 @@ async fn run_gateway(
                                 "Agent response marked [SILENT], suppressing outbound"
                             );
                             return;
+                        }
+
+                        // Record the assistant reply into the session.
+                        if let Some(s) = &gateway_sessions {
+                            s.record(&msg.channel, &msg.chat_id, "assistant", &response)
+                                .await;
                         }
 
                         // Check if the channel supports streaming and use
@@ -4453,5 +4546,53 @@ mod slash_command_tests {
         assert!(s.contains("Provider: anthropic"));
         assert!(s.contains("Agent: busy"));
         assert!(!s.contains("Tokens:"));
+    }
+}
+
+#[cfg(test)]
+mod gateway_session_tests {
+    use super::GatewaySessions;
+    use std::sync::Arc;
+
+    fn recorder(dir: &std::path::Path) -> GatewaySessions {
+        let store = fennec::sessions::SessionStore::new(&dir.join("sessions.db")).unwrap();
+        GatewaySessions {
+            store: Arc::new(store),
+            map: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn records_per_chat_sessions_and_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = recorder(tmp.path());
+
+        // Chat A: user + assistant land in one session.
+        rec.record("telegram", "A", "user", "hi").await;
+        rec.record("telegram", "A", "assistant", "hello").await;
+        // Second turn, same chat → same session.
+        rec.record("telegram", "A", "user", "again").await;
+
+        // Chat B → a distinct session.
+        rec.record("telegram", "B", "user", "yo").await;
+
+        let sessions = rec.store.list_sessions(10).await.unwrap();
+        assert_eq!(sessions.len(), 2, "one session per chat");
+
+        let id_a = rec.session_for("telegram", "A").await.unwrap();
+        let msgs_a = rec.store.get_session_messages(&id_a).await.unwrap();
+        assert_eq!(msgs_a.len(), 3, "two user + one assistant message for chat A");
+
+        // Reset chat A → next message opens a fresh session.
+        rec.reset("telegram", "A").await;
+        rec.record("telegram", "A", "user", "fresh start").await;
+        let id_a2 = rec.session_for("telegram", "A").await.unwrap();
+        assert_ne!(id_a, id_a2, "reset must rotate to a new session");
+
+        // Empty content is not recorded.
+        let before = rec.store.get_session_messages(&id_a2).await.unwrap().len();
+        rec.record("telegram", "A", "assistant", "").await;
+        let after = rec.store.get_session_messages(&id_a2).await.unwrap().len();
+        assert_eq!(before, after, "empty content skipped");
     }
 }
