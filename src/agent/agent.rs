@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 
 use crate::collective::search::{CollectiveSearch, RankedExperience, SearchConfidence};
 use crate::memory::decay::apply_time_decay;
-use crate::memory::traits::Memory;
+use crate::memory::traits::{Memory, MemoryCategory};
 use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent};
 use crate::security::prompt_guard::{PromptGuard, ScanResult};
 use crate::tools::traits::{Tool, ToolSpec};
@@ -52,6 +52,34 @@ impl TokenUsage {
         let pct = (self.last_prompt_tokens as f64 * 100.0) / (self.context_max as f64);
         Some(pct.clamp(0.0, 100.0) as u8)
     }
+}
+
+/// Max core memories injected into the context every turn (in addition to
+/// the query-matched recall). Core facts are durable identity/preference
+/// items and are few by design; this bounds the worst case.
+const CORE_MEMORY_INJECT_LIMIT: usize = 25;
+
+/// Default score assigned to a core memory that has neither a search score
+/// (it came from `list`, not `recall`) nor an explicit importance, so core
+/// facts sort near the top of the injected context.
+const CORE_MEMORY_SCORE: f64 = 1.0;
+
+/// Merge always-injected core memories into the query-recalled set:
+/// append each core entry whose key isn't already present, giving
+/// score-less core entries a sort-friendly score (their importance, else
+/// [`CORE_MEMORY_SCORE`]) so they rank near the top rather than dead-last.
+/// Pure helper for [`Agent::load_memory_context`].
+fn merge_core_memories(
+    mut entries: Vec<crate::memory::traits::MemoryEntry>,
+    core: Vec<crate::memory::traits::MemoryEntry>,
+) -> Vec<crate::memory::traits::MemoryEntry> {
+    for mut c in core {
+        if !entries.iter().any(|e| e.key == c.key) {
+            c.score = c.score.or(c.importance).or(Some(CORE_MEMORY_SCORE));
+            entries.push(c);
+        }
+    }
+    entries
 }
 
 /// The core agent that orchestrates provider calls, tool execution, and memory.
@@ -932,9 +960,27 @@ impl Agent {
     async fn load_memory_context(&self, query: &str) -> Result<Vec<String>> {
         let mut entries = self.memory.recall(query, self.memory_context_limit).await?;
 
+        // Always surface CORE memories (identity, preferences, and the
+        // durable facts the consolidation pipeline extracts), regardless of
+        // whether they keyword/vector-match the current query. Without this,
+        // a question like "what's my favorite color?" whose phrasing didn't
+        // match the stored fact recalled nothing, so the agent answered "I
+        // don't know" even though the fact was in the database. This mirrors
+        // the upstream, which always injects the user profile each turn.
+        // Merge in core entries not already present (dedup by key).
+        match self
+            .memory
+            .list(Some(&MemoryCategory::Core), CORE_MEMORY_INJECT_LIMIT)
+            .await
+        {
+            Ok(core) => entries = merge_core_memories(entries, core),
+            Err(e) => tracing::warn!("failed to load core memories: {e}"),
+        }
+
         apply_time_decay(&mut entries, self.half_life_days);
 
-        // Sort by score descending.
+        // Sort by score descending. Core entries are exempt from decay (see
+        // `apply_time_decay`), so they retain a strong score and sort high.
         entries.sort_by(|a, b| {
             let sa = a.score.unwrap_or(0.0);
             let sb = b.score.unwrap_or(0.0);
@@ -1766,5 +1812,48 @@ fn truncate_summary(s: &str) -> String {
         let mut out: String = single_line.chars().take(MAX - 1).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod memory_injection_tests {
+    use super::{merge_core_memories, CORE_MEMORY_SCORE};
+    use crate::memory::traits::{MemoryCategory, MemoryEntry};
+
+    fn mk(key: &str, score: Option<f64>, importance: Option<f64>, cat: MemoryCategory) -> MemoryEntry {
+        MemoryEntry {
+            key: key.into(),
+            content: format!("content-{key}"),
+            category: cat,
+            score,
+            importance,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_core_memories_dedups_and_scores() {
+        let recalled = vec![
+            mk("a", Some(0.9), None, MemoryCategory::Conversation),
+            // "fav" already recalled — the core copy must NOT be duplicated.
+            mk("fav", Some(0.4), None, MemoryCategory::Core),
+        ];
+        let core = vec![
+            mk("fav", None, None, MemoryCategory::Core), // dup by key → skipped
+            mk("name", None, Some(0.8), MemoryCategory::Core), // importance → score
+            mk("loc", None, None, MemoryCategory::Core), // no score/importance → default
+        ];
+
+        let merged = merge_core_memories(recalled, core);
+        let keys: Vec<&str> = merged.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a", "fav", "name", "loc"], "no dup; core appended");
+        // The recalled "fav" keeps its original score (the core dup was dropped).
+        assert_eq!(merged.iter().find(|e| e.key == "fav").unwrap().score, Some(0.4));
+        // Core "name" took its importance as score; "loc" took the default.
+        assert_eq!(merged.iter().find(|e| e.key == "name").unwrap().score, Some(0.8));
+        assert_eq!(
+            merged.iter().find(|e| e.key == "loc").unwrap().score,
+            Some(CORE_MEMORY_SCORE)
+        );
     }
 }
