@@ -3482,6 +3482,19 @@ async fn run_gateway(
                     }
                 }
 
+                // Run the turn in its own task so the receive loop keeps
+                // draining the bus. A turn that calls `ask_user` blocks
+                // (holding the agent lock) until the user replies — but that
+                // reply arrives as a NEW inbound message, so the loop MUST
+                // stay free to recv() it and route it via take_and_deliver
+                // above. Running the turn inline froze the whole channel for
+                // the entire ask_user timeout. Turns still serialize on the
+                // agent mutex, so only one ever executes at a time.
+                let agent = Arc::clone(&agent);
+                let bus = bus.clone();
+                let manager_ref = Arc::clone(&manager_ref);
+                let cron_origin = Arc::clone(&cron_origin);
+                tokio::spawn(async move {
                 // Handle /new and /reset commands: clear agent history and
                 // send a confirmation instead of running a full agent turn.
                 if msg.metadata.get("command").map(|s| s.as_str()) == Some("reset") {
@@ -3501,7 +3514,7 @@ async fn run_gateway(
                         attachments: Vec::new(),
                     };
                     let _ = bus.publish_outbound(outbound).await;
-                    continue;
+                    return;
                 }
 
                 // Spawn continuous typing indicator that fires every 4 seconds
@@ -3517,30 +3530,29 @@ async fn run_gateway(
                     }
                 });
 
-                // Set the CronTool's origin so any jobs created during this
-                // turn know which channel/chat to deliver results to.
-                // Recover from a poisoned mutex via `into_inner` so that a
-                // single panic-while-locked elsewhere can't kill all
-                // subsequent inbound turns. (Same recovery pattern as the
-                // CronTool::execute lock site.)
-                {
-                    let mut origin = cron_origin
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    *origin = Some(CronOrigin {
-                        channel: msg.channel.clone(),
-                        chat_id: msg.chat_id.clone(),
-                    });
-                }
-
                 // Hold the agent lock only for the LLM turn itself. All
                 // subsequent I/O (typing-indicator abort, streaming
                 // delivery, bus publish) runs without the lock so that
                 // gateway HTTP /chat — which also takes agent.lock() —
                 // doesn't serialize behind a finished agent's outbound
                 // publish.
+                //
+                // Set the CronTool's origin INSIDE the lock so that, with
+                // turns now running in their own tasks, a second turn can't
+                // overwrite this turn's origin mid-flight. Recover from a
+                // poisoned mutex via `into_inner` so a single panic-while-
+                // locked elsewhere can't kill subsequent turns.
                 let turn_result = {
                     let mut agent_lock = agent.lock().await;
+                    {
+                        let mut origin = cron_origin
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *origin = Some(CronOrigin {
+                            channel: msg.channel.clone(),
+                            chat_id: msg.chat_id.clone(),
+                        });
+                    }
                     agent_lock.turn(&msg.content).await
                 };
                 match turn_result {
@@ -3554,7 +3566,7 @@ async fn run_gateway(
                             tracing::debug!(
                                 "Agent response marked [SILENT], suppressing outbound"
                             );
-                            continue;
+                            return;
                         }
 
                         // Check if the channel supports streaming and use
@@ -3595,7 +3607,7 @@ async fn run_gateway(
                                         )
                                         .await;
                                     // Streaming already delivered — skip outbound bus.
-                                    continue;
+                                    return;
                                 }
                                 Ok(None) | Err(_) => {
                                     // Streaming start failed; fall through to
@@ -3645,6 +3657,7 @@ async fn run_gateway(
                         let _ = bus.publish_outbound(outbound).await;
                     }
                 }
+                });
             }
         })
     };
