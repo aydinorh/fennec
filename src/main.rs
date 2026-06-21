@@ -201,6 +201,78 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         .with_context(|| format!("API key not found: set provider.api_key in config or {} env var", env_var))
 }
 
+/// Encrypt `slot` in place if it holds a non-empty plaintext secret.
+/// Returns true if it was changed. Already-encrypted (`enc2:`) and empty
+/// values are left untouched.
+fn encrypt_secret_in_place(store: &SecretStore, slot: &mut String) -> bool {
+    if slot.is_empty() || SecretStore::is_encrypted(slot) {
+        return false;
+    }
+    match store.encrypt(slot) {
+        Ok(blob) => {
+            *slot = blob;
+            true
+        }
+        Err(e) => {
+            tracing::warn!("secret migration: failed to encrypt a secret: {e}");
+            false
+        }
+    }
+}
+
+/// One-time, idempotent migration that encrypts plaintext secrets in an
+/// existing config so it honors `encrypt_secrets = true` and the runtime
+/// stops logging the "value lacks 'enc2:' prefix … unauthenticated"
+/// warning on every start. `#[onboard]` already encrypts on a fresh
+/// install; this covers configs created before that landed.
+///
+/// CRITICAL: only the fields the runtime actually decrypts via
+/// `SecretStore` are migrated. Encrypting a field the runtime reads
+/// literally (webhook HMAC secrets, `memory.embedding_api_key`) would
+/// turn it into an unusable `enc2:` blob. The list below mirrors exactly
+/// the `resolve_api_key` / `decrypt_channel_secret` / collective decrypt
+/// sites. Returns the migrated field names (empty = nothing to do).
+fn migrate_plaintext_secrets(
+    config: &mut FennecConfig,
+    store: &SecretStore,
+) -> Vec<&'static str> {
+    let mut migrated = Vec::new();
+    macro_rules! mig {
+        ($name:literal, $slot:expr) => {
+            if encrypt_secret_in_place(store, $slot) {
+                migrated.push($name);
+            }
+        };
+    }
+    mig!("provider.api_key", &mut config.provider.api_key);
+    mig!("collective.api_key", &mut config.collective.api_key);
+    mig!("channels.telegram.token", &mut config.channels.telegram.token);
+    mig!("channels.discord.token", &mut config.channels.discord.token);
+    mig!("channels.slack.bot_token", &mut config.channels.slack.bot_token);
+    mig!("channels.slack.app_token", &mut config.channels.slack.app_token);
+    mig!(
+        "channels.whatsapp.access_token",
+        &mut config.channels.whatsapp.access_token
+    );
+    mig!(
+        "channels.whatsapp.verify_token",
+        &mut config.channels.whatsapp.verify_token
+    );
+    mig!(
+        "channels.whatsapp.app_secret",
+        &mut config.channels.whatsapp.app_secret
+    );
+    mig!(
+        "channels.email.imap_password",
+        &mut config.channels.email.imap_password
+    );
+    mig!(
+        "channels.email.smtp_password",
+        &mut config.channels.email.smtp_password
+    );
+    migrated
+}
+
 /// Build the auxiliary client. Used by background tasks (curator,
 /// future title generation, smart-approval LLM, etc.) so they
 /// don't dirty the main provider's prompt cache or pay primary-
@@ -3843,7 +3915,34 @@ async fn main() -> Result<()> {
     // Load config: try from config dir, fall back to defaults.
     // (Re-uses pre_home and pre_config so we don't re-read config.toml.)
     let home_dir = pre_home;
-    let config = pre_config;
+    let mut config = pre_config;
+
+    // One-time secret migration for pre-existing configs: encrypt any
+    // plaintext secrets in place so the config honors `encrypt_secrets`
+    // and the runtime stops warning about unauthenticated values. Skipped
+    // when no config file exists (nothing to migrate; don't create one) or
+    // when encryption is disabled. Idempotent — a fully-encrypted config
+    // migrates nothing and is not rewritten.
+    if pre_config_path.exists() && config.security.encrypt_secrets {
+        match SecretStore::new(home_dir.to_path_buf()) {
+            Ok(store) => {
+                let migrated = migrate_plaintext_secrets(&mut config, &store);
+                if !migrated.is_empty() {
+                    match config.save(&pre_config_path) {
+                        Ok(()) => tracing::info!(
+                            "encrypted {} plaintext secret(s) at rest: {}",
+                            migrated.len(),
+                            migrated.join(", ")
+                        ),
+                        Err(e) => {
+                            tracing::warn!("secret migration: failed to save config: {e}")
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("secret migration skipped: {e}"),
+        }
+    }
 
     match cli.command {
         Commands::Agent { message, model, tui } => {
@@ -4300,4 +4399,43 @@ async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod secret_migration_tests {
+    use super::{migrate_plaintext_secrets, FennecConfig};
+    use fennec::security::SecretStore;
+
+    #[test]
+    fn migrates_plaintext_secrets_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(tmp.path().to_path_buf()).unwrap();
+
+        let mut config = FennecConfig::default();
+        config.provider.api_key = "sk-plaintext".into();
+        config.channels.telegram.token = "123:tok".into();
+        // An already-encrypted value must be left untouched.
+        let pre_enc = store.encrypt("already").unwrap();
+        config.collective.api_key = pre_enc.clone();
+        // Empty stays empty.
+        config.channels.discord.token = String::new();
+
+        let migrated = migrate_plaintext_secrets(&mut config, &store);
+        assert!(migrated.contains(&"provider.api_key"));
+        assert!(migrated.contains(&"channels.telegram.token"));
+        assert!(!migrated.contains(&"collective.api_key")); // already encrypted
+        assert!(!migrated.contains(&"channels.discord.token")); // empty
+
+        // Migrated values are enc2 and round-trip back to plaintext.
+        assert!(SecretStore::is_encrypted(&config.provider.api_key));
+        assert_eq!(store.decrypt(&config.provider.api_key).unwrap(), "sk-plaintext");
+        assert_eq!(store.decrypt(&config.channels.telegram.token).unwrap(), "123:tok");
+        // The pre-encrypted value is byte-for-byte untouched.
+        assert_eq!(config.collective.api_key, pre_enc);
+        assert_eq!(config.channels.discord.token, "");
+
+        // Second run is a no-op (idempotent).
+        let again = migrate_plaintext_secrets(&mut config, &store);
+        assert!(again.is_empty(), "fully-encrypted config must migrate nothing");
+    }
 }

@@ -194,12 +194,17 @@ impl FennecConfig {
     /// `/tools`, and other slash commands that mutate runtime
     /// config and need the change to survive a restart. Creates
     /// the parent directory if missing.
+    ///
+    /// Written via `write_secure` (atomic, mode 0600) because the config
+    /// holds API keys and channel tokens. Plain `std::fs::write` left the
+    /// file world-readable (0644), so a `/model` re-serialize silently
+    /// undid the 0600 perms onboard set with `write_secure`.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let body = toml::to_string_pretty(self)?;
-        std::fs::write(path, body)?;
+        crate::security::fs::write_secure(path, body.as_bytes())?;
         Ok(())
     }
 }

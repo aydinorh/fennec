@@ -82,6 +82,14 @@ impl SecretStore {
         ChaCha20Poly1305::new(Key::from_slice(self.key_bytes.as_slice()))
     }
 
+    /// Whether `value` is already an `enc2:`-encrypted blob. Useful for a
+    /// one-time migration that encrypts only the plaintext secrets and
+    /// leaves already-encrypted ones untouched. Empty strings are not
+    /// "encrypted" but also need no migration (callers skip them).
+    pub fn is_encrypted(value: &str) -> bool {
+        value.starts_with(PREFIX)
+    }
+
     /// Encrypt `plaintext` and return a prefixed hex string.
     ///
     /// Format: `enc2:<hex(nonce || ciphertext)>`
