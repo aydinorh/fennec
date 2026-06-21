@@ -306,11 +306,29 @@ fn plan_failover_chain(provider_cfg: &fennec::config::ProviderConfig) -> Vec<Pla
 fn build_failover_providers(
     config: &FennecConfig,
     home_dir: &std::path::Path,
+    secret_store: &SecretStore,
     chain: &[PlannedFallback],
 ) -> Vec<Box<dyn Provider>> {
+    let primary_provider = config.provider.name.trim().to_lowercase();
     let mut providers: Vec<Box<dyn Provider>> = Vec::new();
     for entry in chain {
-        let api_key = match resolve_api_key_for(&entry.provider) {
+        // Same-provider fallbacks (the `fallback_models` shorthand — a
+        // different model on the SAME backend) share the primary's
+        // credentials, so resolve their key from the decrypted config
+        // exactly like the primary does. Only CROSS-provider fallbacks fall
+        // through to the env-only path, since `provider.api_key` belongs to
+        // the primary backend and must not be handed to a different one.
+        //
+        // Without this, a config-only install (key in config.toml, nothing
+        // in env — the default onboarding flow) had its whole chain skipped
+        // at startup: every same-provider fallback resolved to an empty env
+        // key, so failover silently never engaged.
+        let key_result = if entry.provider == primary_provider {
+            resolve_api_key(config, secret_store)
+        } else {
+            resolve_api_key_for(&entry.provider)
+        };
+        let api_key = match key_result {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(
@@ -347,6 +365,37 @@ mod failover_chain_tests {
     #[test]
     fn empty_config_yields_empty_chain() {
         assert!(plan_failover_chain(&cfg()).is_empty());
+    }
+
+    #[test]
+    fn same_provider_fallback_uses_config_key_without_env() {
+        use super::{build_failover_providers, plan_failover_chain};
+        use fennec::config::FennecConfig;
+        use fennec::security::SecretStore;
+
+        // Config-only install: primary key in config, NOTHING in env, and a
+        // same-provider fallback model. The fallback must still build,
+        // because it inherits the primary's decrypted config key. (Before
+        // the fix, env-only resolution skipped it and failover never
+        // engaged.)
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(tmp.path().to_path_buf()).unwrap();
+
+        let mut config = FennecConfig::default();
+        config.provider.name = "anthropic".into();
+        config.provider.model = "claude-sonnet-4-6".into();
+        config.provider.api_key = "sk-test-primary".into(); // plaintext passthrough
+        config.provider.fallback_models = vec!["claude-haiku-4-5".into()];
+
+        let chain = plan_failover_chain(&config.provider);
+        assert_eq!(chain.len(), 1, "one same-provider fallback planned");
+
+        let providers = build_failover_providers(&config, tmp.path(), &store, &chain);
+        assert_eq!(
+            providers.len(),
+            1,
+            "same-provider fallback should build from the config key with no env var set"
+        );
     }
 
     #[test]
@@ -815,7 +864,8 @@ async fn build_agent_with_callbacks(
         if chain.is_empty() {
             provider
         } else {
-            let fallback_providers = build_failover_providers(config, home_dir, &chain);
+            let fallback_providers =
+                build_failover_providers(config, home_dir, &secret_store, &chain);
             if fallback_providers.is_empty() {
                 tracing::warn!(
                     "failover configured but no chain entry was buildable; running without failover"
