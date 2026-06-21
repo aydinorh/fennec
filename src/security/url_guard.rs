@@ -178,8 +178,34 @@ fn check_domain(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Default `User-Agent` for the guarded HTTP client.
+///
+/// Many common targets — notably the GitHub API and Wikipedia (both REST
+/// and rendered pages) — reject requests that send **no** `User-Agent` with
+/// `403 Forbidden`. Without a default here, `web_fetch` / `http_request`
+/// (and the pdf/vision/image helpers that share this client) silently
+/// failed on those sites while the `browser` tool — which sets its own UA —
+/// succeeded on the same URLs.
+///
+/// We use the `Mozilla/5.0 (compatible; …)` form that already works for the
+/// `browser` tool: it carries a contact URL (satisfying Wikipedia's
+/// user-agent policy, which requires a *meaningful* UA) and is honest about
+/// being Fennec rather than impersonating a real browser. A `compatible`
+/// token is the conventional way for a well-behaved bot to identify itself.
+/// Callers that need a different UA (e.g. `http_request` with a
+/// user-supplied header) still override this per request, since a
+/// request-level header takes precedence over the client default.
+pub const GUARDED_CLIENT_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (compatible; Fennec/",
+    env!("CARGO_PKG_VERSION"),
+    "; +https://fennec.dev)"
+);
+
 /// Build a `reqwest::Client` with a redirect policy that re-validates every
 /// hop through [`validate_url`]. Caps redirects at `MAX_REDIRECT_HOPS`.
+///
+/// The client carries a default [`GUARDED_CLIENT_USER_AGENT`] so requests
+/// don't 403 on UA-strict sites; see that constant for the rationale.
 pub fn build_guarded_client(timeout: Duration) -> reqwest::Client {
     let policy = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= MAX_REDIRECT_HOPS {
@@ -192,6 +218,7 @@ pub fn build_guarded_client(timeout: Duration) -> reqwest::Client {
     });
     reqwest::Client::builder()
         .timeout(timeout)
+        .user_agent(GUARDED_CLIENT_USER_AGENT)
         .redirect(policy)
         .build()
         .expect("build reqwest client")
@@ -291,6 +318,27 @@ mod tests {
             std::env::remove_var(OVERRIDE_ENV);
         }
         f()
+    }
+
+    #[test]
+    fn guarded_client_user_agent_is_meaningful() {
+        // Regression for the 403-on-UA-strict-sites bug: the guarded
+        // client must carry a non-empty, meaningful User-Agent. It needs
+        // a version (so operators can correlate traffic) and a contact URL
+        // (Wikipedia's UA policy requires a meaningful agent), and must not
+        // be an empty string (the exact condition that 403'd on GitHub /
+        // Wikipedia).
+        assert!(GUARDED_CLIENT_USER_AGENT.starts_with("Mozilla/5.0 (compatible; Fennec/"));
+        assert!(GUARDED_CLIENT_USER_AGENT.contains(env!("CARGO_PKG_VERSION")));
+        assert!(GUARDED_CLIENT_USER_AGENT.contains("+https://fennec.dev"));
+        assert!(!GUARDED_CLIENT_USER_AGENT.trim().is_empty());
+    }
+
+    #[test]
+    fn guarded_client_builds() {
+        // Building must not panic and the UA must be accepted by reqwest
+        // as a valid header value (panics at build otherwise).
+        let _ = build_guarded_client(Duration::from_secs(5));
     }
 
     #[test]
