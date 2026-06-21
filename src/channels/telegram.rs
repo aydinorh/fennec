@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::bus::InboundMessage;
+use crate::security::url_guard::read_body_capped;
 
 use super::traits::{Channel, SendMessage};
 
@@ -27,6 +29,89 @@ const MAX_RETRY_AFTER_ATTEMPTS: u32 = 3;
 /// rather surface the failure than block a listener for many minutes.
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 
+/// Maximum size, in bytes, we download for an incoming Telegram attachment.
+/// Telegram's public Bot API caps `getFile` downloads at 20 MB; we mirror
+/// that so a huge file can't exhaust memory or disk.
+const MAX_MEDIA_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
+
+/// Kind of attachment on an incoming Telegram message. Determines the
+/// default file extension and the hint we give the agent about which tool
+/// to reach for (vision vs. transcription).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TgMediaKind {
+    Photo,
+    Voice,
+    Audio,
+    Video,
+    Document,
+}
+
+impl TgMediaKind {
+    /// Default file extension when the resolved `file_path` has none.
+    fn default_ext(self) -> &'static str {
+        match self {
+            TgMediaKind::Photo => "jpg",
+            TgMediaKind::Voice => "ogg",
+            TgMediaKind::Audio => "mp3",
+            TgMediaKind::Video => "mp4",
+            TgMediaKind::Document => "bin",
+        }
+    }
+
+    /// Human label used in the saved-at marker injected into the prompt.
+    fn label(self) -> &'static str {
+        match self {
+            TgMediaKind::Photo => "photo",
+            TgMediaKind::Voice => "voice message",
+            TgMediaKind::Audio => "audio file",
+            TgMediaKind::Video => "video",
+            TgMediaKind::Document => "document",
+        }
+    }
+}
+
+/// A single attachment referenced by an incoming update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TgMedia {
+    file_id: String,
+    kind: TgMediaKind,
+    /// Original filename for documents (used for the on-disk name + marker).
+    file_name: Option<String>,
+}
+
+/// A parsed incoming Telegram update reduced to what the agent needs:
+/// the routing IDs, the text (or media caption), and any attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TgUpdate {
+    update_id: i64,
+    sender_id: String,
+    chat_id: String,
+    /// Message text, or the caption for a media message. May be empty.
+    text: String,
+    media: Option<TgMedia>,
+}
+
+/// Default cache directory for incoming Telegram attachments: a
+/// `fennec-telegram-media` folder under the system temp dir. The system
+/// temp dir is outside the path sandbox's denylist, so the agent's media
+/// tools can read what lands here.
+fn default_media_dir() -> PathBuf {
+    std::env::temp_dir().join("fennec-telegram-media")
+}
+
+/// Lowercase file extension (without the dot) of a path-like string, if it
+/// has a short, alphanumeric one. Telegram `file_path`s look like
+/// `photos/file_42.jpg` or `voice/file_7.oga`.
+fn extension_of(path: &str) -> Option<String> {
+    let tail = path.rsplit('/').next().unwrap_or(path);
+    let (_, ext) = tail.rsplit_once('.')?;
+    if !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(ext.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 /// Telegram channel using the Bot API with long-polling and streaming edits.
 pub struct TelegramChannel {
     bot_token: String,
@@ -34,6 +119,9 @@ pub struct TelegramChannel {
     allowed_users: Vec<String>,
     /// Per-chat timestamp of the last edit, used for rate-limiting streaming deltas.
     last_edit: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Directory incoming attachments are downloaded into so the agent's
+    /// `vision_describe` / `transcribe` tools can read them by path.
+    media_dir: PathBuf,
 }
 
 impl TelegramChannel {
@@ -43,7 +131,15 @@ impl TelegramChannel {
             client: reqwest::Client::new(),
             allowed_users,
             last_edit: Arc::new(Mutex::new(HashMap::new())),
+            media_dir: default_media_dir(),
         }
+    }
+
+    /// Override the directory incoming attachments are cached in. Defaults
+    /// to a `fennec-telegram-media` folder under the system temp dir.
+    pub fn with_media_dir(mut self, dir: PathBuf) -> Self {
+        self.media_dir = dir;
+        self
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -154,6 +250,47 @@ impl TelegramChannel {
         }
     }
 
+    /// Edit an existing message's text. Used by the streaming path.
+    async fn edit_message(&self, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        });
+        self.post_json_with_retry(&self.api_url("editMessageText"), &body)
+            .await?;
+        Ok(())
+    }
+
+    /// Send a fresh text message, returning the new message id. Used to
+    /// deliver overflow continuation chunks past the 4096 limit.
+    async fn send_text(&self, chat_id: &str, text: &str) -> Result<Option<String>> {
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+        });
+        let data = self
+            .post_json_with_retry(&self.api_url("sendMessage"), &body)
+            .await?;
+        Ok(data
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|v| v.as_i64())
+            .map(|id| id.to_string()))
+    }
+
+    /// Delete a message (best-effort). Used to remove the "..." streaming
+    /// placeholder when a turn produced no prose.
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+        });
+        self.post_json_with_retry(&self.api_url("deleteMessage"), &body)
+            .await?;
+        Ok(())
+    }
+
     /// Register bot commands with Telegram so they appear in the menu.
     async fn register_commands(&self) -> Result<()> {
         let commands = serde_json::json!([
@@ -170,39 +307,236 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Parse a Telegram `getUpdates` JSON response into a list of
-    /// (update_id, sender_id, chat_id, text) tuples.
-    pub fn parse_updates(body: &Value) -> Vec<(i64, String, String, String)> {
+    /// Highest `update_id` in a raw `getUpdates` response, across **every**
+    /// update — not just the message updates [`parse_updates`] keeps.
+    ///
+    /// The long-poll offset must advance past every update Telegram returns,
+    /// including ones we don't act on (text-less media before media handling
+    /// landed, stickers, `edited_message`, `callback_query`, …). If the
+    /// offset were derived only from updates we surfaced, a trailing
+    /// unhandled update would never be acknowledged: every poll would
+    /// re-fetch it, `parse_updates` would return nothing, the offset would
+    /// stand still, and the listener would spin on the same update forever —
+    /// freezing the whole channel. Advancing from the raw maximum guarantees
+    /// forward progress regardless of what we choose to handle.
+    pub fn max_update_id(body: &Value) -> Option<i64> {
+        body.get("result")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|u| u.get("update_id").and_then(|v| v.as_i64()))
+            .max()
+    }
+
+    /// Parse a Telegram `getUpdates` response into the message updates the
+    /// agent can act on. Each [`TgUpdate`] carries the routing IDs, the text
+    /// (or media caption), and any single attachment.
+    ///
+    /// Photos report the **largest** size variant (Telegram sends an
+    /// ascending-size array). Voice/audio/video/document each map to their
+    /// `file_id`. Non-message updates and updates with neither text nor a
+    /// recognized attachment are skipped here — but the offset still advances
+    /// past them via [`max_update_id`].
+    fn parse_updates(body: &Value) -> Vec<TgUpdate> {
         let mut results = Vec::new();
-        if let Some(arr) = body.get("result").and_then(|v| v.as_array()) {
-            for update in arr {
-                let update_id = update.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                if let Some(message) = update.get("message") {
-                    let text = message
-                        .get("text")
+        let Some(arr) = body.get("result").and_then(|v| v.as_array()) else {
+            return results;
+        };
+        for update in arr {
+            let update_id = update.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let Some(message) = update.get("message") else {
+                continue;
+            };
+
+            // Text for a plain message; caption for a media message.
+            let text = message
+                .get("text")
+                .or_else(|| message.get("caption"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let media = Self::extract_media(message);
+
+            // Nothing actionable: no text and no recognized attachment.
+            if text.is_empty() && media.is_none() {
+                continue;
+            }
+
+            let sender_id = message
+                .get("from")
+                .and_then(|f| f.get("id"))
+                .and_then(|v| v.as_i64())
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            let chat_id = message
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_i64())
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+
+            results.push(TgUpdate {
+                update_id,
+                sender_id,
+                chat_id,
+                text,
+                media,
+            });
+        }
+        results
+    }
+
+    /// Pull the single most relevant attachment off a Telegram `message`
+    /// object, if any. Order mirrors the upstream: photo → voice → audio →
+    /// video → document.
+    fn extract_media(message: &Value) -> Option<TgMedia> {
+        // Photos: array of PhotoSize ascending by resolution — take the last
+        // (largest) entry's file_id.
+        if let Some(file_id) = message
+            .get("photo")
+            .and_then(|v| v.as_array())
+            .and_then(|sizes| sizes.last())
+            .and_then(|p| p.get("file_id"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(TgMedia {
+                file_id: file_id.to_string(),
+                kind: TgMediaKind::Photo,
+                file_name: None,
+            });
+        }
+
+        for (key, kind) in [
+            ("voice", TgMediaKind::Voice),
+            ("audio", TgMediaKind::Audio),
+            ("video", TgMediaKind::Video),
+            ("document", TgMediaKind::Document),
+        ] {
+            if let Some(obj) = message.get(key).filter(|v| v.is_object()) {
+                if let Some(file_id) = obj.get("file_id").and_then(|v| v.as_str()) {
+                    let file_name = obj
+                        .get("file_name")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let sender_id = message
-                        .get("from")
-                        .and_then(|f| f.get("id"))
-                        .and_then(|v| v.as_i64())
-                        .map(|id| id.to_string())
-                        .unwrap_or_default();
-                    let chat_id = message
-                        .get("chat")
-                        .and_then(|c| c.get("id"))
-                        .and_then(|v| v.as_i64())
-                        .map(|id| id.to_string())
-                        .unwrap_or_default();
-                    results.push((update_id, sender_id, chat_id, text));
+                        .map(|s| s.to_string());
+                    return Some(TgMedia {
+                        file_id: file_id.to_string(),
+                        kind,
+                        file_name,
+                    });
                 }
             }
         }
-        results
+        None
+    }
+
+    /// Resolve a `file_id` via `getFile`, download the bytes (capped at
+    /// [`MAX_MEDIA_DOWNLOAD_BYTES`]), and write them to a file under
+    /// [`media_dir`](Self::media_dir). Returns the on-disk path.
+    ///
+    /// The on-disk name is always a fresh UUID plus an extension derived
+    /// from the resolved `file_path` (or the attachment kind / original
+    /// document name) — never the attacker-controlled `file_name`
+    /// directly, so a crafted name can't traverse out of the cache dir.
+    async fn download_telegram_file(&self, media: &TgMedia) -> Result<PathBuf> {
+        // 1. getFile → file_path. Goes through the retrying GET so 429s are
+        //    honored like every other call.
+        let get_file_url = format!("{}?file_id={}", self.api_url("getFile"), media.file_id);
+        let info = self.get_with_retry(&get_file_url).await?;
+        let file_path = info
+            .get("result")
+            .and_then(|r| r.get("file_path"))
+            .and_then(|v| v.as_str())
+            .context("Telegram getFile response missing result.file_path")?;
+
+        // 2. Pick an extension: prefer the resolved file_path's, then a
+        //    document's original name, then the kind default.
+        let ext = extension_of(file_path)
+            .or_else(|| media.file_name.as_deref().and_then(extension_of))
+            .unwrap_or_else(|| media.kind.default_ext().to_string());
+
+        // 3. Download the bytes from the file endpoint (token-bearing URL,
+        //    so it never gets logged — see post_json_with_retry).
+        let download_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot_token, file_path
+        );
+        let resp = self
+            .client
+            .get(&download_url)
+            .send()
+            .await
+            .context("Telegram file download request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Telegram file download returned {}", resp.status());
+        }
+        let (bytes, truncated) = read_body_capped(resp, MAX_MEDIA_DOWNLOAD_BYTES).await?;
+        if truncated {
+            anyhow::bail!(
+                "attachment exceeds {} MB download cap",
+                MAX_MEDIA_DOWNLOAD_BYTES / (1024 * 1024)
+            );
+        }
+
+        // 4. Persist under the cache dir with a fresh, traversal-safe name.
+        std::fs::create_dir_all(&self.media_dir).with_context(|| {
+            format!("creating media cache dir {}", self.media_dir.display())
+        })?;
+        let file_name = format!("{}.{}", uuid::Uuid::new_v4(), ext);
+        let path = self.media_dir.join(file_name);
+        std::fs::write(&path, &bytes)
+            .with_context(|| format!("writing attachment to {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Build the message text for a media update: download the attachment and
+    /// prepend a `[The user sent a … saved at: <path>]` marker (mirrors the
+    /// upstream) so the agent knows to reach for `vision_describe` /
+    /// `transcribe` on the saved path. The caption, if any, follows.
+    ///
+    /// On download failure the channel does **not** stall: it returns a note
+    /// explaining the attachment couldn't be fetched, plus the caption, so
+    /// the agent still gets the message.
+    async fn build_media_content(&self, media: &TgMedia, caption: &str) -> String {
+        let marker = match self.download_telegram_file(media).await {
+            Ok(path) => {
+                let name = media
+                    .file_name
+                    .as_deref()
+                    .map(|n| format!(" '{}'", n))
+                    .unwrap_or_default();
+                let hint = match media.kind {
+                    TgMediaKind::Photo | TgMediaKind::Video => {
+                        " Use the vision_describe tool to view it."
+                    }
+                    TgMediaKind::Voice | TgMediaKind::Audio => {
+                        " Use the transcribe tool to hear it."
+                    }
+                    TgMediaKind::Document => "",
+                };
+                format!(
+                    "[The user sent a {}{}, saved at: {}.{}]",
+                    media.kind.label(),
+                    name,
+                    path.display(),
+                    hint
+                )
+            }
+            Err(e) => {
+                tracing::warn!("Telegram: failed to download {}: {e}", media.kind.label());
+                format!(
+                    "[The user sent a {} but it could not be downloaded: {}]",
+                    media.kind.label(),
+                    e
+                )
+            }
+        };
+
+        if caption.trim().is_empty() {
+            marker
+        } else {
+            format!("{}\n\n{}", marker, caption)
+        }
     }
 }
 
@@ -393,16 +727,34 @@ impl Channel for TelegramChannel {
                 offset
             );
             let body = self.get_with_retry(&url).await?;
-            let updates = Self::parse_updates(&body);
 
-            for (update_id, sender_id, chat_id, text) in updates {
-                // Track offset: next poll starts after the highest update_id.
-                if update_id >= offset {
-                    offset = update_id + 1;
+            // Advance the long-poll offset past EVERY update in this batch
+            // before doing anything else — including stickers, edits, and
+            // media we may not surface. Deriving the offset from the raw
+            // maximum (not from the updates we keep) is what prevents a
+            // trailing unhandled update from wedging the listener forever.
+            if let Some(max_id) = Self::max_update_id(&body) {
+                if max_id >= offset {
+                    offset = max_id + 1;
+                }
+            }
+
+            for upd in Self::parse_updates(&body) {
+                if !self.allows_sender(&upd.sender_id) {
+                    tracing::debug!(
+                        "Telegram: ignoring message from disallowed sender {}",
+                        upd.sender_id
+                    );
+                    continue;
                 }
 
-                if !self.allows_sender(&sender_id) {
-                    tracing::debug!("Telegram: ignoring message from disallowed sender {}", sender_id);
+                // Resolve the message body: download any attachment and
+                // build a saved-path marker; otherwise just the text.
+                let content = match &upd.media {
+                    Some(media) => self.build_media_content(media, &upd.text).await,
+                    None => upd.text.clone(),
+                };
+                if content.trim().is_empty() {
                     continue;
                 }
 
@@ -413,19 +765,16 @@ impl Channel for TelegramChannel {
 
                 // Handle /new and /reset commands as session reset signals.
                 let mut metadata = HashMap::new();
-                let content = if text.starts_with("/new") || text.starts_with("/reset") {
+                if content.starts_with("/new") || content.starts_with("/reset") {
                     metadata.insert("command".to_string(), "reset".to_string());
-                    text.clone()
-                } else {
-                    text
-                };
+                }
 
                 let msg = InboundMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    sender: sender_id,
+                    sender: upd.sender_id,
                     content,
                     channel: "telegram".to_string(),
-                    chat_id,
+                    chat_id: upd.chat_id,
                     timestamp: now,
                     reply_to: None,
                     metadata,
@@ -473,6 +822,17 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
+        // Once the accumulated text grows past Telegram's single-message
+        // limit, stop editing: `editMessageText` rejects an over-limit body
+        // with 400 `MESSAGE_TOO_LONG`. The streamed bubble simply stops
+        // updating here; `send_streaming_end` then splits the complete final
+        // text across continuation messages so nothing is lost. (Previously
+        // the over-limit edit errored and the reply froze at the last
+        // sub-4096 state, dropping the tail.)
+        if full_text.chars().count() > TELEGRAM_MAX_LEN {
+            return Ok(());
+        }
+
         // Rate-limit: skip if last edit for this chat was <300ms ago.
         {
             let map = self.last_edit.lock();
@@ -483,14 +843,7 @@ impl Channel for TelegramChannel {
             }
         }
 
-        let body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": full_text,
-        });
-        self.post_json_with_retry(&self.api_url("editMessageText"), &body)
-            .await?;
-
+        self.edit_message(chat_id, message_id, full_text).await?;
         self.last_edit_insert(chat_id.to_string(), Instant::now());
 
         Ok(())
@@ -502,31 +855,33 @@ impl Channel for TelegramChannel {
         message_id: &str,
         full_text: &str,
     ) -> Result<()> {
-        // Empty final text → Telegram rejects editMessageText with 400
-        // `MESSAGE_TEXT_IS_EMPTY`. Happens when a turn produced only a
-        // tool call and no prose. Leave the placeholder ("...") in
-        // place rather than erroring; the user sees an unfilled bubble,
-        // which is unusual but not broken, and the agent loop completes
-        // cleanly.
+        // Empty final text → the turn produced only a tool call / `[SILENT]`
+        // and no prose. Delete the "..." placeholder we posted at stream
+        // start so it doesn't linger as an orphaned bubble (editMessageText
+        // would 400 on empty text anyway). Best-effort: a failed delete
+        // isn't worth erroring the turn over.
         if full_text.is_empty() {
-            let mut map = self.last_edit.lock();
-            map.remove(chat_id);
+            if let Err(e) = self.delete_message(chat_id, message_id).await {
+                tracing::debug!("Telegram: failed to delete empty-turn placeholder: {e}");
+            }
+            self.last_edit.lock().remove(chat_id);
             return Ok(());
         }
 
-        let body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": full_text,
-        });
-        self.post_json_with_retry(&self.api_url("editMessageText"), &body)
-            .await?;
+        // Split the complete final text across as many messages as it takes.
+        // The first chunk replaces the streamed placeholder via edit; any
+        // remaining chunks are sent as continuation messages in the same
+        // chat, so a >4096 reply is delivered in full instead of truncated.
+        let parts = split_message(full_text, TELEGRAM_MAX_LEN);
+        if let Some((first, rest)) = parts.split_first() {
+            self.edit_message(chat_id, message_id, first).await?;
+            for part in rest {
+                self.send_text(chat_id, part).await?;
+            }
+        }
 
         // Clear the rate-limit entry for this chat.
-        {
-            let mut map = self.last_edit.lock();
-            map.remove(chat_id);
-        }
+        self.last_edit.lock().remove(chat_id);
 
         Ok(())
     }
@@ -696,7 +1051,105 @@ mod tests {
         });
         let updates = TelegramChannel::parse_updates(&body);
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0], (123, "456".to_string(), "789".to_string(), "hello".to_string()));
+        assert_eq!(updates[0].update_id, 123);
+        assert_eq!(updates[0].sender_id, "456");
+        assert_eq!(updates[0].chat_id, "789");
+        assert_eq!(updates[0].text, "hello");
+        assert!(updates[0].media.is_none());
+    }
+
+    #[test]
+    fn max_update_id_spans_text_less_updates() {
+        // A trailing text-less update (e.g. a sticker) must still advance
+        // the offset: max_update_id returns it even though parse_updates
+        // drops it. This is the anti-freeze guarantee.
+        let body = serde_json::json!({
+            "ok": true,
+            "result": [
+                {"update_id": 10, "message": {"text": "hi", "from": {"id": 1}, "chat": {"id": 2}}},
+                {"update_id": 11, "message": {"sticker": {"file_id": "S"}, "from": {"id": 1}, "chat": {"id": 2}}}
+            ]
+        });
+        // parse_updates only keeps the text message...
+        let updates = TelegramChannel::parse_updates(&body);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].update_id, 10);
+        // ...but the offset advances past the sticker too.
+        assert_eq!(TelegramChannel::max_update_id(&body), Some(11));
+    }
+
+    #[test]
+    fn parse_updates_extracts_photo_and_caption() {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": [{
+                "update_id": 5,
+                "message": {
+                    "caption": "look at this",
+                    "from": {"id": 1},
+                    "chat": {"id": 2},
+                    "photo": [
+                        {"file_id": "small", "width": 90, "height": 90},
+                        {"file_id": "large", "width": 1280, "height": 1280}
+                    ]
+                }
+            }]
+        });
+        let updates = TelegramChannel::parse_updates(&body);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, "look at this");
+        let media = updates[0].media.as_ref().expect("photo media");
+        // Largest variant (last in the ascending array) is chosen.
+        assert_eq!(media.file_id, "large");
+        assert_eq!(media.kind, TgMediaKind::Photo);
+    }
+
+    #[test]
+    fn parse_updates_extracts_voice_without_caption() {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": [{
+                "update_id": 6,
+                "message": {
+                    "from": {"id": 1},
+                    "chat": {"id": 2},
+                    "voice": {"file_id": "voice123", "duration": 3}
+                }
+            }]
+        });
+        let updates = TelegramChannel::parse_updates(&body);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, "");
+        let media = updates[0].media.as_ref().expect("voice media");
+        assert_eq!(media.file_id, "voice123");
+        assert_eq!(media.kind, TgMediaKind::Voice);
+    }
+
+    #[test]
+    fn parse_updates_extracts_document_filename() {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": [{
+                "update_id": 7,
+                "message": {
+                    "from": {"id": 1},
+                    "chat": {"id": 2},
+                    "document": {"file_id": "doc1", "file_name": "report.pdf"}
+                }
+            }]
+        });
+        let updates = TelegramChannel::parse_updates(&body);
+        let media = updates[0].media.as_ref().expect("document media");
+        assert_eq!(media.kind, TgMediaKind::Document);
+        assert_eq!(media.file_name.as_deref(), Some("report.pdf"));
+    }
+
+    #[test]
+    fn extension_of_extracts_known_extensions() {
+        assert_eq!(extension_of("photos/file_42.jpg").as_deref(), Some("jpg"));
+        assert_eq!(extension_of("voice/file_7.OGA").as_deref(), Some("oga"));
+        assert_eq!(extension_of("noext"), None);
+        assert_eq!(extension_of("weird.toolongextension"), None);
     }
 
     #[test]
