@@ -237,11 +237,27 @@ impl PlurumlClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let body = resp.text().await.unwrap_or_default();
+
+        // Surface the raw status + body at warn level so an intermittent
+        // failure (e.g. a 422 the server rejects with an empty body) is
+        // diagnosable from the default log level instead of only via the
+        // returned error, which callers may downgrade or swallow. The
+        // request side (query/limit) is logged at debug just before the
+        // call, so enabling debug for one run correlates the two.
+        if !status.is_success() {
+            tracing::warn!(
+                status = %status,
+                body = %if body.is_empty() { "<empty>" } else { body.as_str() },
+                "Plurum API error response"
+            );
+        }
+
         let message = serde_json::from_str::<ErrorResponse>(&body)
             .map(|e| e.message)
             .unwrap_or(body);
 
         let label = match status.as_u16() {
+            422 => "validation rejected",
             429 => "rate limited",
             503 => "service unavailable",
             _ => "API error",

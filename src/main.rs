@@ -389,7 +389,20 @@ fn build_provider(
         }
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
-            Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+            // OpenRouter asks integrators to send HTTP-Referer + X-Title so
+            // requests are attributed and the app appears on its rankings.
+            // Building OpenAIProvider directly here previously dropped them
+            // (the OpenRouterProvider wrapper that set these headers was
+            // never reached). Set them inline so the base_url override above
+            // still works.
+            Box::new(
+                OpenAIProvider::new(api_key, Some(model), Some(or_url), None).with_extra_headers(
+                    vec![
+                        ("HTTP-Referer".to_string(), "https://fennec.dev".to_string()),
+                        ("X-Title".to_string(), "Fennec".to_string()),
+                    ],
+                ),
+            )
         }
         "ollama" => {
             // Same back-compat as kimi: accept both new and old Anthropic
