@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,11 @@ const MAX_MEDIA_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
 /// Kind of attachment on an incoming Telegram message. Determines the
 /// default file extension and the hint we give the agent about which tool
 /// to reach for (vision vs. transcription).
+/// Max bytes of a text-like document (`.md`/`.txt`) whose content we inline
+/// into the prompt instead of only referencing its path. Mirrors the
+/// upstream's 100 KB injection cap.
+const MAX_TEXT_INJECT_BYTES: u64 = 100 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TgMediaKind {
     Photo,
@@ -44,6 +49,7 @@ enum TgMediaKind {
     Audio,
     Video,
     Document,
+    Sticker,
 }
 
 impl TgMediaKind {
@@ -55,6 +61,7 @@ impl TgMediaKind {
             TgMediaKind::Audio => "mp3",
             TgMediaKind::Video => "mp4",
             TgMediaKind::Document => "bin",
+            TgMediaKind::Sticker => "webp",
         }
     }
 
@@ -66,6 +73,19 @@ impl TgMediaKind {
             TgMediaKind::Audio => "audio file",
             TgMediaKind::Video => "video",
             TgMediaKind::Document => "document",
+            TgMediaKind::Sticker => "sticker",
+        }
+    }
+
+    /// Tool hint appended to the saved-at marker so the agent knows which
+    /// tool to reach for. Empty for documents (path is enough).
+    fn tool_hint(self) -> &'static str {
+        match self {
+            TgMediaKind::Photo | TgMediaKind::Video | TgMediaKind::Sticker => {
+                " Use the vision_describe tool to view it."
+            }
+            TgMediaKind::Voice | TgMediaKind::Audio => " Use the transcribe tool to hear it.",
+            TgMediaKind::Document => "",
         }
     }
 }
@@ -75,12 +95,32 @@ impl TgMediaKind {
 struct TgMedia {
     file_id: String,
     kind: TgMediaKind,
-    /// Original filename for documents (used for the on-disk name + marker).
+    /// Original filename for documents (used for the on-disk name + marker
+    /// and to decide whether to inline a text document's content).
     file_name: Option<String>,
+    /// Emoji a sticker represents (`None` for non-stickers).
+    emoji: Option<String>,
+    /// True for an animated/video sticker — these can't be still-image
+    /// analyzed, so we surface the emoji instead of downloading.
+    animated: bool,
+}
+
+impl TgMedia {
+    /// Construct a plain (non-sticker) attachment.
+    fn plain(file_id: String, kind: TgMediaKind, file_name: Option<String>) -> Self {
+        TgMedia {
+            file_id,
+            kind,
+            file_name,
+            emoji: None,
+            animated: false,
+        }
+    }
 }
 
 /// A parsed incoming Telegram update reduced to what the agent needs:
-/// the routing IDs, the text (or media caption), and any attachment.
+/// the routing IDs, the text (or media caption), any attachment, and the
+/// album id (`media_group_id`) so multi-photo albums coalesce into one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TgUpdate {
     update_id: i64,
@@ -89,6 +129,9 @@ struct TgUpdate {
     /// Message text, or the caption for a media message. May be empty.
     text: String,
     media: Option<TgMedia>,
+    /// Telegram album identifier; `Some` when this update is one item of a
+    /// multi-attachment album.
+    media_group_id: Option<String>,
 }
 
 /// Default cache directory for incoming Telegram attachments: a
@@ -97,6 +140,109 @@ struct TgUpdate {
 /// tools can read what lands here.
 fn default_media_dir() -> PathBuf {
     std::env::temp_dir().join("fennec-telegram-media")
+}
+
+/// Group a poll batch so contiguous updates sharing a `media_group_id`
+/// (a Telegram album) coalesce into one work item. Non-album updates each
+/// form their own single-item group. Telegram queues an album's items
+/// together, so they almost always arrive in one poll; an album split
+/// across two polls degrades gracefully to separate messages.
+fn group_updates(updates: Vec<TgUpdate>) -> Vec<Vec<TgUpdate>> {
+    let mut groups: Vec<Vec<TgUpdate>> = Vec::new();
+    for upd in updates {
+        let same_album = matches!(
+            (&upd.media_group_id, groups.last()),
+            (Some(gid), Some(last))
+                if last.last().and_then(|u| u.media_group_id.as_ref()) == Some(gid)
+        );
+        if same_album {
+            groups.last_mut().expect("same_album implies a last group").push(upd);
+        } else {
+            groups.push(vec![upd]);
+        }
+    }
+    groups
+}
+
+/// Append a caption after a marker, separated by a blank line. Empty
+/// captions are dropped.
+fn with_caption(marker: String, caption: &str) -> String {
+    if caption.trim().is_empty() {
+        marker
+    } else {
+        format!("{marker}\n\n{caption}")
+    }
+}
+
+/// Sanitize a user-supplied document filename for display inside a prompt
+/// marker (mirrors the upstream's `[^\w.\- ]` → `_` scrub) so a crafted
+/// name can't inject control characters or break the marker framing.
+fn sanitize_doc_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Build the marker for a successfully-downloaded attachment. For a small
+/// text document (`.md`/`.txt`) the content is inlined directly (mirrors
+/// the upstream's 100 KB injection) so the agent reads it without a tool;
+/// everything else gets a `saved at: <path>` reference plus a tool hint.
+fn marker_for_download(media: &TgMedia, path: &Path) -> String {
+    if media.kind == TgMediaKind::Document {
+        if let Some(name) = media.file_name.as_deref() {
+            let is_text = matches!(extension_of(name).as_deref(), Some("md") | Some("txt"));
+            if is_text {
+                let small = std::fs::metadata(path)
+                    .map(|m| m.len() <= MAX_TEXT_INJECT_BYTES)
+                    .unwrap_or(false);
+                if small {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        return format!("[Content of {}]:\n{}", sanitize_doc_name(name), content);
+                    }
+                }
+            }
+        }
+    }
+
+    let name = media
+        .file_name
+        .as_deref()
+        .map(|n| format!(" '{}'", sanitize_doc_name(n)))
+        .unwrap_or_default();
+    let emoji = media
+        .emoji
+        .as_deref()
+        .map(|e| format!(" (emoji {e})"))
+        .unwrap_or_default();
+    // An image delivered as a document should still get the vision hint —
+    // the upstream reroutes image-documents through the photo/vision path.
+    let saved_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let is_image = matches!(
+        saved_ext.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif")
+    );
+    let hint = if media.kind == TgMediaKind::Document && is_image {
+        TgMediaKind::Photo.tool_hint()
+    } else {
+        media.kind.tool_hint()
+    };
+    format!(
+        "[The user sent a {}{}{}, saved at: {}.{}]",
+        media.kind.label(),
+        emoji,
+        name,
+        path.display(),
+        hint
+    )
 }
 
 /// Lowercase file extension (without the dot) of a path-like string, if it
@@ -376,21 +522,47 @@ impl TelegramChannel {
                 .map(|id| id.to_string())
                 .unwrap_or_default();
 
+            let media_group_id = message
+                .get("media_group_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
             results.push(TgUpdate {
                 update_id,
                 sender_id,
                 chat_id,
                 text,
                 media,
+                media_group_id,
             });
         }
         results
     }
 
     /// Pull the single most relevant attachment off a Telegram `message`
-    /// object, if any. Order mirrors the upstream: photo → voice → audio →
-    /// video → document.
+    /// object, if any. Order mirrors the upstream: sticker → photo → voice →
+    /// audio → video → document.
     fn extract_media(message: &Value) -> Option<TgMedia> {
+        // Stickers carry their own metadata (emoji, animated/video flags).
+        if let Some(st) = message.get("sticker").filter(|v| v.is_object()) {
+            if let Some(file_id) = st.get("file_id").and_then(|v| v.as_str()) {
+                let emoji = st
+                    .get("emoji")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let animated = st.get("is_animated").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || st.get("is_video").and_then(|v| v.as_bool()).unwrap_or(false);
+                return Some(TgMedia {
+                    file_id: file_id.to_string(),
+                    kind: TgMediaKind::Sticker,
+                    file_name: None,
+                    emoji,
+                    animated,
+                });
+            }
+        }
+
         // Photos: array of PhotoSize ascending by resolution — take the last
         // (largest) entry's file_id.
         if let Some(file_id) = message
@@ -400,11 +572,7 @@ impl TelegramChannel {
             .and_then(|p| p.get("file_id"))
             .and_then(|v| v.as_str())
         {
-            return Some(TgMedia {
-                file_id: file_id.to_string(),
-                kind: TgMediaKind::Photo,
-                file_name: None,
-            });
+            return Some(TgMedia::plain(file_id.to_string(), TgMediaKind::Photo, None));
         }
 
         for (key, kind) in [
@@ -419,11 +587,7 @@ impl TelegramChannel {
                         .get("file_name")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    return Some(TgMedia {
-                        file_id: file_id.to_string(),
-                        kind,
-                        file_name,
-                    });
+                    return Some(TgMedia::plain(file_id.to_string(), kind, file_name));
                 }
             }
         }
@@ -489,39 +653,34 @@ impl TelegramChannel {
         Ok(path)
     }
 
-    /// Build the message text for a media update: download the attachment and
-    /// prepend a `[The user sent a … saved at: <path>]` marker (mirrors the
-    /// upstream) so the agent knows to reach for `vision_describe` /
-    /// `transcribe` on the saved path. The caption, if any, follows.
+    /// Build the message text for a single media update: download the
+    /// attachment and produce a marker (mirrors the upstream) so the agent
+    /// knows to reach for `vision_describe` / `transcribe` on the saved
+    /// path. The caption, if any, follows.
     ///
     /// On download failure the channel does **not** stall: it returns a note
     /// explaining the attachment couldn't be fetched, plus the caption, so
     /// the agent still gets the message.
     async fn build_media_content(&self, media: &TgMedia, caption: &str) -> String {
-        let marker = match self.download_telegram_file(media).await {
-            Ok(path) => {
-                let name = media
-                    .file_name
-                    .as_deref()
-                    .map(|n| format!(" '{}'", n))
-                    .unwrap_or_default();
-                let hint = match media.kind {
-                    TgMediaKind::Photo | TgMediaKind::Video => {
-                        " Use the vision_describe tool to view it."
-                    }
-                    TgMediaKind::Voice | TgMediaKind::Audio => {
-                        " Use the transcribe tool to hear it."
-                    }
-                    TgMediaKind::Document => "",
-                };
-                format!(
-                    "[The user sent a {}{}, saved at: {}.{}]",
-                    media.kind.label(),
-                    name,
-                    path.display(),
-                    hint
-                )
-            }
+        let marker = self.media_marker(media).await;
+        with_caption(marker, caption)
+    }
+
+    /// Produce the marker text for one attachment (no caption). Handles the
+    /// animated-sticker (emoji-only, no download) and text-document
+    /// (content inlined) special cases.
+    async fn media_marker(&self, media: &TgMedia) -> String {
+        // Animated/video stickers can't be still-image analyzed; surface the
+        // emoji instead of downloading (mirrors the upstream).
+        if media.kind == TgMediaKind::Sticker && media.animated {
+            return match &media.emoji {
+                Some(e) => format!("[The user sent an animated sticker (emoji {e}).]"),
+                None => "[The user sent an animated sticker.]".to_string(),
+            };
+        }
+
+        match self.download_telegram_file(media).await {
+            Ok(path) => marker_for_download(media, &path),
             Err(e) => {
                 tracing::warn!("Telegram: failed to download {}: {e}", media.kind.label());
                 format!(
@@ -530,13 +689,32 @@ impl TelegramChannel {
                     e
                 )
             }
-        };
-
-        if caption.trim().is_empty() {
-            marker
-        } else {
-            format!("{}\n\n{}", marker, caption)
         }
+    }
+
+    /// Build the combined content for a Telegram album (multiple
+    /// attachments sharing a `media_group_id`): each item's marker, joined,
+    /// then the merged caption. Mirrors the upstream's media-group coalesce
+    /// so a multi-photo album arrives as ONE agent turn instead of N.
+    async fn build_album_content(&self, items: &[TgUpdate]) -> String {
+        let mut markers = Vec::with_capacity(items.len());
+        let mut caption = String::new();
+        for item in items {
+            if let Some(media) = &item.media {
+                markers.push(self.media_marker(media).await);
+            }
+            // Telegram puts the caption on one item of the album; keep the
+            // first non-empty one.
+            if caption.is_empty() && !item.text.trim().is_empty() {
+                caption = item.text.clone();
+            }
+        }
+        let header = format!(
+            "[The user sent an album of {} attachments.]",
+            markers.len()
+        );
+        let body = markers.join("\n");
+        with_caption(format!("{header}\n{body}"), &caption)
     }
 }
 
@@ -739,20 +917,28 @@ impl Channel for TelegramChannel {
                 }
             }
 
-            for upd in Self::parse_updates(&body) {
-                if !self.allows_sender(&upd.sender_id) {
+            // Group the batch so a multi-attachment album (updates sharing
+            // a media_group_id) coalesces into a single agent turn.
+            for group in group_updates(Self::parse_updates(&body)) {
+                let first = &group[0];
+                if !self.allows_sender(&first.sender_id) {
                     tracing::debug!(
                         "Telegram: ignoring message from disallowed sender {}",
-                        upd.sender_id
+                        first.sender_id
                     );
                     continue;
                 }
 
-                // Resolve the message body: download any attachment and
-                // build a saved-path marker; otherwise just the text.
-                let content = match &upd.media {
-                    Some(media) => self.build_media_content(media, &upd.text).await,
-                    None => upd.text.clone(),
+                // Resolve the message body: an album coalesces all its
+                // attachments; otherwise download any single attachment and
+                // build a marker, or just use the text.
+                let content = if group.len() > 1 {
+                    self.build_album_content(&group).await
+                } else {
+                    match &first.media {
+                        Some(media) => self.build_media_content(media, &first.text).await,
+                        None => first.text.clone(),
+                    }
                 };
                 if content.trim().is_empty() {
                     continue;
@@ -771,10 +957,10 @@ impl Channel for TelegramChannel {
 
                 let msg = InboundMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    sender: upd.sender_id,
+                    sender: first.sender_id.clone(),
                     content,
                     channel: "telegram".to_string(),
-                    chat_id: upd.chat_id,
+                    chat_id: first.chat_id.clone(),
                     timestamp: now,
                     reply_to: None,
                     metadata,
@@ -1060,22 +1246,106 @@ mod tests {
 
     #[test]
     fn max_update_id_spans_text_less_updates() {
-        // A trailing text-less update (e.g. a sticker) must still advance
-        // the offset: max_update_id returns it even though parse_updates
-        // drops it. This is the anti-freeze guarantee.
+        // A trailing non-actionable update (here a location-only service
+        // message, which parse_updates drops) must still advance the
+        // offset: max_update_id returns it. This is the anti-freeze
+        // guarantee.
         let body = serde_json::json!({
             "ok": true,
             "result": [
                 {"update_id": 10, "message": {"text": "hi", "from": {"id": 1}, "chat": {"id": 2}}},
-                {"update_id": 11, "message": {"sticker": {"file_id": "S"}, "from": {"id": 1}, "chat": {"id": 2}}}
+                {"update_id": 11, "message": {"location": {"latitude": 1.0, "longitude": 2.0}, "from": {"id": 1}, "chat": {"id": 2}}}
             ]
         });
-        // parse_updates only keeps the text message...
+        // parse_updates only keeps the text message (location is not a
+        // recognized attachment)...
         let updates = TelegramChannel::parse_updates(&body);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].update_id, 10);
-        // ...but the offset advances past the sticker too.
+        // ...but the offset advances past the location update too.
         assert_eq!(TelegramChannel::max_update_id(&body), Some(11));
+    }
+
+    #[test]
+    fn parse_updates_extracts_sticker_with_emoji() {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": [{
+                "update_id": 8,
+                "message": {
+                    "from": {"id": 1}, "chat": {"id": 2},
+                    "sticker": {"file_id": "stk", "emoji": "🎉", "is_animated": false}
+                }
+            }]
+        });
+        let updates = TelegramChannel::parse_updates(&body);
+        let media = updates[0].media.as_ref().expect("sticker media");
+        assert_eq!(media.kind, TgMediaKind::Sticker);
+        assert_eq!(media.emoji.as_deref(), Some("🎉"));
+        assert!(!media.animated);
+    }
+
+    #[test]
+    fn animated_sticker_marker_uses_emoji_without_download() {
+        // media_marker for an animated sticker must NOT attempt a download
+        // (no network in tests) and surfaces the emoji.
+        let ch = TelegramChannel::new("token".into(), vec![]);
+        let media = TgMedia {
+            file_id: "x".into(),
+            kind: TgMediaKind::Sticker,
+            file_name: None,
+            emoji: Some("😺".into()),
+            animated: true,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let marker = rt.block_on(ch.media_marker(&media));
+        assert_eq!(marker, "[The user sent an animated sticker (emoji 😺).]");
+    }
+
+    #[test]
+    fn group_updates_coalesces_album_items() {
+        let mk = |id: i64, gid: Option<&str>| TgUpdate {
+            update_id: id,
+            sender_id: "1".into(),
+            chat_id: "2".into(),
+            text: String::new(),
+            media: Some(TgMedia::plain(format!("f{id}"), TgMediaKind::Photo, None)),
+            media_group_id: gid.map(String::from),
+        };
+        // Two album items (same gid) + one standalone photo.
+        let groups = group_updates(vec![mk(1, Some("A")), mk(2, Some("A")), mk(3, None)]);
+        assert_eq!(groups.len(), 2, "album coalesces; standalone is its own group");
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn marker_for_download_inlines_small_text_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "hello from a file").unwrap();
+        let media = TgMedia::plain("id".into(), TgMediaKind::Document, Some("notes.txt".into()));
+        let marker = marker_for_download(&media, &path);
+        assert!(marker.starts_with("[Content of notes.txt]:\n"));
+        assert!(marker.contains("hello from a file"));
+    }
+
+    #[test]
+    fn marker_for_download_references_path_for_binary_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.pdf");
+        std::fs::write(&path, b"%PDF-1.4 binary").unwrap();
+        let media = TgMedia::plain("id".into(), TgMediaKind::Document, Some("doc.pdf".into()));
+        let marker = marker_for_download(&media, &path);
+        assert!(marker.contains("saved at:"));
+        assert!(marker.contains("doc.pdf"));
+    }
+
+    #[test]
+    fn sanitize_doc_name_strips_unsafe_chars() {
+        assert_eq!(sanitize_doc_name("report v2.pdf"), "report v2.pdf");
+        // ']' , '\n' , '[' each become '_'.
+        assert_eq!(sanitize_doc_name("a]b\n[c"), "a_b__c");
     }
 
     #[test]
