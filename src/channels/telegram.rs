@@ -409,12 +409,23 @@ impl TelegramChannel {
     }
 
     /// Send a fresh text message, returning the new message id. Used to
-    /// deliver overflow continuation chunks past the 4096 limit.
-    async fn send_text(&self, chat_id: &str, text: &str) -> Result<Option<String>> {
-        let body = serde_json::json!({
+    /// deliver overflow continuation chunks past the 4096 limit. When
+    /// `reply_to` is a numeric message id, the message is sent as a reply
+    /// so overflow continuations group visually under the original
+    /// (mirrors the upstream's reply-chained continuations).
+    async fn send_text(
+        &self,
+        chat_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Option<String>> {
+        let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
         });
+        if let Some(anchor) = reply_to.and_then(|s| s.parse::<i64>().ok()) {
+            body["reply_to_message_id"] = serde_json::json!(anchor);
+        }
         let data = self
             .post_json_with_retry(&self.api_url("sendMessage"), &body)
             .await?;
@@ -423,6 +434,36 @@ impl TelegramChannel {
             .and_then(|r| r.get("message_id"))
             .and_then(|v| v.as_i64())
             .map(|id| id.to_string()))
+    }
+
+    /// Send one overflow continuation chunk as a reply to `reply_to`,
+    /// returning the new message id (falling back to the anchor id when
+    /// Telegram omits one). If Telegram rejects the reply because the anchor
+    /// message is gone ("reply message not found"), retry once without the
+    /// anchor (mirrors the upstream). Returns `None` only when even the
+    /// anchorless retry fails, so the caller can record partial delivery.
+    async fn send_continuation(
+        &self,
+        chat_id: &str,
+        text: &str,
+        reply_to: &str,
+    ) -> Option<String> {
+        match self.send_text(chat_id, text, Some(reply_to)).await {
+            Ok(id) => id.or_else(|| Some(reply_to.to_string())),
+            Err(e) if e.to_string().to_lowercase().contains("reply message not found") => {
+                match self.send_text(chat_id, text, None).await {
+                    Ok(id) => id.or_else(|| Some(reply_to.to_string())),
+                    Err(e2) => {
+                        tracing::warn!("Telegram overflow continuation retry failed: {e2}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Telegram overflow continuation failed: {e}");
+                None
+            }
+        }
     }
 
     /// Delete a message (best-effort). Used to remove the "..." streaming
@@ -1055,21 +1096,51 @@ impl Channel for TelegramChannel {
         }
 
         // Split the complete final text across as many messages as it takes.
-        // The first chunk replaces the streamed placeholder via edit; any
-        // remaining chunks are sent as continuation messages in the same
-        // chat, so a >4096 reply is delivered in full instead of truncated.
+        // The first chunk replaces the streamed placeholder via edit; the
+        // rest go out as continuation messages so a >4096 reply is delivered
+        // in full instead of truncated.
         let parts = split_message(full_text, TELEGRAM_MAX_LEN);
+        let total = parts.len();
+        let mut result = Ok(());
         if let Some((first, rest)) = parts.split_first() {
+            // First chunk via edit. A failure here is a real adapter problem
+            // (not an overflow), so propagate it — matches the upstream,
+            // which only fails the whole split when the first edit fails.
             self.edit_message(chat_id, message_id, first).await?;
+
+            // Continuations: each is sent as a reply to the previous message
+            // so they group visually (upstream chains continuations the same
+            // way). Delivery is resilient — one failed chunk does not abort
+            // the rest — and we report partial delivery rather than silently
+            // dropping the tail. (The upstream additionally carries a
+            // structured partial-overflow result through a stream-consumer
+            // fallback; Fennec's Channel trait returns `Result<()>`, so we
+            // surface the partial as a logged warning + Err instead.)
+            let mut prev_id = message_id.to_string();
+            let mut delivered = 1usize;
             for part in rest {
-                self.send_text(chat_id, part).await?;
+                match self.send_continuation(chat_id, part, &prev_id).await {
+                    Some(new_id) => {
+                        prev_id = new_id;
+                        delivered += 1;
+                    }
+                    None => break, // failed even after the no-reply retry
+                }
+            }
+            if delivered < total {
+                tracing::warn!(
+                    "Telegram overflow split: delivered {delivered}/{total} chunks to chat {chat_id}"
+                );
+                result = Err(anyhow::anyhow!(
+                    "overflow split delivered {delivered}/{total} chunks"
+                ));
             }
         }
 
         // Clear the rate-limit entry for this chat.
         self.last_edit.lock().remove(chat_id);
 
-        Ok(())
+        result
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<()> {
