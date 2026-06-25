@@ -177,6 +177,50 @@ fn decrypt_channel_secret(
     }
 }
 
+/// Build the `/status` cockpit. `usage` is `None` when the agent is busy
+/// (a turn holds the lock), in which case we report the busy state without
+/// live token figures. Mirrors the upstream's status cockpit shape
+/// (model/provider, context utilisation, tokens, cost, agent state) using
+/// the data Fennec actually has.
+fn build_status_text(
+    provider_name: &str,
+    usage: Option<&fennec::agent::TokenUsage>,
+) -> String {
+    let mut lines = vec![format!(
+        "🦊 Fennec v{} — online",
+        env!("CARGO_PKG_VERSION")
+    )];
+    match usage {
+        Some(u) => {
+            lines.push(format!("Provider: {provider_name}"));
+            lines.push(format!("Model: {}", u.model));
+            if u.context_max > 0 {
+                let pct = u
+                    .context_percent()
+                    .map(|p| format!(" ({p}%)"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "Context: {} / {} tokens{}",
+                    u.last_prompt_tokens, u.context_max, pct
+                ));
+            }
+            lines.push(format!(
+                "Tokens: {} in / {} out ({} API calls)",
+                u.input_tokens, u.output_tokens, u.api_calls
+            ));
+            if let Some(cost) = u.cost_usd {
+                lines.push(format!("Cost: ${cost:.4}"));
+            }
+            lines.push("Agent: idle".to_string());
+        }
+        None => {
+            lines.push(format!("Provider: {provider_name}"));
+            lines.push("Agent: busy (a turn is running)".to_string());
+        }
+    }
+    lines.join("\n")
+}
+
 /// Extract the leading slash-command token from a message, stripping any
 /// `@botname` suffix Telegram appends in groups (`/help@mybot` → `/help`).
 /// Returns `""` when the message doesn't begin with a token.
@@ -3447,18 +3491,16 @@ async fn run_gateway(
     });
 
     // 7. Main loop: consume inbound messages from bus, run agent, publish outbound.
-    // Static responses for the /status and /help commands, built once.
-    // Without real handlers these commands fell through to the agent,
-    // which improvised an unverified (and sometimes over-promising) reply.
-    let status_text = format!(
-        "🦊 Fennec v{} — online\nProvider: {}\nModel: {}",
-        env!("CARGO_PKG_VERSION"),
-        config.provider.name,
-        config.provider.model,
-    );
+    // Real handlers for /status and /help. Without them these commands fell
+    // through to the agent, which improvised an unverified (and sometimes
+    // over-promising) reply. /status is a live cockpit (built per request
+    // from the agent's token usage); /help lists only commands Fennec
+    // actually handles, so it never over-promises.
+    let provider_name = config.provider.name.clone();
     let help_text = "Commands:\n\
          /new or /reset — start a fresh session (clears history)\n\
-         /status — show agent status\n\
+         /status — show agent status (model, context, tokens, cost)\n\
+         /think:<level> — set reasoning effort (off, low, medium, high, max)\n\
          /help — show this message\n\n\
          Otherwise just send a message and I'll respond."
         .to_string();
@@ -3518,17 +3560,21 @@ async fn run_gateway(
                 let bus = bus.clone();
                 let manager_ref = Arc::clone(&manager_ref);
                 let cron_origin = Arc::clone(&cron_origin);
-                let status_text = status_text.clone();
+                let provider_name = provider_name.clone();
                 let help_text = help_text.clone();
                 tokio::spawn(async move {
-                // /status and /help get real, static answers instead of
-                // being passed to the agent (which would improvise an
-                // unverified reply). Matched on the leading token so a bot
-                // mention suffix (/help@bot) or trailing args still hit.
+                // /status and /help get real answers instead of being passed
+                // to the agent (which would improvise an unverified reply).
+                // Matched on the leading token so a bot mention suffix
+                // (/help@bot) or trailing args still hit.
                 let first_token = leading_command_token(&msg.content);
                 if matches!(first_token, "/status" | "/help") {
                     let content = if first_token == "/status" {
-                        status_text.clone()
+                        // Live cockpit: read token usage when the agent isn't
+                        // mid-turn (try_lock fails → a turn holds the lock →
+                        // report "busy" without live figures).
+                        let usage = agent.try_lock().ok().map(|g| g.token_usage());
+                        build_status_text(&provider_name, usage.as_ref())
                     } else {
                         help_text.clone()
                     };
@@ -4366,7 +4412,8 @@ async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result
 
 #[cfg(test)]
 mod slash_command_tests {
-    use super::leading_command_token;
+    use super::{build_status_text, leading_command_token};
+    use fennec::agent::TokenUsage;
 
     #[test]
     fn leading_command_token_strips_mention_and_args() {
@@ -4377,5 +4424,34 @@ mod slash_command_tests {
         assert_eq!(leading_command_token("/help@bot now"), "/help");
         assert_eq!(leading_command_token("hello there"), "hello");
         assert_eq!(leading_command_token(""), "");
+    }
+
+    #[test]
+    fn status_cockpit_shows_live_usage_when_idle() {
+        let usage = TokenUsage {
+            model: "deepseek-chat".into(),
+            input_tokens: 1200,
+            output_tokens: 340,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 3,
+            last_prompt_tokens: 50_000,
+            context_max: 200_000,
+            cost_usd: Some(0.0123),
+        };
+        let s = build_status_text("deepseek", Some(&usage));
+        assert!(s.contains("Model: deepseek-chat"));
+        assert!(s.contains("Context: 50000 / 200000 tokens (25%)"));
+        assert!(s.contains("Tokens: 1200 in / 340 out (3 API calls)"));
+        assert!(s.contains("Cost: $0.0123"));
+        assert!(s.contains("Agent: idle"));
+    }
+
+    #[test]
+    fn status_cockpit_reports_busy_when_locked() {
+        let s = build_status_text("anthropic", None);
+        assert!(s.contains("Provider: anthropic"));
+        assert!(s.contains("Agent: busy"));
+        assert!(!s.contains("Tokens:"));
     }
 }
