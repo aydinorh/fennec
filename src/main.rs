@@ -246,18 +246,19 @@ struct GatewaySessions {
 
 impl GatewaySessions {
     /// Resolve the session id for a chat, creating one on first contact.
-    /// The map lock is held across `create_session` so two concurrent
-    /// turns from the same chat can't create duplicate sessions.
-    async fn session_for(&self, channel: &str, chat_id: &str) -> Option<String> {
+    /// Returns `(session_id, newly_created)`. The map lock is held across
+    /// `create_session` so two concurrent turns from the same chat can't
+    /// create duplicate sessions.
+    async fn session_for(&self, channel: &str, chat_id: &str) -> Option<(String, bool)> {
         let key = (channel.to_string(), chat_id.to_string());
         let mut map = self.map.lock().await;
         if let Some(id) = map.get(&key) {
-            return Some(id.clone());
+            return Some((id.clone(), false));
         }
         match self.store.create_session(channel).await {
             Ok(id) => {
                 map.insert(key, id.clone());
-                Some(id)
+                Some((id, true))
             }
             Err(e) => {
                 tracing::warn!("session recording: create_session failed: {e}");
@@ -266,14 +267,67 @@ impl GatewaySessions {
         }
     }
 
-    /// Append one message to the chat's session.
-    async fn record(&self, channel: &str, chat_id: &str, role: &str, content: &str) {
-        if content.is_empty() {
+    /// Record a whole turn into the chat's session: every message appended
+    /// to the agent history this turn (the user prompt, assistant messages
+    /// with their tool_calls, and tool-result rows). Mirrors the upstream's
+    /// per-turn session flush and the TUI's persistence loop, so
+    /// session_search / session_list see the full structured transcript
+    /// (not just plain text). On a freshly-created session the title is set
+    /// from the first user message so the conversation is identifiable.
+    async fn record_turn(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        messages: &[fennec::providers::ChatMessage],
+    ) {
+        if messages.is_empty() {
             return;
         }
-        if let Some(id) = self.session_for(channel, chat_id).await {
-            if let Err(e) = self.store.add_message(&id, role, content).await {
-                tracing::warn!("session recording: add_message failed: {e}");
+        let Some((id, created)) = self.session_for(channel, chat_id).await else {
+            return;
+        };
+
+        if created {
+            if let Some(title) = messages
+                .iter()
+                .find(|m| m.role == "user")
+                .and_then(|m| m.content.as_deref())
+                .map(session_title_from)
+                .filter(|t| !t.is_empty())
+            {
+                let _ = self.store.set_session_title(&id, &title).await;
+            }
+        }
+
+        for msg in messages {
+            let content = msg.content.clone().unwrap_or_default();
+            // Persist tool_calls as JSON so resume reconstructs the
+            // structured list; skip the empty array.
+            let tool_calls_json = msg.tool_calls.as_ref().and_then(|tcs| {
+                if tcs.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(tcs).ok()
+                }
+            });
+            // Skip only when there's nothing at all to record (no content,
+            // no tool structure) — an assistant message that is purely a
+            // tool call, or a tool-result row, is still recorded.
+            if content.is_empty() && tool_calls_json.is_none() && msg.tool_call_id.is_none() {
+                continue;
+            }
+            if let Err(e) = self
+                .store
+                .add_message_full(
+                    &id,
+                    &msg.role,
+                    &content,
+                    tool_calls_json.as_deref(),
+                    msg.tool_call_id.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!("session recording: add_message_full failed: {e}");
             }
         }
     }
@@ -286,6 +340,23 @@ impl GatewaySessions {
             let _ = self.store.end_session(&id, None).await;
         }
     }
+}
+
+/// Derive a short session title from the first user message: a single
+/// trimmed line, capped at 60 chars with an ellipsis. A no-LLM stand-in
+/// for the dedicated title generator (which is TUI-only today).
+fn session_title_from(first_user_message: &str) -> String {
+    let line = first_user_message
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut out: String = line.chars().take(60).collect();
+    if line.chars().count() > 60 {
+        out.push('…');
+    }
+    out
 }
 
 /// Resolve the API key from config or provider-specific environment variable.
@@ -3693,12 +3764,6 @@ async fn run_gateway(
                     return;
                 }
 
-                // Record the user prompt before the turn so it lands in the
-                // session even if the turn errors.
-                if let Some(s) = &gateway_sessions {
-                    s.record(&msg.channel, &msg.chat_id, "user", &msg.content).await;
-                }
-
                 // Spawn continuous typing indicator that fires every 4 seconds
                 // until the agent finishes processing.
                 let typing_channel: Option<Arc<dyn Channel>> = manager_ref.get_channel(&msg.channel);
@@ -3724,7 +3789,7 @@ async fn run_gateway(
                 // overwrite this turn's origin mid-flight. Recover from a
                 // poisoned mutex via `into_inner` so a single panic-while-
                 // locked elsewhere can't kill subsequent turns.
-                let turn_result = {
+                let (turn_result, new_msgs) = {
                     let mut agent_lock = agent.lock().await;
                     {
                         let mut origin = cron_origin
@@ -3735,8 +3800,26 @@ async fn run_gateway(
                             chat_id: msg.chat_id.clone(),
                         });
                     }
-                    agent_lock.turn(&msg.content).await
+                    let history_before = agent_lock.history_len();
+                    let r = agent_lock.turn(&msg.content).await;
+                    // Snapshot every message this turn appended (user prompt,
+                    // assistant + tool_calls, tool results) while the lock is
+                    // held, so we can record the full structured transcript.
+                    let new_msgs: Vec<_> = agent_lock
+                        .history_slice(history_before)
+                        .iter()
+                        .cloned()
+                        .collect();
+                    (r, new_msgs)
                 };
+
+                // Record the structured turn (mirrors the upstream's per-turn
+                // session flush). Done for both success and failure so the
+                // user prompt and any partial work land in the session.
+                if let Some(s) = &gateway_sessions {
+                    s.record_turn(&msg.channel, &msg.chat_id, &new_msgs).await;
+                }
+
                 match turn_result {
                     Ok(response) => {
                         // Stop typing indicator.
@@ -3749,12 +3832,6 @@ async fn run_gateway(
                                 "Agent response marked [SILENT], suppressing outbound"
                             );
                             return;
-                        }
-
-                        // Record the assistant reply into the session.
-                        if let Some(s) = &gateway_sessions {
-                            s.record(&msg.channel, &msg.chat_id, "assistant", &response)
-                                .await;
                         }
 
                         // Check if the channel supports streaming and use
@@ -4551,7 +4628,8 @@ mod slash_command_tests {
 
 #[cfg(test)]
 mod gateway_session_tests {
-    use super::GatewaySessions;
+    use super::{session_title_from, GatewaySessions};
+    use fennec::providers::{ChatMessage, ToolCall};
     use std::sync::Arc;
 
     fn recorder(dir: &std::path::Path) -> GatewaySessions {
@@ -4562,37 +4640,87 @@ mod gateway_session_tests {
         }
     }
 
+    fn msg(role: &str, content: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.map(String::from),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+            reasoning: None,
+        }
+    }
+    fn user(text: &str) -> ChatMessage {
+        msg("user", Some(text))
+    }
+    fn assistant(text: &str) -> ChatMessage {
+        msg("assistant", Some(text))
+    }
+
     #[tokio::test]
-    async fn records_per_chat_sessions_and_resets() {
+    async fn record_turn_persists_tool_calls_and_title() {
         let tmp = tempfile::tempdir().unwrap();
         let rec = recorder(tmp.path());
 
-        // Chat A: user + assistant land in one session.
-        rec.record("telegram", "A", "user", "hi").await;
-        rec.record("telegram", "A", "assistant", "hello").await;
-        // Second turn, same chat → same session.
-        rec.record("telegram", "A", "user", "again").await;
+        // A turn with a tool call: user, assistant(tool_calls), tool result,
+        // final assistant.
+        let tool_call = ToolCall {
+            id: "tc1".into(),
+            name: "calculator".into(),
+            arguments: serde_json::json!({"expr": "1+1"}),
+        };
+        let mut assistant_with_tool = msg("assistant", None);
+        assistant_with_tool.tool_calls = Some(vec![tool_call]);
+        let mut tool_result = msg("tool", Some("2"));
+        tool_result.tool_call_id = Some("tc1".into());
+        let turn = vec![
+            user("what is 1+1?"),
+            assistant_with_tool,
+            tool_result,
+            assistant("It's 2."),
+        ];
+        rec.record_turn("telegram", "A", &turn).await;
 
-        // Chat B → a distinct session.
-        rec.record("telegram", "B", "user", "yo").await;
+        let (id, _) = rec.session_for("telegram", "A").await.unwrap();
+        let msgs = rec.store.get_session_messages(&id).await.unwrap();
+        assert_eq!(msgs.len(), 4, "all four turn messages recorded");
+        // The assistant-with-tool message kept its tool_calls JSON.
+        let tool_msg = msgs.iter().find(|m| m.tool_calls.is_some()).unwrap();
+        assert!(tool_msg.tool_calls.as_ref().unwrap().contains("calculator"));
+        // The tool-result row kept its tool_call_id.
+        assert!(msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("tc1")));
 
-        let sessions = rec.store.list_sessions(10).await.unwrap();
-        assert_eq!(sessions.len(), 2, "one session per chat");
+        // Title was set from the first user message.
+        let sessions = rec.store.list_sessions(5).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("what is 1+1?"));
+    }
 
-        let id_a = rec.session_for("telegram", "A").await.unwrap();
-        let msgs_a = rec.store.get_session_messages(&id_a).await.unwrap();
-        assert_eq!(msgs_a.len(), 3, "two user + one assistant message for chat A");
+    #[tokio::test]
+    async fn record_turn_keeps_one_session_per_chat_and_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = recorder(tmp.path());
 
-        // Reset chat A → next message opens a fresh session.
+        rec.record_turn("telegram", "A", &[user("hi"), assistant("hello")]).await;
+        rec.record_turn("telegram", "A", &[user("again"), assistant("ok")]).await;
+        rec.record_turn("telegram", "B", &[user("yo"), assistant("hey")]).await;
+
+        assert_eq!(rec.store.list_sessions(10).await.unwrap().len(), 2);
+
+        let (id_a, _) = rec.session_for("telegram", "A").await.unwrap();
         rec.reset("telegram", "A").await;
-        rec.record("telegram", "A", "user", "fresh start").await;
-        let id_a2 = rec.session_for("telegram", "A").await.unwrap();
-        assert_ne!(id_a, id_a2, "reset must rotate to a new session");
+        rec.record_turn("telegram", "A", &[user("fresh")]).await;
+        let (id_a2, _) = rec.session_for("telegram", "A").await.unwrap();
+        assert_ne!(id_a, id_a2, "reset rotates to a new session");
+    }
 
-        // Empty content is not recorded.
-        let before = rec.store.get_session_messages(&id_a2).await.unwrap().len();
-        rec.record("telegram", "A", "assistant", "").await;
-        let after = rec.store.get_session_messages(&id_a2).await.unwrap().len();
-        assert_eq!(before, after, "empty content skipped");
+    #[test]
+    fn session_title_from_takes_first_line_capped() {
+        assert_eq!(session_title_from("  hello world  "), "hello world");
+        assert_eq!(session_title_from("first line\nsecond"), "first line");
+        let long = "x".repeat(80);
+        let title = session_title_from(&long);
+        assert_eq!(title.chars().count(), 61); // 60 + ellipsis
+        assert!(title.ends_with('…'));
     }
 }
