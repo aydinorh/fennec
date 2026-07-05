@@ -110,6 +110,7 @@ both paths work.
 | OpenAI | chunked | `reasoning_effort` (o1 family) |
 | Google Gemini | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
 | Gemini (Cloud Code) | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
+| OpenAI Codex (Responses API) | SSE | `reasoning.effort` (gpt-5 / codex) |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -128,6 +129,10 @@ signs in with your Google account (`fennec login --provider gemini-cloudcode`)
 for the Cloud Code Assist free tier — no API key, generous personal quota. The
 login runs a loopback OAuth flow (with a paste fallback for headless/SSH hosts)
 and discovers your Code Assist project automatically.
+
+Set `provider.name = "codex"` to use OpenAI's Responses API (`/v1/responses`,
+for gpt-5 / Codex models) instead of Chat Completions; it authenticates with the
+same `OPENAI_API_KEY`.
 
 ## Tools
 
