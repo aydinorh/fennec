@@ -108,6 +108,7 @@ both paths work.
 |---|---|---|
 | Anthropic | SSE | Extended thinking, budget tokens |
 | OpenAI | chunked | `reasoning_effort` (o1 family) |
+| Google Gemini | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -118,7 +119,8 @@ fallback chain with cooldowns and an overall deadline.
 
 Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KIMI_API_KEY`).
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
+`KIMI_API_KEY`).
 
 ## Tools
 

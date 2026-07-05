@@ -118,6 +118,7 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        "google" | "gemini" => "GEMINI_API_KEY",
         _ => "ANTHROPIC_API_KEY",
     };
     match std::env::var(env_var) {
@@ -196,6 +197,16 @@ pub async fn check_provider_reachable(
         "kimi" | "moonshot" => {
             let url = "https://api.moonshot.ai/v1/models".to_string();
             let req = client.get(&url).bearer_auth(api_key);
+            (url, req)
+        }
+        "google" | "gemini" => {
+            let base = if config.provider.base_url.is_empty() {
+                "https://generativelanguage.googleapis.com/v1beta"
+            } else {
+                config.provider.base_url.trim_end_matches('/')
+            };
+            let url = format!("{}/models", base);
+            let req = client.get(&url).header("x-goog-api-key", api_key);
             (url, req)
         }
         "ollama" => {
@@ -345,6 +356,7 @@ pub async fn run_all(
                     "openai" => "OPENAI_API_KEY",
                     "kimi" | "moonshot" => "KIMI_API_KEY",
                     "openrouter" => "OPENROUTER_API_KEY",
+                    "google" | "gemini" => "GEMINI_API_KEY",
                     _ => "",
                 };
                 std::env::var(env_var).unwrap_or_default()

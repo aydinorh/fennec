@@ -23,6 +23,7 @@ use fennec::memory::sqlite::SqliteMemory;
 use fennec::memory::Memory;
 use fennec::providers::anthropic::AnthropicProvider;
 use fennec::providers::openai::OpenAIProvider;
+use fennec::providers::gemini::GeminiProvider;
 use fennec::providers::ollama::OllamaProvider;
 use fennec::providers::traits::Provider;
 use fennec::security::prompt_guard::{GuardAction, PromptGuard};
@@ -193,6 +194,7 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        "google" | "gemini" => "GEMINI_API_KEY",
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -308,6 +310,13 @@ fn build_auxiliary_client(
         &mut vision_chain,
         false, // Kimi vision support is variable; conservative skip
     );
+    try_add(
+        "gemini",
+        "GEMINI_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true, // Gemini is natively multimodal
+    );
     let _ = secret_store; // reserved for future encrypted-aux-key
                           // resolution; placeholder so callers can
                           // pass it without breaking when we wire it.
@@ -390,6 +399,20 @@ fn build_provider(
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
             Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+        }
+        "google" | "gemini" => {
+            // Back-compat: if the user switched provider to Gemini but kept an
+            // Anthropic-flavored default model string, fall back to Gemini's
+            // own default rather than passing a non-Gemini model id.
+            let gemini_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "gemini-2.5-flash".to_string()
+            } else {
+                model
+            };
+            Box::new(GeminiProvider::new(api_key, Some(gemini_model), base_url, None))
         }
         "ollama" => {
             // Same back-compat as kimi: accept both new and old Anthropic
@@ -584,8 +607,8 @@ async fn build_agent_with_callbacks(
     let browser_tool = BrowserTool::new();
 
     // Vision tool: only wired when the configured provider supports vision
-    // (anthropic, openai) AND we can resolve an API key. OAuth-only users and
-    // non-vision providers silently skip it.
+    // (anthropic, openai, gemini) AND we can resolve an API key. OAuth-only
+    // users and non-vision providers silently skip it.
     let vision_api_key = resolve_api_key(config, &secret_store)
         .ok()
         .unwrap_or_default();

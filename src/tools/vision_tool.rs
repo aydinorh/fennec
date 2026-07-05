@@ -1,8 +1,8 @@
 //! Vision tool — analyzes images via the configured vision-capable provider.
 //!
 //! Accepts a local file path or URL, base64-encodes the image, and sends it
-//! to Anthropic or OpenAI's vision API with an optional question. Returns
-//! the model's text response.
+//! to Anthropic, OpenAI, or Google Gemini's vision API with an optional
+//! question. Returns the model's text response.
 //!
 //! Why this lives as a tool rather than native multimodal messages: the
 //! existing agent message type is text-only. Wrapping the vision call in
@@ -31,6 +31,7 @@ const MAX_IMAGE_FETCH_BYTES: usize = 20 * 1024 * 1024;
 pub enum VisionBackend {
     Anthropic,
     OpenAi,
+    Gemini,
 }
 
 impl VisionBackend {
@@ -40,6 +41,7 @@ impl VisionBackend {
         match name.to_lowercase().as_str() {
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::OpenAi),
+            "google" | "gemini" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -70,6 +72,7 @@ impl VisionTool {
         let model = model.unwrap_or_else(|| match backend {
             VisionBackend::Anthropic => "claude-sonnet-4-6".to_string(),
             VisionBackend::OpenAi => "gpt-4o".to_string(),
+            VisionBackend::Gemini => "gemini-2.5-flash".to_string(),
         });
         let client = build_guarded_client(std::time::Duration::from_secs(60));
         Some(Self {
@@ -210,6 +213,45 @@ impl VisionTool {
         extract_openai_text(&parsed)
             .ok_or_else(|| anyhow::anyhow!("no message content in OpenAI response: {}", parsed))
     }
+
+    async fn analyze_gemini(&self, image_b64: &str, mime: &str, question: &str) -> Result<String> {
+        let body = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "inlineData": { "mimeType": mime, "data": image_b64 } },
+                    { "text": question }
+                ]
+            }],
+            "generationConfig": { "maxOutputTokens": 1024 }
+        });
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            self.model
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Gemini vision API error ({}): {}",
+                status,
+                err_body
+            ));
+        }
+
+        let parsed: Value = resp.json().await?;
+        extract_gemini_text(&parsed)
+            .ok_or_else(|| anyhow::anyhow!("no text part in Gemini response: {}", parsed))
+    }
 }
 
 fn extract_anthropic_text(v: &Value) -> Option<String> {
@@ -236,6 +278,30 @@ fn extract_openai_text(v: &Value) -> Option<String> {
         .get("content")?
         .as_str()
         .map(String::from)
+}
+
+fn extract_gemini_text(v: &Value) -> Option<String> {
+    let parts = v
+        .get("candidates")?
+        .as_array()?
+        .first()?
+        .get("content")?
+        .get("parts")?
+        .as_array()?;
+    let mut out = String::new();
+    for part in parts {
+        // Skip reasoning ("thought") parts — only surface answer text.
+        if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+            continue;
+        }
+        if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(t);
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn guess_mime_from_path(path: &str) -> String {
@@ -317,6 +383,7 @@ impl Tool for VisionTool {
         let result = match self.backend {
             VisionBackend::Anthropic => self.analyze_anthropic(&b64, &mime, &question).await,
             VisionBackend::OpenAi => self.analyze_openai(&b64, &mime, &question).await,
+            VisionBackend::Gemini => self.analyze_gemini(&b64, &mime, &question).await,
         };
 
         match result {
@@ -363,10 +430,59 @@ mod tests {
     }
 
     #[test]
+    fn backend_from_gemini() {
+        assert_eq!(
+            VisionBackend::from_provider_name("gemini"),
+            Some(VisionBackend::Gemini)
+        );
+        assert_eq!(
+            VisionBackend::from_provider_name("google"),
+            Some(VisionBackend::Gemini)
+        );
+        assert_eq!(
+            VisionBackend::from_provider_name("Gemini"),
+            Some(VisionBackend::Gemini)
+        );
+    }
+
+    #[test]
     fn backend_from_unsupported_returns_none() {
         assert_eq!(VisionBackend::from_provider_name("ollama"), None);
         assert_eq!(VisionBackend::from_provider_name("kimi"), None);
         assert_eq!(VisionBackend::from_provider_name(""), None);
+    }
+
+    #[test]
+    fn extract_gemini_text_joins_text_parts_and_skips_thoughts() {
+        let v = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "thought": true, "text": "reasoning..." },
+                        { "text": "A red bicycle" },
+                        { "text": "leaning on a wall." }
+                    ]
+                }
+            }]
+        });
+        assert_eq!(
+            extract_gemini_text(&v).as_deref(),
+            Some("A red bicycle\nleaning on a wall.")
+        );
+    }
+
+    #[test]
+    fn extract_gemini_text_none_when_empty() {
+        let v = json!({ "candidates": [] });
+        assert!(extract_gemini_text(&v).is_none());
+    }
+
+    #[test]
+    fn from_provider_builds_gemini_with_default_model() {
+        let tool = VisionTool::from_provider("gemini", "key".to_string(), None)
+            .expect("gemini vision tool should build");
+        assert_eq!(tool.backend, VisionBackend::Gemini);
+        assert_eq!(tool.model, "gemini-2.5-flash");
     }
 
     #[test]
