@@ -471,7 +471,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_tool_iterations: 15,
+            max_tool_iterations: 90,
             context_window: 200_000,
             compression_threshold: 0.50,
         }

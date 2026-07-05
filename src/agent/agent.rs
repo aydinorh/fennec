@@ -474,7 +474,11 @@ impl Agent {
             self.apply_pending_steer_to_tool_results();
         }
 
-        bail!("max tool iterations ({}) exceeded", self.max_tool_iterations)
+        // Budget exhausted: end gracefully with a tool-less summary instead of
+        // erroring the whole turn. See `summarize_after_max_iterations`.
+        self.callbacks
+            .on_status("max iterations reached — requesting summary");
+        self.summarize_after_max_iterations().await
     }
 
     /// Execute a single conversational turn with streaming.
@@ -806,10 +810,10 @@ impl Agent {
             self.apply_pending_steer_to_tool_results();
         }
 
-        bail!(
-            "max tool iterations ({}) exceeded",
-            self.max_tool_iterations
-        )
+        // Budget exhausted (streaming path): same graceful tool-less summary.
+        self.callbacks
+            .on_status("max iterations reached — requesting summary");
+        self.summarize_after_max_iterations().await
     }
 
     /// Record the final assistant text after a [`Self::turn_streamed`]
@@ -863,6 +867,71 @@ impl Agent {
         }
 
         response
+    }
+
+    /// Graceful end-of-budget handler. When the tool-iteration cap is hit we
+    /// do NOT error the turn — instead we make one final provider call with
+    /// tools disabled, nudging the model to summarise what it accomplished,
+    /// and return that text. A budget-exhausted turn should still give the
+    /// user a usable answer, not a stack-trace-style failure.
+    ///
+    /// The summary instruction is appended to the trailing tool-result message
+    /// — the same channel `/steer` uses — so providers that require strict
+    /// user/assistant role alternation (Anthropic in particular) never see two
+    /// consecutive user turns. When there is no trailing tool result to attach
+    /// to (degenerate case, e.g. a zero-iteration cap), we fall back to a
+    /// standalone user message.
+    async fn summarize_after_max_iterations(&mut self) -> Result<String> {
+        const SUMMARY_INSTRUCTION: &str = "[System] You've reached the maximum \
+            number of tool-calling iterations allowed for this turn. Provide a \
+            final response summarising what you found and accomplished so far. \
+            Do not attempt to call any more tools.";
+
+        match self.history.last_mut() {
+            Some(last) if last.role == "tool" => {
+                let content = last.content.get_or_insert_with(String::new);
+                content.push_str("\n\n");
+                content.push_str(SUMMARY_INSTRUCTION);
+            }
+            _ => {
+                self.history.push(ChatMessage::user(SUMMARY_INSTRUCTION));
+            }
+        }
+
+        // Tools stripped — the model must answer in text. Clone the provider
+        // Arc so the request can borrow `self` immutably across the await
+        // without conflicting with the provider handle.
+        let provider = Arc::clone(&self.provider);
+        let request = ChatRequest {
+            system: self.system_prompt.as_deref(),
+            messages: &self.history,
+            tools: None,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            thinking_level: self.thinking_level,
+        };
+        let response = provider.chat(request).await?;
+        self.total_api_calls += 1;
+
+        // Track usage from the summary call so /usage stays accurate.
+        if let Some(ref usage) = response.usage {
+            self.total_input_tokens += usage.input_tokens;
+            self.total_output_tokens += usage.output_tokens;
+            self.last_prompt_tokens = usage.input_tokens
+                + usage.cache_read_tokens.unwrap_or(0)
+                + usage.cache_write_tokens.unwrap_or(0);
+            if let Some(c) = usage.cache_read_tokens {
+                self.total_cache_read_tokens += c;
+            }
+            if let Some(c) = usage.cache_write_tokens {
+                self.total_cache_write_tokens += c;
+            }
+        }
+
+        let text = response.content.unwrap_or_default();
+        self.history.push(ChatMessage::assistant(&text));
+        self.callbacks.on_turn_complete(&text);
+        Ok(text)
     }
 
     /// Find a tool by name and execute it. Returns the formatted output string
@@ -1694,7 +1763,7 @@ impl AgentBuilder {
             pending_steer: None,
             memory,
             prompt_builder,
-            max_tool_iterations: self.max_tool_iterations.unwrap_or(15),
+            max_tool_iterations: self.max_tool_iterations.unwrap_or(90),
             history: Vec::new(),
             system_prompt: None,
             max_tokens: self.max_tokens.unwrap_or(8192),
