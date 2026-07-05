@@ -96,6 +96,14 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         return CheckResult::pass("api_key", "ollama requires no key");
     }
 
+    // gemini-cloudcode authenticates via Google OAuth, not an API key.
+    if matches!(config.provider.name.as_str(), "gemini-cloudcode" | "google-cloudcode") {
+        return CheckResult::pass(
+            "api_key",
+            "OAuth provider — sign in with `fennec login --provider gemini-cloudcode`",
+        );
+    }
+
     if !config.provider.api_key.is_empty() {
         match secret_store.decrypt(&config.provider.api_key) {
             Ok(k) if !k.is_empty() => {
@@ -160,6 +168,14 @@ pub async fn check_provider_reachable(
     config: &FennecConfig,
     api_key: &str,
 ) -> CheckResult {
+    let is_oauth_provider =
+        matches!(config.provider.name.as_str(), "gemini-cloudcode" | "google-cloudcode");
+    if is_oauth_provider {
+        return CheckResult::warn(
+            "provider_reachable",
+            "skipped — OAuth provider; verify with `fennec login --provider gemini-cloudcode`",
+        );
+    }
     if api_key.is_empty() && config.provider.name != "ollama" {
         return CheckResult::warn(
             "provider_reachable",

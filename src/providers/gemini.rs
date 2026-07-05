@@ -75,35 +75,46 @@ impl GeminiProvider {
 
     /// Build the Gemini request body shared by `chat` and `chat_stream`.
     fn build_request_body(&self, request: &ChatRequest<'_>) -> Value {
-        let (contents, system_instruction) =
-            build_contents(request.system, request.messages);
+        build_gemini_request_body(request)
+    }
+}
 
-        let mut body = json!({ "contents": contents });
-        if let Some(si) = system_instruction {
-            body["systemInstruction"] = si;
-        }
+/// Build the Gemini `:generateContent` request body from a [`ChatRequest`].
+///
+/// Exposed to the Cloud Code Assist provider, which reuses the identical inner
+/// request body and only differs in transport (OAuth bearer + a wrapping
+/// envelope) — see [`super::gemini_cloudcode`].
+pub(crate) fn build_gemini_request_body(request: &ChatRequest<'_>) -> Value {
+    let (contents, system_instruction) = build_contents(request.system, request.messages);
 
-        if let Some(tools) = request.tools {
-            let declarations = convert_tools(tools);
-            if !declarations.is_empty() {
-                body["tools"] = json!(declarations);
-            }
-        }
-
-        let mut generation_config = json!({
-            "temperature": request.temperature,
-            "maxOutputTokens": request.max_tokens,
-        });
-        if let Some(thinking) = thinking_config_for(request.thinking_level) {
-            generation_config["thinkingConfig"] = thinking;
-        }
-        body["generationConfig"] = generation_config;
-
-        body
+    let mut body = json!({ "contents": contents });
+    if let Some(si) = system_instruction {
+        body["systemInstruction"] = si;
     }
 
-    /// Parse a non-streaming Gemini response into a [`ChatResponse`].
-    fn parse_response(body: &Value) -> Result<ChatResponse> {
+    if let Some(tools) = request.tools {
+        let declarations = convert_tools(tools);
+        if !declarations.is_empty() {
+            body["tools"] = json!(declarations);
+        }
+    }
+
+    let mut generation_config = json!({
+        "temperature": request.temperature,
+        "maxOutputTokens": request.max_tokens,
+    });
+    if let Some(thinking) = thinking_config_for(request.thinking_level) {
+        generation_config["thinkingConfig"] = thinking;
+    }
+    body["generationConfig"] = generation_config;
+
+    body
+}
+
+/// Parse a non-streaming Gemini response into a [`ChatResponse`]. Shared with
+/// the Cloud Code Assist provider (after it unwraps the `{response:{…}}`
+/// envelope).
+pub(crate) fn parse_gemini_response(body: &Value) -> Result<ChatResponse> {
         let usage = parse_usage(body);
 
         let candidate = body
@@ -171,7 +182,6 @@ impl GeminiProvider {
             },
         })
     }
-}
 
 /// Allowed keys for Gemini's `FunctionDeclaration.parameters` schema. Gemini
 /// accepts only this subset of OpenAPI 3.0 / JSON Schema; keys outside it
@@ -467,7 +477,7 @@ fn gen_tool_call_id() -> String {
 
 /// Extract a human-readable message from a Gemini error body, falling back to
 /// the first 200 bytes of the raw payload.
-fn extract_error_message(raw: &[u8]) -> String {
+pub(crate) fn extract_error_message(raw: &[u8]) -> String {
     serde_json::from_slice::<Value>(raw)
         .ok()
         .and_then(|v| {
@@ -488,7 +498,7 @@ fn extract_error_message(raw: &[u8]) -> String {
 /// in-flight tool call at a time, so each group must be self-contained).
 /// Captures `usageMetadata` into `usage_acc` and returns `true` once a
 /// `finishReason` is observed.
-async fn dispatch_gemini_event(
+pub(crate) async fn dispatch_gemini_event(
     data: &Value,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
     usage_acc: &mut UsageInfo,
@@ -567,7 +577,7 @@ async fn dispatch_gemini_event(
 }
 
 /// Emit a final `Usage` (when token counts were seen) followed by `Done`.
-async fn finish_stream(tx: &tokio::sync::mpsc::Sender<StreamEvent>, usage_acc: &UsageInfo) {
+pub(crate) async fn finish_stream(tx: &tokio::sync::mpsc::Sender<StreamEvent>, usage_acc: &UsageInfo) {
     if usage_acc.input_tokens > 0
         || usage_acc.output_tokens > 0
         || usage_acc.cache_read_tokens.is_some()
@@ -617,7 +627,7 @@ impl Provider for GeminiProvider {
 
         let response_body: Value = serde_json::from_slice(&raw_body)
             .context("parsing Gemini API response as JSON")?;
-        Self::parse_response(&response_body)
+        parse_gemini_response(&response_body)
     }
 
     fn supports_tool_calling(&self) -> bool {
@@ -972,7 +982,7 @@ mod tests {
                 "cachedContentTokenCount": 3
             }
         });
-        let resp = GeminiProvider::parse_response(&body).unwrap();
+        let resp = parse_gemini_response(&body).unwrap();
         assert_eq!(resp.content.as_deref(), Some("Hello!"));
         assert_eq!(resp.reasoning.as_deref(), Some("thinking..."));
         assert!(resp.tool_calls.is_empty());
@@ -994,7 +1004,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let resp = GeminiProvider::parse_response(&body).unwrap();
+        let resp = parse_gemini_response(&body).unwrap();
         assert!(resp.content.is_none());
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].name, "get_weather");
@@ -1005,7 +1015,7 @@ mod tests {
     #[test]
     fn parse_response_empty_candidates_is_contentless() {
         let body = json!({ "candidates": [] });
-        let resp = GeminiProvider::parse_response(&body).unwrap();
+        let resp = parse_gemini_response(&body).unwrap();
         assert!(resp.content.is_none());
         assert!(resp.tool_calls.is_empty());
     }

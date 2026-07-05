@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod openai;
 pub mod openrouter;
 pub mod gemini;
+pub mod gemini_cloudcode;
 pub mod ollama;
 pub mod reliable;
 pub mod router;
@@ -13,6 +14,7 @@ pub use traits::{Provider, ChatMessage, ChatRequest, ChatResponse, ToolCall, Str
 pub use openai::OpenAIProvider;
 pub use openrouter::OpenRouterProvider;
 pub use gemini::GeminiProvider;
+pub use gemini_cloudcode::GeminiCloudCodeProvider;
 pub use ollama::OllamaProvider;
 pub use reliable::ReliableProvider;
 pub use router::{RouterProvider, ModelSwitchTool};

@@ -109,6 +109,7 @@ both paths work.
 | Anthropic | SSE | Extended thinking, budget tokens |
 | OpenAI | chunked | `reasoning_effort` (o1 family) |
 | Google Gemini | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
+| Gemini (Cloud Code) | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -121,6 +122,12 @@ Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
 `KIMI_API_KEY`).
+
+Gemini has two flavors: `gemini` uses a `GEMINI_API_KEY`, while `gemini-cloudcode`
+signs in with your Google account (`fennec login --provider gemini-cloudcode`)
+for the Cloud Code Assist free tier — no API key, generous personal quota. The
+login runs a loopback OAuth flow (with a paste fallback for headless/SSH hosts)
+and discovers your Code Assist project automatically.
 
 ## Tools
 

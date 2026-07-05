@@ -113,8 +113,18 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Authenticate with Anthropic via OAuth
-    Login,
+    /// Authenticate via OAuth. Defaults to Anthropic; pass
+    /// `--provider gemini-cloudcode` to sign in with Google for the Gemini
+    /// Cloud Code Assist free tier.
+    Login {
+        /// Which provider to authenticate: `anthropic` (default) or
+        /// `gemini-cloudcode` (Google sign-in).
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        /// Force re-authentication even if valid credentials already exist.
+        #[arg(long)]
+        force: bool,
+    },
     /// Run diagnostic checks — provider reachability, API key, memory DB, Plurum, config.
     Doctor,
     /// Manage the skill curator — periodic background consolidation
@@ -195,6 +205,9 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "google" | "gemini" => "GEMINI_API_KEY",
+        // OAuth-authenticated; the provider resolves a Google bearer token
+        // from stored credentials, so there's no API key to read here.
+        "gemini-cloudcode" | "google-cloudcode" => return Ok(String::new()),
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -222,6 +235,7 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
 /// vision chain just excludes the local-only provider).
 fn build_auxiliary_client(
     config: &FennecConfig,
+    home_dir: &std::path::Path,
     primary: Arc<dyn Provider>,
     secret_store: &SecretStore,
 ) -> fennec::providers::AuxiliaryClient {
@@ -270,7 +284,7 @@ fn build_auxiliary_client(
             },
             ..config.clone()
         };
-        let provider_box = build_provider(&aux_config, key, None);
+        let provider_box = build_provider(&aux_config, home_dir, key, None);
         let provider: Arc<dyn Provider> = Arc::from(provider_box);
         let entry = fennec::providers::ChainEntry {
             name: name.to_string(),
@@ -341,11 +355,11 @@ fn resolve_provider_with_model(
             ))
         } else {
             let api_key = resolve_api_key(config, &secret_store)?;
-            build_provider(config, api_key, Some(model.to_string()))
+            build_provider(config, home_dir, api_key, Some(model.to_string()))
         }
     } else {
         let api_key = resolve_api_key(config, &secret_store)?;
-        build_provider(config, api_key, Some(model.to_string()))
+        build_provider(config, home_dir, api_key, Some(model.to_string()))
     };
     Ok(Arc::from(provider))
 }
@@ -353,6 +367,7 @@ fn resolve_provider_with_model(
 /// Build the LLM provider based on config.
 fn build_provider(
     config: &FennecConfig,
+    home_dir: &std::path::Path,
     api_key: String,
     model_override: Option<String>,
 ) -> Box<dyn Provider> {
@@ -413,6 +428,25 @@ fn build_provider(
                 model
             };
             Box::new(GeminiProvider::new(api_key, Some(gemini_model), base_url, None))
+        }
+        "gemini-cloudcode" | "google-cloudcode" => {
+            // OAuth/free-tier flavor — no API key; the provider resolves a
+            // Google bearer token (and the project) from credentials stored
+            // under `home_dir` by `fennec login --provider gemini-cloudcode`.
+            let cc_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "gemini-2.5-flash".to_string()
+            } else {
+                model
+            };
+            Box::new(fennec::providers::GeminiCloudCodeProvider::new(
+                home_dir.to_path_buf(),
+                Some(cc_model),
+                None,
+                None,
+            ))
         }
         "ollama" => {
             // Same back-compat as kimi: accept both new and old Anthropic
@@ -512,11 +546,11 @@ async fn build_agent_with_callbacks(
             Box::new(AnthropicProvider::new_with_oauth(oauth_token, Some(model)))
         } else {
             let api_key = resolve_api_key(config, &secret_store)?;
-            build_provider(config, api_key, model_override)
+            build_provider(config, home_dir, api_key, model_override)
         }
     } else {
         let api_key = resolve_api_key(config, &secret_store)?;
-        build_provider(config, api_key, model_override)
+        build_provider(config, home_dir, api_key, model_override)
     };
 
     // Promote the provider to `Arc` so it can be shared with DelegateTool
@@ -531,6 +565,7 @@ async fn build_agent_with_callbacks(
     // provider not known to handle multimodal input.
     let aux_client = build_auxiliary_client(
         &config,
+        home_dir,
         Arc::clone(&provider),
         &secret_store,
     );
@@ -3894,9 +3929,40 @@ async fn main() -> Result<()> {
             }
             fennec::onboard::run_wizard(&home_dir)?;
         }
-        Commands::Login => {
-            auth::run_oauth_login(&home_dir)?;
-        }
+        Commands::Login { provider, force } => match provider.as_str() {
+            "anthropic" => {
+                auth::run_oauth_login(&home_dir)?;
+            }
+            "gemini-cloudcode" | "google-cloudcode" | "gemini" | "google" => {
+                auth::google_oauth::run_google_login(&home_dir, force)?;
+                println!("Discovering your Gemini Code Assist project…");
+                match fennec::providers::gemini_cloudcode::ensure_project_context(&home_dir) {
+                    Ok(project) if !project.is_empty() => {
+                        println!("Signed in. Using project: {project}");
+                    }
+                    Ok(_) => {
+                        println!(
+                            "Signed in. No managed project was returned; set \
+                             FENNEC_GEMINI_PROJECT_ID or GOOGLE_CLOUD_PROJECT if requests fail."
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "Signed in, but project discovery failed: {e}\n\
+                             You can still try running; set FENNEC_GEMINI_PROJECT_ID if needed."
+                        );
+                    }
+                }
+                println!(
+                    "Set `provider.name = \"gemini-cloudcode\"` in your config to use it."
+                );
+            }
+            other => {
+                anyhow::bail!(
+                    "unknown login provider '{other}'. Use 'anthropic' or 'gemini-cloudcode'."
+                );
+            }
+        },
         Commands::Doctor => {
             run_doctor(&config, &home_dir).await?;
         }
@@ -4235,8 +4301,8 @@ async fn build_provider_for_curator(
             return Ok(None);
         }
     };
-    let primary: Arc<dyn Provider> = build_provider(config, api_key, None).into();
-    Ok(Some(build_auxiliary_client(config, primary, &secret_store)))
+    let primary: Arc<dyn Provider> = build_provider(config, home_dir, api_key, None).into();
+    Ok(Some(build_auxiliary_client(config, home_dir, primary, &secret_store)))
 }
 
 /// Run Fennec as an MCP server on stdio. Logs to stderr (stdout is
