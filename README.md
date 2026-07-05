@@ -112,6 +112,7 @@ both paths work.
 | Gemini (Cloud Code) | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
 | OpenAI Codex (Responses API) | SSE | `reasoning.effort` (gpt-5 / codex) |
 | Azure OpenAI / Foundry | chunked | `reasoning_effort` (o-series / gpt-5) |
+| AWS Bedrock | event-stream (Converse) | temperature fallback |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -145,6 +146,16 @@ otherwise it goes keyless via Microsoft Entra ID, either through
 `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` (service principal) or
 the Azure CLI (`az login`). Override `AZURE_OPENAI_API_VERSION` /
 `AZURE_OPENAI_SCOPE` if needed.
+
+**AWS Bedrock** (`provider.name = "bedrock"`) uses the Converse API with
+SigV4-signed requests — no AWS SDK dependency. Set `provider.model` to the
+Bedrock model or inference-profile id (e.g.
+`anthropic.claude-3-5-sonnet-20241022-v2:0` or `us.anthropic.claude-…`).
+Credentials resolve through a chain (env static keys → web-identity / EKS IRSA
+via `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` → named profile from
+`~/.aws/credentials` (`AWS_PROFILE`) → EC2/EKS instance role via IMDSv2); region
+from `AWS_REGION` / `AWS_DEFAULT_REGION` (default `us-east-1`). SSO /
+assume-role profiles are a follow-up.
 
 ## Tools
 
