@@ -115,10 +115,11 @@ enum Commands {
     },
     /// Authenticate via OAuth. Defaults to Anthropic; pass
     /// `--provider gemini-cloudcode` to sign in with Google for the Gemini
-    /// Cloud Code Assist free tier.
+    /// Cloud Code Assist free tier, or `--provider copilot` to sign in to
+    /// GitHub for the Copilot provider.
     Login {
-        /// Which provider to authenticate: `anthropic` (default) or
-        /// `gemini-cloudcode` (Google sign-in).
+        /// Which provider to authenticate: `anthropic` (default),
+        /// `gemini-cloudcode` (Google sign-in), or `copilot` (GitHub).
         #[arg(long, default_value = "anthropic")]
         provider: String,
         /// Force re-authentication even if valid credentials already exist.
@@ -226,6 +227,9 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         // Bedrock authenticates with AWS credentials (resolved by the provider
         // from env/IMDS), not a single API key.
         "bedrock" | "aws" => return Ok(String::new()),
+        // Copilot uses a GitHub OAuth token exchanged for a Copilot token by
+        // the provider — there's no single API key to read here.
+        "copilot" | "github-copilot" => return Ok(String::new()),
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -484,6 +488,12 @@ fn build_provider(
                 base_url,
                 None,
             ))
+        }
+        "copilot" | "github-copilot" => {
+            // OpenAI-compatible chat over api.githubcopilot.com; auth is a
+            // GitHub-token → Copilot-token exchange handled by the provider.
+            let _ = api_key; // Copilot uses a GitHub OAuth token, not the api_key.
+            Box::new(fennec::providers::CopilotProvider::new(Some(model), base_url, None))
         }
         "azure" | "foundry" => {
             // `model` is the Azure *deployment* name; base_url is the resource
@@ -4016,9 +4026,13 @@ async fn main() -> Result<()> {
                     "Set `provider.name = \"gemini-cloudcode\"` in your config to use it."
                 );
             }
+            "copilot" | "github-copilot" => {
+                auth::github_copilot::run_device_login()?;
+                println!("Signed in to GitHub. Set `provider.name = \"copilot\"` to use Copilot.");
+            }
             other => {
                 anyhow::bail!(
-                    "unknown login provider '{other}'. Use 'anthropic' or 'gemini-cloudcode'."
+                    "unknown login provider '{other}'. Use 'anthropic', 'gemini-cloudcode', or 'copilot'."
                 );
             }
         },

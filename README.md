@@ -80,7 +80,7 @@ overwrite.
 | `fennec agent` | Interactive chat session. `--message <text>` for single-shot. `--model <id>` to override. |
 | `fennec gateway` | Start the multi-channel server. Runs all configured channels, the HTTP gateway, the cron scheduler, and the heartbeat loop together. |
 | `fennec onboard` | Interactive setup wizard. `--force` overwrites an existing config. |
-| `fennec login` | Anthropic OAuth (PKCE) flow. Persists encrypted token. Alternative to setting `provider.api_key`. |
+| `fennec login` | OAuth flow. Default: Anthropic (PKCE). `--provider copilot` runs the GitHub device-code flow for the Copilot provider. |
 | `fennec doctor` | Self-diagnostic — verifies provider reachability, API key validity, memory DB schema, Plurum connectivity, skill loading, and channel config. |
 | `fennec status` | Print version and quick status. |
 
@@ -113,6 +113,7 @@ both paths work.
 | OpenAI Codex (Responses API) | SSE | `reasoning.effort` (gpt-5 / codex) |
 | Azure OpenAI / Foundry | chunked | `reasoning_effort` (o-series / gpt-5) |
 | AWS Bedrock | event-stream (Converse) | temperature fallback |
+| GitHub Copilot | chunked | `reasoning_effort` (per underlying model) |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -156,6 +157,13 @@ via `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` → named profile from
 `~/.aws/credentials` (`AWS_PROFILE`) → EC2/EKS instance role via IMDSv2); region
 from `AWS_REGION` / `AWS_DEFAULT_REGION` (default `us-east-1`). SSO /
 assume-role profiles are a follow-up.
+**GitHub Copilot** (`provider.name = "copilot"`) uses the OpenAI-compatible
+Copilot chat API. It needs a Copilot-enabled GitHub OAuth token (`gho_`/`ghu_`,
+not a classic PAT), resolved from `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` /
+`GITHUB_TOKEN`, then `gh auth token`, then a token saved by
+`fennec login --provider copilot` (GitHub device-code flow). The provider
+exchanges it for a short-lived Copilot token automatically. Set
+`provider.model` to a Copilot model id (`gpt-4o`, `o1`, `claude-3.5-sonnet`, …).
 
 ## Tools
 
