@@ -6,15 +6,27 @@ pub use jobs::{
 };
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::Utc;
 
 use crate::bus::{InboundMessage, MessageBus};
 
+/// Env var that lets ops cap the cron tick's parallelism without rebuilding.
+/// Set to a positive integer; `0`, missing, or unparseable values mean
+/// "unbounded" (every due job spawned at once). Matches the upstream's
+/// `HERMES_CRON_MAX_PARALLEL` knob.
+pub const MAX_PARALLEL_ENV: &str = "FENNEC_CRON_MAX_PARALLEL";
+
 pub struct CronScheduler {
     store: JobStore,
     bus: MessageBus,
     check_interval_secs: u64,
+    /// Optional concurrency cap for in-tick job publishes. `None` (the
+    /// default) means unbounded — every due job is spawned at once.
+    /// The env [`MAX_PARALLEL_ENV`] is read each tick and overrides
+    /// this; the field is the programmatic fallback.
+    max_parallel: Option<usize>,
 }
 
 impl CronScheduler {
@@ -27,7 +39,17 @@ impl CronScheduler {
             store,
             bus,
             check_interval_secs: check_interval_secs.unwrap_or(30),
+            max_parallel: None,
         }
+    }
+
+    /// Set the in-tick concurrency cap. `Some(1)` mimics the old
+    /// serial behavior; `None` (the default) is unbounded; `Some(n)`
+    /// caps via a [`tokio::sync::Semaphore`] so a tick with hundreds
+    /// of due jobs doesn't flood the bus or the agent consumers.
+    pub fn with_max_parallel(mut self, n: Option<usize>) -> Self {
+        self.max_parallel = n;
+        self
     }
 
     /// Run the scheduler loop. This blocks until the task is cancelled.
@@ -49,71 +71,217 @@ impl CronScheduler {
         }
     }
 
-    /// Execute a single scheduler tick: ask the store for all due jobs,
-    /// advance their `next_run_at` (at-most-once for recurring jobs),
-    /// publish each job's command to the bus, and mark the run.
+    /// Path to the cross-process tick lock. Lives next to `jobs.json` so
+    /// a single Fennec home means a single tick at a time, regardless of
+    /// how many processes (gateway, CLI, manual `tick`) try to run one.
+    fn tick_lock_path(&self) -> std::path::PathBuf {
+        let parent = self
+            .store
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        parent.join(".tick.lock")
+    }
+
+    /// Resolve the in-tick parallelism cap from env first, then the
+    /// programmatic [`with_max_parallel`] setting. Re-reading the env each
+    /// tick lets ops change the cap without restarting Fennec — matches
+    /// the upstream's behaviour for `HERMES_CRON_MAX_PARALLEL`.
+    fn resolve_max_parallel(&self) -> Option<usize> {
+        if let Ok(raw) = std::env::var(MAX_PARALLEL_ENV) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                match trimmed.parse::<usize>() {
+                    Ok(0) => return None, // explicit 0 = unbounded
+                    Ok(n) => return Some(n),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Invalid {} value '{}'; falling back to the configured cap",
+                            MAX_PARALLEL_ENV,
+                            raw
+                        );
+                    }
+                }
+            }
+        }
+        self.max_parallel
+    }
+
+    /// Execute a single scheduler tick.
     ///
-    /// The heavy lifting — recovery of missing `next_run_at`, stale
-    /// fast-forward, repeat counting, lifecycle state — lives in
-    /// [`JobStore`] so this loop stays thin and the same semantics work
-    /// for any future tick entry point (CLI, gateway, tests).
+    /// Flow:
+    /// 1. Acquire a cross-process exclusive file lock on `.tick.lock`.
+    ///    If another process / in-process call already holds it, skip
+    ///    this tick — duplicate ticks would re-fire jobs and clobber
+    ///    each other's `mark_job_run` writes.
+    /// 2. Ask the store for all due jobs (handles recovery + stale
+    ///    fast-forward).
+    /// 3. Pre-advance each recurring job's `next_run_at` so a crash
+    ///    between publish and mark loses one run rather than refiring
+    ///    on every restart — at-most-once semantics.
+    /// 4. Publish each job's command to the bus, in parallel (bounded
+    ///    by [`MAX_PARALLEL_ENV`] / [`with_max_parallel`] if set).
+    /// 5. Collect the per-job publish results and `mark_job_run`
+    ///    sequentially — keeps the store's writes serialized so
+    ///    concurrent `mark_job_run` calls can't clobber each other.
     pub async fn tick(&mut self) {
+        // Acquire the cross-process file lock. The lock is held for the
+        // duration of this tick (the `_lock_guard` keeps the File alive;
+        // drop releases the lock on Unix and Windows).
+        let _lock_guard = match self.acquire_tick_lock() {
+            Some(g) => g,
+            None => {
+                tracing::debug!("Cron tick skipped — another tick holds the lock");
+                return;
+            }
+        };
+
         let due_jobs = self.store.get_due_jobs();
         if due_jobs.is_empty() {
             return;
         }
 
-        for job in due_jobs {
-            // Pre-advance recurring jobs' next_run_at BEFORE we publish
-            // anything. If we crash between publish and mark_job_run, we
-            // lose one run instead of refiring on every restart —
-            // at-most-once semantics for recurring schedules.
+        // Pre-advance recurring jobs' next_run_at BEFORE we publish so a
+        // mid-publish crash doesn't refire them on restart. Sequential +
+        // cheap; runs under the file lock.
+        for job in &due_jobs {
             if let Err(e) = self.store.advance_next_run(&job.id) {
                 tracing::error!("Cron job '{}': advance_next_run failed: {}", job.id, e);
             }
+        }
 
-            let now = Utc::now();
-            let msg = InboundMessage {
-                id: uuid::Uuid::new_v4().to_string(),
-                sender: format!("cron:{}", job.id),
-                content: job.command.clone(),
-                channel: job
-                    .origin_channel
-                    .clone()
-                    .unwrap_or_else(|| "cron".to_string()),
-                chat_id: job
-                    .origin_chat_id
-                    .clone()
-                    .unwrap_or_else(|| format!("cron:{}", job.id)),
-                timestamp: now.timestamp() as u64,
-                reply_to: None,
-                metadata: {
-                    let mut m = HashMap::new();
-                    m.insert("source".to_string(), "cron".to_string());
-                    m.insert("cron_job_id".to_string(), job.id.clone());
-                    m
-                },
-            };
+        // Publish in parallel (capped, if configured). Bus publish is
+        // mpsc-channel send — concurrency mostly matters once downstream
+        // consumers do real work, but matches the upstream's parallel
+        // tick semantics and prevents head-of-line blocking when one
+        // consumer is slow.
+        let cap = self.resolve_max_parallel();
+        let sem = cap.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+        let bus = self.bus.clone();
 
-            let (success, err_msg) = match self.bus.publish_inbound(msg).await {
-                Ok(_) => (true, None),
-                Err(e) => {
-                    tracing::error!("Cron job '{}': failed to publish message: {}", job.id, e);
-                    (false, Some(e.to_string()))
+        let mut handles = Vec::with_capacity(due_jobs.len());
+        for job in due_jobs {
+            let bus = bus.clone();
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                // Hold the semaphore permit for the duration of the
+                // publish so the cap actually limits concurrent
+                // publishes (not just spawn rate).
+                let _permit = match sem {
+                    Some(s) => Some(s.acquire_owned().await.ok()),
+                    None => None,
+                };
+                let now = Utc::now();
+                let msg = InboundMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender: format!("cron:{}", job.id),
+                    content: job.command.clone(),
+                    channel: job
+                        .origin_channel
+                        .clone()
+                        .unwrap_or_else(|| "cron".to_string()),
+                    chat_id: job
+                        .origin_chat_id
+                        .clone()
+                        .unwrap_or_else(|| format!("cron:{}", job.id)),
+                    timestamp: now.timestamp() as u64,
+                    reply_to: None,
+                    metadata: {
+                        let mut m = HashMap::new();
+                        m.insert("source".to_string(), "cron".to_string());
+                        m.insert("cron_job_id".to_string(), job.id.clone());
+                        m
+                    },
+                };
+                let result = bus.publish_inbound(msg).await;
+                (job.id, result.err().map(|e| e.to_string()))
+            }));
+        }
+
+        // Collect results, then mark each run SEQUENTIALLY so concurrent
+        // `mark_job_run` writes can't clobber each other's JobStore
+        // mutations (it saves the whole store JSON per call).
+        for h in handles {
+            match h.await {
+                Ok((id, err_msg)) => {
+                    let success = err_msg.is_none();
+                    if let Some(ref err) = err_msg {
+                        tracing::error!("Cron job '{}': failed to publish message: {}", id, err);
+                    }
+                    if let Err(e) =
+                        self.store
+                            .mark_job_run(&id, success, err_msg.as_deref(), None)
+                    {
+                        tracing::error!("Cron job '{}': mark_job_run failed: {}", id, e);
+                    }
                 }
-            };
-
-            // mark_job_run handles last_run / last_status / last_error /
-            // last_delivery_error, repeat counting (+ auto-remove), and
-            // recomputes next_run_at + state. delivery_error is None for
-            // the bus-publish path — true remote-delivery error tracking
-            // arrives with the delivery system (later PR).
-            if let Err(e) =
-                self.store
-                    .mark_job_run(&job.id, success, err_msg.as_deref(), None)
-            {
-                tracing::error!("Cron job '{}': mark_job_run failed: {}", job.id, e);
+                Err(join_err) => {
+                    tracing::error!("Cron tick: publish task panicked: {}", join_err);
+                }
             }
+        }
+    }
+
+    /// Open and exclusively lock `.tick.lock` non-blocking. Returns a
+    /// `LockGuard` whose Drop releases the lock; `None` when another
+    /// process / call already holds it.
+    fn acquire_tick_lock(&self) -> Option<LockGuard> {
+        use fs2::FileExt;
+
+        let lock_path = self.tick_lock_path();
+        if let Some(parent) = lock_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(
+                    "Cron tick: failed to create lock dir {}: {}",
+                    parent.display(),
+                    e
+                );
+                return None;
+            }
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    "Cron tick: failed to open lock file {}: {}",
+                    lock_path.display(),
+                    e
+                );
+                return None;
+            }
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => Some(LockGuard { file: Some(file) }),
+            Err(_) => None,
+        }
+    }
+}
+
+/// RAII guard for the tick file lock. Drop releases the OS-level lock
+/// (`fs2` calls `unlock_file` on Windows / `fcntl LOCK_UN` on Unix
+/// when the file is closed). Stays in scope for the lifetime of one
+/// `tick()` call.
+struct LockGuard {
+    file: Option<std::fs::File>,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            // Explicit fs2 trait call: `File::unlock` is also a stdlib
+            // method since Rust 1.89, but the MSRV here is 1.87. Going
+            // through `fs2::FileExt::unlock` keeps the behaviour stable
+            // across both compilers. File closes on drop too, which
+            // also releases the lock — the explicit unlock is a
+            // belt-and-suspenders for the narrow window between unlock
+            // and close on platforms where Drop ordering matters.
+            let _ = fs2::FileExt::unlock(&file);
         }
     }
 }
@@ -437,6 +605,136 @@ mod tests {
 
         // Non-existent ref: Ok(false).
         assert!(!store.remove_by_ref("nope").unwrap());
+    }
+
+    #[tokio::test]
+    async fn parallel_tick_fires_all_due_jobs() {
+        // Five due jobs in one tick: every one should produce an
+        // inbound message regardless of publish ordering.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        for i in 0..5 {
+            store.add_job(job(
+                &format!("p{i}"),
+                "every 1m",
+                None,
+                Some(&past),
+            ));
+        }
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let mut got = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let m = rx
+                .inbound_rx
+                .try_recv()
+                .expect("expected 5 inbound messages from parallel tick");
+            got.insert(m.sender);
+        }
+        assert_eq!(got.len(), 5, "all 5 jobs should publish exactly once");
+        for i in 0..5 {
+            assert!(
+                got.contains(&format!("cron:p{i}")),
+                "missing fire for p{i}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn max_parallel_cap_does_not_drop_jobs() {
+        // Cap = 1 (serial publishes); 3 due jobs must all still fire,
+        // just one at a time via the semaphore.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        for i in 0..3 {
+            store.add_job(job(
+                &format!("c{i}"),
+                "every 1m",
+                None,
+                Some(&past),
+            ));
+        }
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler =
+            CronScheduler::new(store, bus, Some(30)).with_max_parallel(Some(1));
+        scheduler.tick().await;
+
+        for _ in 0..3 {
+            let _ = rx
+                .inbound_rx
+                .try_recv()
+                .expect("max_parallel cap must not drop jobs");
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_creates_lock_file() {
+        // The cross-process file lock lives at <store_dir>/.tick.lock.
+        // Verify it appears after the first tick so ops can see a single
+        // canonical lock location for diagnostics.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        store.add_job(job("j1", "every 1h", None, None));
+
+        let (bus, _rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        assert!(
+            tmp.path().join(".tick.lock").exists(),
+            ".tick.lock should be created at tick time"
+        );
+    }
+
+    #[test]
+    fn resolve_max_parallel_reads_env_first() {
+        // Env override wins over the programmatic setting.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(tmp.path().join("jobs.json"));
+        let (bus, _rx) = MessageBus::new(1);
+        let scheduler = CronScheduler::new(store, bus, Some(30)).with_max_parallel(Some(2));
+
+        // SAFETY: env mutation in tests is process-global; this test is
+        // intentionally narrow in scope and restores the env on exit.
+        let prev = std::env::var(MAX_PARALLEL_ENV).ok();
+        // SAFETY: single-threaded scope around env mutation; the
+        // restoration block below pairs every set with the original.
+        unsafe {
+            std::env::set_var(MAX_PARALLEL_ENV, "7");
+        }
+        assert_eq!(scheduler.resolve_max_parallel(), Some(7));
+
+        unsafe {
+            std::env::set_var(MAX_PARALLEL_ENV, "0");
+        }
+        assert_eq!(
+            scheduler.resolve_max_parallel(),
+            None,
+            "0 in env should mean unbounded"
+        );
+
+        unsafe {
+            std::env::remove_var(MAX_PARALLEL_ENV);
+        }
+        assert_eq!(
+            scheduler.resolve_max_parallel(),
+            Some(2),
+            "no env should fall back to programmatic setting"
+        );
+
+        // Restore original env.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(MAX_PARALLEL_ENV, v),
+                None => std::env::remove_var(MAX_PARALLEL_ENV),
+            }
+        }
     }
 
     #[cfg(unix)]
