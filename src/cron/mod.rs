@@ -2,10 +2,17 @@ pub mod jobs;
 pub use jobs::{parse_schedule, parse_schedule_kind, CronJob, JobStore, ScheduleKind};
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use chrono::Utc;
 
 use crate::bus::{InboundMessage, MessageBus};
+
+/// Grace window for one-shot timestamp jobs: a job scheduled for HH:MM
+/// still fires if the scheduler tick happens within this many seconds
+/// after the scheduled moment. Past that, the job is skipped as stale
+/// and disabled so the scheduler stops re-evaluating it every tick.
+const ONESHOT_GRACE_SECS: i64 = 120;
 
 pub struct CronScheduler {
     store: JobStore,
@@ -92,28 +99,101 @@ impl CronScheduler {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc));
 
-            if last_dt_opt.is_none() {
-                // Anchor and skip this tick.
-                if let Some(job) = self.store.get_mut(&id) {
-                    job.last_run = Some(now.to_rfc3339());
+            // Per-kind due-check + first-tick behavior.
+            //
+            // Recurring / OneShot / Cron all anchor-and-skip on first
+            // observation so a newly-created job doesn't fire on the very
+            // next tick ("every 24h" added at noon should fire ~24h later,
+            // not 30s later).
+            //
+            // AtTimestamp is different: it must fire at the scheduled
+            // wall-clock time regardless of when the job was created, and
+            // is allowed a small grace window to catch up if the scheduler
+            // tick lands slightly after the moment.
+            let (is_due, is_one_shot) = match &kind {
+                ScheduleKind::Recurring { interval_secs } => {
+                    let Some(last_dt) = last_dt_opt else {
+                        if let Some(job) = self.store.get_mut(&id) {
+                            job.last_run = Some(now.to_rfc3339());
+                        }
+                        dirty = true;
+                        continue;
+                    };
+                    let elapsed = now
+                        .signed_duration_since(last_dt)
+                        .num_seconds()
+                        .max(0) as u64;
+                    (elapsed >= *interval_secs, false)
                 }
-                dirty = true;
-                continue;
-            }
-            let last_dt = last_dt_opt.expect("just checked is_some");
-            let elapsed = now
-                .signed_duration_since(last_dt)
-                .num_seconds()
-                .max(0) as u64;
-
-            let (is_due, is_one_shot) = match kind {
-                ScheduleKind::Recurring { interval_secs } => (elapsed >= interval_secs, false),
                 ScheduleKind::OneShot { delay_secs } => {
-                    // For a one-shot, `last_run` is either None (anchor — not
-                    // reachable here) or Some(when-we-anchored). The
-                    // elapsed check against delay_secs gives the right
-                    // "delay from creation" semantics.
-                    (elapsed >= delay_secs, true)
+                    let Some(last_dt) = last_dt_opt else {
+                        if let Some(job) = self.store.get_mut(&id) {
+                            job.last_run = Some(now.to_rfc3339());
+                        }
+                        dirty = true;
+                        continue;
+                    };
+                    let elapsed = now
+                        .signed_duration_since(last_dt)
+                        .num_seconds()
+                        .max(0) as u64;
+                    (elapsed >= *delay_secs, true)
+                }
+                ScheduleKind::Cron(expr) => {
+                    let Some(last_dt) = last_dt_opt else {
+                        if let Some(job) = self.store.get_mut(&id) {
+                            job.last_run = Some(now.to_rfc3339());
+                        }
+                        dirty = true;
+                        continue;
+                    };
+                    let cron = match croner::Cron::from_str(expr) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Cron job '{}': invalid cron expression '{}': {}",
+                                id, expr, e
+                            );
+                            continue;
+                        }
+                    };
+                    match cron.find_next_occurrence(&last_dt, false) {
+                        Ok(next) => (now >= next, false),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Cron job '{}': failed to compute next occurrence for '{}': {}",
+                                id, expr, e
+                            );
+                            continue;
+                        }
+                    }
+                }
+                ScheduleKind::AtTimestamp(ts) => {
+                    // Already fired (last_run is set) — done.
+                    if last_dt_opt.is_some() {
+                        continue;
+                    }
+                    if *ts > now {
+                        // Not yet due — wait without anchoring so we
+                        // re-check on the next tick.
+                        continue;
+                    }
+                    if now.signed_duration_since(*ts).num_seconds() > ONESHOT_GRACE_SECS {
+                        // Stale (past the grace window) — mark handled +
+                        // disable so we stop re-evaluating it.
+                        tracing::warn!(
+                            "Cron job '{}': skipping stale one-shot scheduled for {} (more than {}s past due)",
+                            id, ts, ONESHOT_GRACE_SECS
+                        );
+                        if let Some(job) = self.store.get_mut(&id) {
+                            job.last_run = Some(now.to_rfc3339());
+                            job.enabled = false;
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                    // Within grace window — fire.
+                    (true, true)
                 }
             };
 

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,9 +8,14 @@ use serde::{Deserialize, Serialize};
 pub struct CronJob {
     pub id: String,
     pub name: String,
-    /// Schedule expression. Recurring: "every 30m", "every 1h", "every 24h",
-    /// "every 7d". Bare durations ("5m", "1h") are treated as one-shot
-    /// delays — fired once after the delay, then disabled.
+    /// Schedule expression. Supported formats:
+    /// - Recurring interval: `"every 30m"`, `"every 1h"`, `"every 24h"`, `"every 7d"`.
+    /// - One-shot duration:  bare `"5m"`, `"1h"`, `"30s"` — fires once after the delay.
+    /// - Cron expression:    standard 5- or 6-field syntax (`"0 9 * * 1-5"`,
+    ///   `"*/15 * * * *"`). Names (`MON`/`JAN`) and the `L`/`W`/`#` extensions
+    ///   are supported via the `croner` crate.
+    /// - Timestamp one-shot: ISO 8601 (`"2026-02-03T14:00"`, `"2026-02-03T14:00:00Z"`).
+    ///   Naive timestamps are interpreted as local time at parse time.
     pub schedule: String,
     /// Message to send to the agent when this job fires.
     pub command: String,
@@ -142,20 +148,42 @@ impl JobStore {
 /// so bare durations like `"5m"` re-fired on every scheduler tick after
 /// the first — because `elapsed >= interval` stayed true forever. The
 /// scheduler now uses this enum to enforce one-shot semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleKind {
-    /// "every Nu" — fire every interval_secs seconds.
+    /// `"every Nu"` — fire every `interval_secs` seconds.
     Recurring { interval_secs: u64 },
-    /// bare "Nu" — fire once, delay_secs after the job is scheduled.
+    /// Bare `"Nu"` — fire once, `delay_secs` after the job is scheduled.
     OneShot { delay_secs: u64 },
+    /// Standard cron expression (5 or 6 fields). The string is re-parsed
+    /// each tick via `croner::Cron::from_str` to compute the next
+    /// occurrence after `last_run`.
+    Cron(String),
+    /// Fire once at a specific UTC timestamp. Naive ISO timestamps from
+    /// the source string are interpreted as local time at parse time and
+    /// converted to UTC, so the stored value doesn't depend on the
+    /// system timezone at fire-check time.
+    AtTimestamp(chrono::DateTime<chrono::Utc>),
 }
 
 impl ScheduleKind {
+    /// Interval-equivalent seconds. Returns 0 for non-interval kinds
+    /// (cron, timestamp) — callers that need a "next fire in N seconds"
+    /// value for those must branch on the variant and compute it
+    /// directly (via croner or the stored timestamp).
     pub fn seconds(&self) -> u64 {
         match self {
             ScheduleKind::Recurring { interval_secs } => *interval_secs,
             ScheduleKind::OneShot { delay_secs } => *delay_secs,
+            ScheduleKind::Cron(_) | ScheduleKind::AtTimestamp(_) => 0,
         }
+    }
+
+    /// True if this kind fires at most once.
+    pub fn is_one_shot(&self) -> bool {
+        matches!(
+            self,
+            ScheduleKind::OneShot { .. } | ScheduleKind::AtTimestamp(_)
+        )
     }
 }
 
@@ -178,23 +206,53 @@ pub fn parse_schedule_kind(schedule: &str) -> Option<ScheduleKind> {
         return None;
     }
 
-    let (rest, recurring) = match trimmed.strip_prefix("every ") {
-        Some(r) => (r.trim(), true),
-        None => (trimmed, false),
-    };
-    if rest.is_empty() {
-        return None;
+    // 1. "every X" → Recurring interval.
+    if let Some(rest) = trimmed.strip_prefix("every ") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let seconds = parse_duration_seconds(rest)?;
+        return Some(ScheduleKind::Recurring {
+            interval_secs: seconds,
+        });
     }
 
-    let unit_pos = rest.find(|c: char| c.is_alphabetic())?;
-    let (num_str, unit) = rest.split_at(unit_pos);
+    // 2. 5- or 6-field cron expression — validated via croner so the parse
+    //    rejects malformed expressions up front instead of failing on a
+    //    later scheduler tick.
+    let field_count = trimmed.split_whitespace().count();
+    if (field_count == 5 || field_count == 6) && croner::Cron::from_str(trimmed).is_ok() {
+        return Some(ScheduleKind::Cron(trimmed.to_string()));
+    }
+
+    // 3. ISO 8601 timestamp ("2026-02-03T14:00", "2026-02-03 14:00:00",
+    //    "2026-02-03T14:00:00Z"). Timezone-aware variants parse via
+    //    RFC3339; naive variants are interpreted as local time then
+    //    converted to UTC, matching the upstream's pin-at-parse-time
+    //    behaviour.
+    if trimmed.contains('T') || looks_like_iso_date_prefix(trimmed) {
+        if let Some(ts) = parse_iso_timestamp(trimmed) {
+            return Some(ScheduleKind::AtTimestamp(ts));
+        }
+    }
+
+    // 4. Bare "Nu" → OneShot delay.
+    let seconds = parse_duration_seconds(trimmed)?;
+    Some(ScheduleKind::OneShot {
+        delay_secs: seconds,
+    })
+}
+
+/// Parse a duration token like `"30m"`, `"1h"`, `"7d"`, `"90s"` into
+/// seconds. Rejects zero (would busy-loop the scheduler) and overflow.
+fn parse_duration_seconds(s: &str) -> Option<u64> {
+    let unit_pos = s.find(|c: char| c.is_alphabetic())?;
+    let (num_str, unit) = s.split_at(unit_pos);
     let num: u64 = num_str.trim().parse().ok()?;
-    // Zero produces a busy-loop in the scheduler — elapsed is always
-    // >= 0, so the job would fire on every tick in a tight loop.
     if num == 0 {
         return None;
     }
-
     let multiplier: u64 = match unit.trim() {
         "s" => 1,
         "m" => 60,
@@ -202,20 +260,43 @@ pub fn parse_schedule_kind(schedule: &str) -> Option<ScheduleKind> {
         "d" => 86400,
         _ => return None,
     };
+    num.checked_mul(multiplier)
+}
 
-    // checked_mul — prevents u64 overflow panics in debug mode on
-    // absurd inputs like "every 9999999999999999d".
-    let seconds = num.checked_mul(multiplier)?;
+/// Cheap pre-filter for the timestamp branch: looks like `YYYY-MM-DD…`.
+/// The actual parse happens in `parse_iso_timestamp`.
+fn looks_like_iso_date_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
 
-    Some(if recurring {
-        ScheduleKind::Recurring {
-            interval_secs: seconds,
+fn parse_iso_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // RFC3339 / ISO 8601 with explicit timezone.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // Naive formats — pin to local at parse time so the stored UTC value
+    // doesn't drift if the system timezone changes before the fire check.
+    use chrono::TimeZone;
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return chrono::Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&chrono::Utc));
         }
-    } else {
-        ScheduleKind::OneShot {
-            delay_secs: seconds,
-        }
-    })
+    }
+    None
 }
 
 /// Back-compat wrapper: returns just the seconds, discarding the recurring
@@ -275,6 +356,78 @@ mod tests {
             parse_schedule_kind("30m"),
             Some(ScheduleKind::OneShot { delay_secs: 1800 })
         );
+    }
+
+    #[test]
+    fn parse_schedule_kind_recognises_cron_expression() {
+        // Standard 5-field cron — weekdays at 9am.
+        assert_eq!(
+            parse_schedule_kind("0 9 * * 1-5"),
+            Some(ScheduleKind::Cron("0 9 * * 1-5".to_string()))
+        );
+        // Step + wildcard.
+        assert_eq!(
+            parse_schedule_kind("*/15 * * * *"),
+            Some(ScheduleKind::Cron("*/15 * * * *".to_string()))
+        );
+        // 6-field cron (with seconds) — first of every month at midnight.
+        assert!(matches!(
+            parse_schedule_kind("0 0 0 1 * *"),
+            Some(ScheduleKind::Cron(_))
+        ));
+    }
+
+    #[test]
+    fn parse_schedule_kind_recognises_cron_with_extensions() {
+        // croner supports the Quartz/croniter `L` (last day of month) extension.
+        // We want parity with that.
+        assert!(matches!(
+            parse_schedule_kind("0 0 L * *"),
+            Some(ScheduleKind::Cron(_))
+        ));
+    }
+
+    #[test]
+    fn parse_schedule_kind_rejects_invalid_cron_falls_through_to_other_kinds() {
+        // "99 99 * * *" has 5 fields but is invalid (out-of-range). Without a
+        // duration/timestamp fallback match, it must return None — never
+        // accept-as-cron silently.
+        assert_eq!(parse_schedule_kind("99 99 * * *"), None);
+    }
+
+    #[test]
+    fn parse_schedule_kind_recognises_iso_timestamp() {
+        // RFC3339 with Z.
+        match parse_schedule_kind("2026-02-03T14:00:00Z") {
+            Some(ScheduleKind::AtTimestamp(dt)) => {
+                assert_eq!(dt.to_rfc3339(), "2026-02-03T14:00:00+00:00");
+            }
+            other => panic!("expected AtTimestamp, got {:?}", other),
+        }
+        // Naive ISO — parses as local time. We only assert the variant +
+        // round-trip, not a specific UTC value (depends on the test host TZ).
+        assert!(matches!(
+            parse_schedule_kind("2026-02-03T14:00"),
+            Some(ScheduleKind::AtTimestamp(_))
+        ));
+        assert!(matches!(
+            parse_schedule_kind("2026-02-03 14:00:00"),
+            Some(ScheduleKind::AtTimestamp(_))
+        ));
+    }
+
+    #[test]
+    fn schedule_kind_is_one_shot_classification() {
+        assert!(!ScheduleKind::Recurring { interval_secs: 60 }.is_one_shot());
+        assert!(ScheduleKind::OneShot { delay_secs: 60 }.is_one_shot());
+        assert!(!ScheduleKind::Cron("* * * * *".to_string()).is_one_shot());
+        assert!(ScheduleKind::AtTimestamp(chrono::Utc::now()).is_one_shot());
+    }
+
+    #[test]
+    fn seconds_returns_zero_for_non_interval_kinds() {
+        assert_eq!(ScheduleKind::Cron("* * * * *".to_string()).seconds(), 0);
+        assert_eq!(ScheduleKind::AtTimestamp(chrono::Utc::now()).seconds(), 0);
     }
 
     #[test]

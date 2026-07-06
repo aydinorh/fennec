@@ -53,6 +53,10 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Cron-expression parser + matcher. Matches the upstream's croniter-equivalent
+# grammar (standard 5/6-field, names, ranges, lists, steps, plus L/W/#
+# extensions) so cron-scheduled jobs work at parity with the reference agent.
+croner = "3"
 rand = "0.9"
 futures = "0.3"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
