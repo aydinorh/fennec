@@ -6,7 +6,9 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use fennec::memory::traits::{Memory, MemoryCategory, MemoryEntry};
-use fennec::providers::traits::{ChatRequest, ChatResponse, Provider, ToolCall, UsageInfo};
+use fennec::providers::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall, UsageInfo,
+};
 use fennec::tools::traits::{Tool, ToolResult};
 
 use fennec::agent::AgentBuilder;
@@ -22,6 +24,8 @@ struct MockProvider {
     /// Lets tests assert which calls advertised tools (e.g. the graceful
     /// max-iterations summary call must strip tools).
     tools_seen: Mutex<Vec<bool>>,
+    /// Reported context window. Small values let tests trigger auto-compaction.
+    ctx_window: usize,
 }
 
 impl MockProvider {
@@ -29,7 +33,14 @@ impl MockProvider {
         Self {
             responses: Mutex::new(responses),
             tools_seen: Mutex::new(Vec::new()),
+            ctx_window: 100_000,
         }
+    }
+
+    /// Override the reported context window (default 100_000).
+    fn with_context_window(mut self, ctx_window: usize) -> Self {
+        self.ctx_window = ctx_window;
+        self
     }
 
     /// Snapshot of whether each `chat` call so far advertised tools.
@@ -58,7 +69,7 @@ impl Provider for MockProvider {
     }
 
     fn context_window(&self) -> usize {
-        100_000
+        self.ctx_window
     }
 
     async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
@@ -494,4 +505,139 @@ async fn test_parallel_results_preserve_order() {
     // originating ids in order).
     let out = agent.turn("go").await.expect("turn should succeed");
     assert_eq!(out, "done");
+}
+
+// ---------------------------------------------------------------------------
+// Automatic context compaction
+// ---------------------------------------------------------------------------
+
+/// Build a multi-message history big enough to exceed a small context
+/// threshold and long enough for the compressor's middle block to be
+/// non-empty (> protect_first + protect_last).
+fn big_history() -> Vec<ChatMessage> {
+    (0..12)
+        .map(|i| {
+            let body = format!("conversation message number {i} with some filler text");
+            if i % 2 == 0 {
+                ChatMessage::user(body)
+            } else {
+                ChatMessage::assistant(body)
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_auto_compaction_triggers_over_threshold() {
+    // Two responses: the first is the compaction summary, the second is the
+    // turn's actual reply. If auto-compaction fires, it consumes the summary
+    // response and the turn returns the second ("done"). If it does NOT fire,
+    // the turn would consume the summary response first and return that.
+    let responses = vec![
+        ChatResponse {
+            content: Some("[SUMMARY]".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+    // Tiny context window so the loaded history is over the 50% threshold.
+    let provider = MockProvider::new(responses).with_context_window(40);
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .build()
+        .expect("agent build should succeed");
+
+    agent.replace_history(big_history());
+    let len_before = agent.history_len();
+
+    let result = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(
+        result, "done",
+        "auto-compaction should have consumed the summary response, leaving the turn to return 'done'"
+    );
+    assert!(
+        agent.history_len() < len_before,
+        "history should be smaller after compaction (was {len_before}, now {})",
+        agent.history_len()
+    );
+}
+
+#[tokio::test]
+async fn test_no_compaction_under_threshold() {
+    // Same setup, but a large context window keeps history under threshold, so
+    // compaction must NOT fire — the turn returns the first response.
+    let responses = vec![
+        ChatResponse {
+            content: Some("[SUMMARY]".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+    let provider = MockProvider::new(responses); // default 100_000-token window
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .build()
+        .expect("agent build should succeed");
+
+    agent.replace_history(big_history());
+
+    let result = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(
+        result, "[SUMMARY]",
+        "no compaction under threshold — the turn returns the first response unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_compaction_disabled_skips_compaction() {
+    // With compression disabled, even an over-threshold history must not
+    // compact: the turn returns the first response.
+    let responses = vec![
+        ChatResponse {
+            content: Some("[SUMMARY]".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+    let provider = MockProvider::new(responses).with_context_window(40);
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .compression_enabled(false)
+        .build()
+        .expect("agent build should succeed");
+
+    agent.replace_history(big_history());
+
+    let result = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(
+        result, "[SUMMARY]",
+        "compaction disabled — no compaction even over threshold"
+    );
 }

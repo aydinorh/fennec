@@ -10,6 +10,7 @@ use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider,
 use crate::security::prompt_guard::{PromptGuard, ScanResult};
 use crate::tools::traits::{Tool, ToolSpec};
 
+use super::compressor::ContextCompressor;
 use super::context::SystemPromptBuilder;
 use super::scrub;
 use super::thinking::{self, ThinkingLevel};
@@ -84,6 +85,16 @@ pub struct Agent {
     /// reply. Multiple steer calls concatenate with newlines.
     /// Mirrors `run_agent.py:4493-4527` + `:4545-4600`.
     pending_steer: Option<String>,
+    /// Automatic context compactor. Consulted at the top of each tool-loop
+    /// iteration: when the conversation exceeds the provider's context
+    /// threshold it summarises the middle of history in place, so long
+    /// multi-iteration turns don't grow past the model's window.
+    context_compressor: ContextCompressor,
+    /// Master switch for automatic compaction. When false, `maybe_compact`
+    /// is a no-op and history is never altered mid-turn (useful when an
+    /// operator wants strict prompt-cache stability and accepts the risk of
+    /// hitting the context limit on very long turns).
+    compression_enabled: bool,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
     max_tool_iterations: usize,
@@ -349,6 +360,9 @@ impl Agent {
             if self.is_interrupted() {
                 bail!("interrupted by user");
             }
+            // Auto-compact before the call so a long, tool-heavy turn can't
+            // grow history past the model's context window.
+            self.maybe_compact().await;
             self.callbacks.on_status("calling provider");
             let response = self.call_provider().await?;
             self.total_api_calls += 1;
@@ -644,6 +658,9 @@ impl Agent {
             if self.is_interrupted() {
                 bail!("interrupted by user");
             }
+            // Auto-compact before the call so a long, tool-heavy turn can't
+            // grow history past the model's context window.
+            self.maybe_compact().await;
             self.callbacks.on_status("calling provider");
 
             let enabled = self.enabled_tool_specs();
@@ -699,10 +716,7 @@ impl Agent {
                     }
                     StreamEvent::ToolCallEnd { id: _ } => {
                         if let Some((id, name, args)) = current_tool.take() {
-                            let arguments: serde_json::Value =
-                                serde_json::from_str(&args).unwrap_or_else(|_| {
-                                    serde_json::Value::Object(serde_json::Map::new())
-                                });
+                            let arguments = parse_streamed_tool_args(&name, &args);
                             tool_calls.push(ToolCall {
                                 id,
                                 name,
@@ -877,6 +891,53 @@ impl Agent {
         self.history.push(ChatMessage::assistant(&text));
         self.callbacks.on_turn_complete(&text);
         Ok(text)
+    }
+
+    /// Compact the conversation in place if it has grown past the context
+    /// threshold. Called at the top of each tool-loop iteration. No-op when
+    /// compaction is disabled, the provider reports no context window, or the
+    /// history is still under threshold. On a successful compaction the cached
+    /// system prompt is left untouched — compaction alters message history, not
+    /// the system prefix, so the provider's prompt cache stays valid.
+    async fn maybe_compact(&mut self) {
+        if !self.compression_enabled {
+            return;
+        }
+        let ctx_window = self.provider.context_window();
+        if ctx_window == 0 {
+            return;
+        }
+        if !self
+            .context_compressor
+            .should_compress(&self.history, ctx_window)
+        {
+            return;
+        }
+        let before = self.history.len();
+        // Own the compressor + provider handle so neither aliases the
+        // `&mut self.history` borrow during the summarisation call.
+        let compressor = self.context_compressor.clone();
+        let provider = Arc::clone(&self.provider);
+        match compressor
+            .compress(&mut self.history, provider.as_ref(), ctx_window)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    before_messages = before,
+                    after_messages = self.history.len(),
+                    "auto-compacted conversation context"
+                );
+                self.callbacks.on_status("compacted context");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // A compaction failure must never abort the turn — log it and
+                // continue with the uncompacted history (the provider call may
+                // still succeed, or surface its own context error).
+                tracing::warn!("context compaction failed: {e}");
+            }
+        }
     }
 
     /// Execute a batch of tool calls — concurrently when the batch is
@@ -1644,6 +1705,8 @@ pub struct AgentBuilder {
     auxiliary_client: Option<Arc<crate::providers::AuxiliaryClient>>,
     callbacks: Option<super::callbacks::CallbacksHandle>,
     interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    context_compressor: Option<ContextCompressor>,
+    compression_enabled: Option<bool>,
 }
 
 impl AgentBuilder {
@@ -1668,7 +1731,24 @@ impl AgentBuilder {
             auxiliary_client: None,
             callbacks: None,
             interrupt_flag: None,
+            context_compressor: None,
+            compression_enabled: None,
         }
+    }
+
+    /// Set the automatic context compactor. Defaults to
+    /// `ContextCompressor::default()` (compress at 50% of the context window)
+    /// when not supplied.
+    pub fn context_compressor(mut self, compressor: ContextCompressor) -> Self {
+        self.context_compressor = Some(compressor);
+        self
+    }
+
+    /// Enable or disable automatic mid-turn context compaction. Defaults to
+    /// `true`.
+    pub fn compression_enabled(mut self, enabled: bool) -> Self {
+        self.compression_enabled = Some(enabled);
+        self
     }
 
     /// Wire the resolved Fennec home directory.
@@ -1855,6 +1935,10 @@ impl AgentBuilder {
             tools: self.tools,
             tool_specs,
             disabled_tools: HashSet::new(),
+            context_compressor: self
+                .context_compressor
+                .unwrap_or_default(),
+            compression_enabled: self.compression_enabled.unwrap_or(true),
             pending_attachments: Vec::new(),
             pending_steer: None,
             memory,
@@ -1925,6 +2009,23 @@ async fn run_tool_call(
     with_hooks: bool,
 ) -> (String, bool, std::time::Duration) {
     let started = std::time::Instant::now();
+
+    // `Null` arguments are the sentinel for "the provider sent argument
+    // JSON that did not parse" (truncated stream, malformed output — see
+    // `parse_streamed_tool_args` and the providers' non-streaming
+    // parsers). Executing anyway would run the tool with arguments the
+    // model never chose; surface a retryable error instead.
+    if args.is_null() {
+        return (
+            format!(
+                "Error: the arguments for tool '{name}' were not valid JSON \
+                 (the stream may have been truncated). The call was NOT \
+                 executed — re-issue it with complete arguments."
+            ),
+            false,
+            started.elapsed(),
+        );
+    }
 
     // Plugin pre-tool hook: may skip the call or rewrite the arguments.
     let effective_args = if with_hooks {
@@ -2023,6 +2124,63 @@ fn truncate_summary(s: &str) -> String {
         let mut out: String = single_line.chars().take(MAX - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// Parse the accumulated argument buffer of a streamed tool call.
+///
+/// - Empty buffer → `{}`: providers legitimately send no argument deltas
+///   for parameter-less tools.
+/// - Valid JSON → parsed as-is.
+/// - Non-empty but unparseable (truncated stream, malformed provider
+///   output) → `Value::Null`, the sentinel `run_tool_call` refuses to run.
+///   The old behavior coerced this case to `{}` and executed the tool
+///   with arguments the model never chose.
+fn parse_streamed_tool_args(name: &str, buf: &str) -> serde_json::Value {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "streamed tool-call '{}' arguments did not parse ({}); \
+                 marking the call malformed instead of executing with empty args",
+                name,
+                e
+            );
+            serde_json::Value::Null
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_arg_tests {
+    use super::parse_streamed_tool_args;
+
+    #[test]
+    fn empty_buffer_is_valid_no_arg_call() {
+        let v = parse_streamed_tool_args("noop", "");
+        assert!(v.as_object().is_some_and(|m| m.is_empty()));
+        let v = parse_streamed_tool_args("noop", "   ");
+        assert!(v.as_object().is_some_and(|m| m.is_empty()));
+    }
+
+    #[test]
+    fn valid_json_parses() {
+        let v = parse_streamed_tool_args("shell", r#"{"command": "ls"}"#);
+        assert_eq!(v["command"], "ls");
+    }
+
+    #[test]
+    fn truncated_json_becomes_null_sentinel() {
+        // A stream cut mid-arguments must NOT become {} (which would
+        // execute the tool with args the model never chose).
+        let v = parse_streamed_tool_args("write_file", r#"{"path": "/tmp/x", "conte"#);
+        assert!(v.is_null());
+        let v = parse_streamed_tool_args("shell", "not json at all");
+        assert!(v.is_null());
     }
 }
 

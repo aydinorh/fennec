@@ -633,6 +633,7 @@ command_timeout_secs = 60
 [agent]
 max_tool_iterations = 90
 context_window = 200000
+compression_enabled = true
 
 [channels.telegram]
 enabled = {telegram_enabled}
