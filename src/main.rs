@@ -3645,10 +3645,42 @@ async fn run_gateway(
         )
         .filter(|t| !t.is_empty())
         {
+            // Pairing flow: a fresh 6-digit code each gateway boot lets
+            // a new user pair by DM-ing the code, instead of editing
+            // allowed_users in config. Paired users persist across
+            // restarts (pairing.json, 0600). 5 wrong codes → lockout.
+            let pairing = {
+                let mut guard =
+                    fennec::security::PairingGuard::new(Some(home_dir.join("pairing.json")));
+                let code = guard.generate_code();
+                // Surface the code on stdout, not just via tracing. The
+                // operator MUST see it to share it out-of-band — but the
+                // default tracing filter (EnvFilter with RUST_LOG unset)
+                // drops everything below ERROR, so a `tracing::info!` line
+                // is invisible in a normal `fennec gateway` run and the
+                // pairing flow becomes unusable. A plain stdout banner is
+                // reliable on both an interactive console and under
+                // systemd (journald captures stdout regardless of
+                // RUST_LOG). The tracing line is kept for structured-log
+                // capture when INFO logging is explicitly enabled.
+                println!(
+                    "\n┌─ Telegram pairing ────────────────────────────────────────┐\n\
+                     │  Pairing code for this session: {code}\n\
+                     │  Share it out-of-band with anyone who should DM the bot.\n\
+                     │  A new code is generated each time the gateway starts.\n\
+                     └───────────────────────────────────────────────────────────┘\n"
+                );
+                tracing::info!(
+                    "Telegram pairing code for this session: {code} — share it \
+                     out-of-band with anyone who should be able to DM the bot."
+                );
+                Arc::new(parking_lot::Mutex::new(guard))
+            };
             let ch = fennec::channels::TelegramChannel::new(
                 token,
                 ch_config.telegram.allowed_users.clone(),
-            );
+            )
+            .with_pairing(pairing);
             channels.push(Arc::new(ch));
             tracing::info!("Telegram channel enabled");
         }
