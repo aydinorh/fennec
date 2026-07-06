@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str_resolved};
 use crate::security::PathSandbox;
 
 use super::traits::{Tool, ToolResult};
@@ -54,7 +54,7 @@ impl PdfReadTool {
     /// Returns (path, is_temp) — caller deletes the file when is_temp=true.
     async fn resolve_to_local(&self, source: &str) -> Result<(PathBuf, bool)> {
         if source.starts_with("http://") || source.starts_with("https://") {
-            validate_url_str(source)?;
+            validate_url_str_resolved(source).await?;
             tokio::fs::create_dir_all(&self.temp_dir).await?;
             let resp = self.client.get(source).send().await?;
             if !resp.status().is_success() {

@@ -17,17 +17,27 @@
 //!   so a hostile server returning 10 GB OOM'd the process before the cap
 //!   ever ran.
 //!
-//! **Known limitation**: this does *not* resolve DNS before the request, so a
-//! hostile domain whose A record points to a private IP is not caught at the
-//! static-host level (reqwest will connect, though the custom redirect policy
-//! still re-validates redirected URLs). A resolver-level guard is a
-//! follow-up — see the Tier-2 notes.
+//! - [`validate_url_str_resolved`] — everything `validate_url` does PLUS a
+//!   DNS resolution check: domain hosts are resolved and every returned
+//!   address is re-validated, so a hostile domain whose A record points at
+//!   a private IP is caught before any connection is made. URL-accepting
+//!   tools should prefer this (they're all async).
+//!
+//! **Known limitation**: the resolve-then-connect sequence is not atomic — a
+//! DNS rebinding attacker who flips the record between our lookup and
+//! reqwest's own lookup can still slip through. Closing that fully requires
+//! pinning the resolved address into the connector; follow-up noted in the
+//! plan. The pre-resolve check still removes the entire static-DNS attack
+//! class.
 //!
 //! **Opt-out**: users who need the agent to reach loopback / private services
 //! (e.g. a local Ollama or an internal API on their LAN) can set
 //! `FENNEC_ALLOW_PRIVATE_URLS=1` in the env. The override is intentionally a
 //! process-global switch rather than per-tool config because it's a blunt
-//! security posture decision.
+//! security posture decision. The override does NOT unblock cloud-metadata
+//! endpoints (IMDS, metadata.google.internal): leaking instance credentials
+//! is never what "let me reach my LAN" means, so those stay on an
+//! always-blocked floor.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
@@ -66,6 +76,15 @@ pub fn validate_url(url: &Url) -> Result<()> {
         .host()
         .ok_or_else(|| anyhow!("URL missing host: {}", url))?;
 
+    // Cloud-metadata floor: ALWAYS blocked, even with the private-URL
+    // override. The override exists for "reach my LAN/loopback", never
+    // for "hand instance credentials to the model".
+    match &host {
+        url::Host::Ipv4(ip) => check_metadata_floor_ip(IpAddr::V4(*ip))?,
+        url::Host::Ipv6(ip) => check_metadata_floor_ip(IpAddr::V6(*ip))?,
+        url::Host::Domain(name) => check_metadata_floor_domain(name)?,
+    }
+
     if private_urls_allowed() {
         return Ok(());
     }
@@ -74,6 +93,85 @@ pub fn validate_url(url: &Url) -> Result<()> {
         url::Host::Ipv4(ip) => check_ipv4(ip)?,
         url::Host::Ipv6(ip) => check_ipv6(ip)?,
         url::Host::Domain(name) => check_domain(name)?,
+    }
+    Ok(())
+}
+
+/// Validate a URL string INCLUDING a DNS-resolution check for domain
+/// hosts: every address the name resolves to is run through the same
+/// IP checks (and the metadata floor), so a domain whose A/AAAA record
+/// points at a private or metadata address is rejected before any
+/// connection. IP-literal hosts skip the lookup.
+pub async fn validate_url_str_resolved(url: &str) -> Result<Url> {
+    let parsed = validate_url_str(url)?;
+    validate_resolved_addrs(&parsed).await?;
+    Ok(parsed)
+}
+
+/// DNS half of [`validate_url_str_resolved`]. Domain hosts are resolved
+/// via the system resolver; resolution failure is an error (the request
+/// would fail anyway, and silently skipping the check would let a
+/// flaky-then-poisoned resolver bypass it).
+async fn validate_resolved_addrs(url: &Url) -> Result<()> {
+    let Some(url::Host::Domain(name)) = url.host() else {
+        return Ok(()); // IP literal — already fully checked statically.
+    };
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((name, port))
+        .await
+        .with_context(|| format!("could not resolve host '{}'", name))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("host '{}' resolved to no addresses", name);
+    }
+    let allow_private = private_urls_allowed();
+    for addr in addrs {
+        let ip = addr.ip();
+        // Metadata floor applies even with the private-URL override.
+        check_metadata_floor_ip(ip)
+            .with_context(|| format!("host '{}' resolves to {}", name, ip))?;
+        if allow_private {
+            continue;
+        }
+        let check = match ip {
+            IpAddr::V4(v4) => check_ipv4(v4),
+            IpAddr::V6(v6) => check_ipv6(v6),
+        };
+        check.with_context(|| format!("host '{}' resolves to {}", name, ip))?;
+    }
+    Ok(())
+}
+
+/// Cloud-metadata addresses that stay blocked regardless of the
+/// private-URL override: AWS/GCP/Azure IMDS (169.254.169.254), the AWS
+/// IPv6 IMDS endpoint, and their IPv4-mapped forms.
+fn check_metadata_floor_ip(ip: IpAddr) -> Result<()> {
+    const IMDS_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+    // fd00:ec2::254 — AWS IMDS over IPv6.
+    const IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254);
+    let blocked = match ip {
+        IpAddr::V4(v4) => v4 == IMDS_V4,
+        IpAddr::V6(v6) => v6 == IMDS_V6 || v6.to_ipv4_mapped() == Some(IMDS_V4),
+    };
+    if blocked {
+        bail!(
+            "URL targets a cloud instance-metadata endpoint ({}) — always blocked, the private-URL override does not apply",
+            ip
+        );
+    }
+    Ok(())
+}
+
+/// Hostname aliases for cloud metadata services — same always-blocked
+/// floor as [`check_metadata_floor_ip`].
+fn check_metadata_floor_domain(name: &str) -> Result<()> {
+    let lower = name.to_lowercase();
+    const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.goog", "metadata"];
+    if METADATA_HOSTS.iter().any(|h| lower == *h) {
+        bail!(
+            "URL targets a cloud instance-metadata host ({}) — always blocked, the private-URL override does not apply",
+            name
+        );
     }
     Ok(())
 }
@@ -405,12 +503,15 @@ mod tests {
     #[test]
     fn rejection_messages_mention_override_env() {
         with_default_env(|| {
+            // NB: 169.254.169.254 is NOT in this list — IMDS now gets the
+            // metadata-floor message, which deliberately does NOT suggest
+            // the override (see metadata_floor_error_does_not_suggest_override).
             let cases = [
                 "http://127.0.0.1/",
                 "http://192.168.1.1/",
                 "http://localhost/",
                 "http://[fc00::1]/",
-                "http://169.254.169.254/",
+                "http://169.254.0.1/",
             ];
             for url in cases {
                 let err = validate_url_str(url).unwrap_err().to_string();
@@ -430,6 +531,67 @@ mod tests {
             validate_url_str("http://127.0.0.1:8080/").unwrap();
             validate_url_str("http://localhost/").unwrap();
         });
+    }
+
+    /// The private-URL override exists for "reach my LAN/loopback" — it
+    /// must NOT unblock cloud instance-metadata endpoints, which leak
+    /// instance credentials.
+    #[test]
+    fn env_override_does_not_unblock_metadata_floor() {
+        with_override("1", || {
+            // IMDS IPv4, AWS IMDS IPv6, IPv4-mapped form, and hostname aliases.
+            assert!(validate_url_str("http://169.254.169.254/latest/meta-data/").is_err());
+            assert!(validate_url_str("http://[fd00:ec2::254]/").is_err());
+            assert!(validate_url_str("http://[::ffff:169.254.169.254]/").is_err());
+            assert!(validate_url_str("http://metadata.google.internal/computeMetadata/").is_err());
+            assert!(validate_url_str("http://metadata.goog/").is_err());
+            assert!(validate_url_str("http://metadata/").is_err());
+        });
+    }
+
+    #[test]
+    fn metadata_floor_error_does_not_suggest_override() {
+        with_default_env(|| {
+            let err = validate_url_str("http://169.254.169.254/")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("always blocked"),
+                "floor error must say the override doesn't apply: {err}"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn resolved_validation_passes_ip_literals_without_dns() {
+        with_default_env(|| {});
+        // Public IP literal: no DNS lookup involved, passes statically.
+        validate_url_str_resolved("http://93.184.216.34/").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolved_validation_blocks_domains_resolving_private() {
+        // localtest.me publicly resolves to 127.0.0.1 — the classic
+        // DNS-based SSRF vector the static check can't see. Skip
+        // gracefully when offline (resolution failure is an error too,
+        // but a DIFFERENT one; only assert when resolution succeeded).
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(OVERRIDE_ENV);
+        }
+        match validate_url_str_resolved("http://localtest.me/").await {
+            Err(e) => {
+                let msg = e.to_string();
+                // Either blocked (resolved to loopback) or unresolvable
+                // (offline) — both are rejections; only the blocked case
+                // proves the DNS check, but offline must not fail CI.
+                assert!(
+                    msg.contains("resolves to") || msg.contains("could not resolve"),
+                    "unexpected error shape: {msg}"
+                );
+            }
+            Ok(_) => panic!("localtest.me must not validate (resolves to 127.0.0.1)"),
+        }
     }
 
     #[test]
