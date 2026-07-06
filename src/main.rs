@@ -3733,12 +3733,126 @@ async fn run_gateway(
                         // Stop typing indicator.
                         typing_handle.abort();
 
-                        // If the response starts with "[SILENT]", the agent
-                        // decided nothing needs to be said — skip outbound.
-                        if response.starts_with("[SILENT]") {
+                        // Silent marker: agent (or no_agent script) says
+                        // "nothing to report" — skip delivery. Case-
+                        // insensitive containment matches the upstream's
+                        // `SILENT_MARKER in resp.upper()` semantics.
+                        if fennec::cron::delivery::is_silent_response(&response) {
                             tracing::debug!(
                                 "Agent response marked [SILENT], suppressing outbound"
                             );
+                            continue;
+                        }
+
+                        // Cron-sourced messages route through the cron
+                        // delivery system: local/origin/platform/all
+                        // fan-out + optional response wrap. Done BEFORE
+                        // the streaming-channel branch because cron is a
+                        // batched delivery (matches the upstream's
+                        // non-streaming `_deliver_result` path) and a
+                        // multi-target tick can't sensibly stream.
+                        let is_cron = msg
+                            .metadata
+                            .get("source")
+                            .map(|s| s.as_str())
+                            == Some("cron");
+                        if is_cron {
+                            // local: agent ran (so we recorded a turn)
+                            // but no outbound is sent.
+                            if msg
+                                .metadata
+                                .get("cron_no_deliver")
+                                .map(|s| s.as_str())
+                                == Some("1")
+                            {
+                                tracing::debug!(
+                                    "Cron job '{}': deliver=local, no outbound",
+                                    msg.metadata
+                                        .get("cron_job_id")
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("?")
+                                );
+                                continue;
+                            }
+
+                            // Optional cron header/footer wrap so users
+                            // on busy channels can tell which scheduled
+                            // task spoke.
+                            let final_content = if msg
+                                .metadata
+                                .get("cron_wrap_response")
+                                .map(|s| s.as_str())
+                                == Some("1")
+                            {
+                                let job_name = msg
+                                    .metadata
+                                    .get("cron_job_name")
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("cron job");
+                                let job_id = msg
+                                    .metadata
+                                    .get("cron_job_id")
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                fennec::cron::delivery::wrap_response(
+                                    &response, job_name, job_id,
+                                )
+                            } else {
+                                response.clone()
+                            };
+
+                            // Fan-out targets: either the explicit
+                            // multi-target list from
+                            // `cron_deliver_targets`, or the implicit
+                            // single target from msg.channel +
+                            // msg.chat_id (+ optional thread).
+                            let targets: Vec<
+                                fennec::cron::delivery::DeliveryTarget,
+                            > = match msg.metadata.get("cron_deliver_targets") {
+                                Some(encoded) => {
+                                    fennec::cron::delivery::decode_targets(
+                                        encoded,
+                                    )
+                                }
+                                None => vec![
+                                    fennec::cron::delivery::DeliveryTarget {
+                                        platform: msg.channel.clone(),
+                                        chat_id: msg.chat_id.clone(),
+                                        thread_id: msg
+                                            .metadata
+                                            .get("cron_deliver_thread_id")
+                                            .cloned(),
+                                    },
+                                ],
+                            };
+
+                            for target in targets {
+                                let mut out_meta =
+                                    std::collections::HashMap::new();
+                                if let Some(thread) = &target.thread_id {
+                                    out_meta.insert(
+                                        "thread_id".to_string(),
+                                        thread.clone(),
+                                    );
+                                }
+                                let outbound = fennec::bus::OutboundMessage {
+                                    content: final_content.clone(),
+                                    channel: target.platform.clone(),
+                                    chat_id: target.chat_id.clone(),
+                                    reply_to: Some(msg.id.clone()),
+                                    metadata: out_meta,
+                                    attachments: Vec::new(),
+                                };
+                                if let Err(e) =
+                                    bus.publish_outbound(outbound).await
+                                {
+                                    tracing::error!(
+                                        "Cron outbound to {}:{} failed: {e}",
+                                        target.platform,
+                                        target.chat_id
+                                    );
+                                }
+                            }
                             continue;
                         }
 

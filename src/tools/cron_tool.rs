@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 
+use crate::cron::delivery;
 use crate::cron::jobs::{
     compute_next_run, parse_schedule_kind, schedule_display_for, CronJob, JobStore, RepeatConfig,
 };
@@ -166,6 +167,18 @@ impl CronTool {
             enabled_toolsets: None,
             workdir: None,
             profile: None,
+            // Default delivery: `"origin"` when the job has an origin
+            // (created via a chat platform), `"local"` otherwise.
+            // Matches upstream's `deliver = "origin" if origin else
+            // "local"` create-time default.
+            deliver: {
+                let origin_ref = origin.as_ref().map(|o| delivery::JobOrigin {
+                    channel: o.channel.as_str(),
+                    chat_id: o.chat_id.as_str(),
+                });
+                delivery::default_deliver_for(origin_ref.as_ref()).to_string()
+            },
+            wrap_response: None,
         };
 
         let mut store = self.load_store()?;

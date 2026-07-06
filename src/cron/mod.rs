@@ -1,3 +1,4 @@
+pub mod delivery;
 pub mod jobs;
 pub mod output;
 pub mod script;
@@ -454,34 +455,91 @@ async fn process_due_job(
         return (job_id, true, None);
     }
 
-    // 6b. Agent path: publish the composite prompt to the bus.
+    // 6b. Agent path: resolve delivery targets, then publish the
+    // composite prompt to the bus.
     //
-    // Per-job overrides (model / provider / base_url / enabled_toolsets
-    // / workdir / profile) ride along in the message metadata under
-    // `cron_override_<field>` keys. Downstream agent consumers can read
-    // them to reconfigure the agent per-message — Fennec's current
-    // gateway loop uses a shared `Arc<Mutex<Agent>>` and doesn't honour
-    // these yet (cross-subsystem follow-up), but the data is in place
-    // so wiring it is a read-from-metadata change rather than a
-    // protocol change.
+    // The `deliver` field (parsed by `delivery::parse_deliver`) picks
+    // where the agent's response goes:
+    //   - empty list (`local`) → publish with `cron_no_deliver=1` so
+    //     the agent runs but downstream skips outbound delivery;
+    //   - single target → set `channel`/`chat_id` from the target;
+    //   - multi-target (`all`, comma-list) → put the encoded list in
+    //     `cron_deliver_targets` metadata for downstream fan-out.
+    //
+    // Per-job overrides ride under `cron_override_<field>` keys.
+    // `cron_wrap_response=1` opts into the cron header/footer.
+    let origin = match (&job.origin_channel, &job.origin_chat_id) {
+        (Some(ch), Some(cid)) if !ch.is_empty() && !cid.is_empty() => {
+            Some(delivery::JobOrigin {
+                channel: ch.as_str(),
+                chat_id: cid.as_str(),
+            })
+        }
+        _ => None,
+    };
+    let deliver_token = if job.deliver.is_empty() {
+        delivery::default_deliver_for(origin.as_ref()).to_string()
+    } else {
+        job.deliver.clone()
+    };
+    let targets = delivery::parse_deliver(&deliver_token, origin.as_ref());
+
+    let (channel, chat_id, encoded_targets, no_deliver) = if targets.is_empty() {
+        // `local` (or unresolved): still publish so the agent can
+        // run + produce a response we record, but signal "no outbound".
+        let ch = job
+            .origin_channel
+            .clone()
+            .unwrap_or_else(|| "cron".to_string());
+        let cid = job
+            .origin_chat_id
+            .clone()
+            .unwrap_or_else(|| format!("cron:{}", job_id));
+        (ch, cid, None, true)
+    } else if targets.len() == 1 {
+        let t = &targets[0];
+        (t.platform.clone(), t.chat_id.clone(), None, false)
+    } else {
+        let primary = &targets[0];
+        let encoded = delivery::encode_targets(&targets);
+        (primary.platform.clone(), primary.chat_id.clone(), Some(encoded), false)
+    };
+
+    // Default wrap behaviour: on. Matches the upstream's config.yaml
+    // default (`cron.wrap_response: true`); per-job `wrap_response`
+    // overrides it.
+    let wrap = job.wrap_response.unwrap_or(true);
+
     let msg = InboundMessage {
         id: uuid::Uuid::new_v4().to_string(),
         sender: format!("cron:{}", job_id),
         content: prompt,
-        channel: job
-            .origin_channel
-            .clone()
-            .unwrap_or_else(|| "cron".to_string()),
-        chat_id: job
-            .origin_chat_id
-            .clone()
-            .unwrap_or_else(|| format!("cron:{}", job_id)),
+        channel,
+        chat_id,
         timestamp: now.timestamp() as u64,
         reply_to: None,
         metadata: {
             let mut m = HashMap::new();
             m.insert("source".to_string(), "cron".to_string());
             m.insert("cron_job_id".to_string(), job_id.clone());
+            m.insert("cron_job_name".to_string(), job.name.clone());
+            if no_deliver {
+                m.insert("cron_no_deliver".to_string(), "1".to_string());
+            }
+            if let Some(encoded) = encoded_targets {
+                m.insert("cron_deliver_targets".to_string(), encoded);
+            }
+            // Primary target's thread_id (Telegram topics, etc.) — when
+            // the single-target path is used, downstream needs this to
+            // land the reply in the right thread.
+            if let Some(primary) = targets.first() {
+                if let Some(thread) = &primary.thread_id {
+                    m.insert("cron_deliver_thread_id".to_string(), thread.clone());
+                }
+            }
+            if wrap {
+                m.insert("cron_wrap_response".to_string(), "1".to_string());
+            }
             if let Some(model) = &job.model {
                 m.insert("cron_override_model".to_string(), model.clone());
             }
@@ -492,9 +550,6 @@ async fn process_due_job(
                 m.insert("cron_override_base_url".to_string(), base_url.clone());
             }
             if let Some(toolsets) = &job.enabled_toolsets {
-                // Comma-joined — agents that consume this should split
-                // on `,` and trim. Matches the upstream's habit of
-                // serialising small lists through env vars.
                 m.insert(
                     "cron_override_enabled_toolsets".to_string(),
                     toolsets.join(","),
@@ -557,6 +612,8 @@ mod tests {
             enabled_toolsets: None,
             workdir: None,
             profile: None,
+            deliver: String::new(),
+            wrap_response: None,
         }
     }
 
@@ -1212,6 +1269,134 @@ mod tests {
                 "metadata must not contain {key} for a job that didn't set it"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deliver_local_publishes_with_no_deliver_flag() {
+        // A cron job with `deliver=local` still publishes (so the agent
+        // can run + we record a turn), but the metadata signals
+        // downstream to skip outbound. The wrap flag is still set so a
+        // future delivery PR can rely on it consistently.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("loc", "every 1m", None, Some(&past));
+        j.deliver = "local".to_string();
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("local still publishes inbound");
+        assert_eq!(
+            msg.metadata.get("cron_no_deliver").map(|s| s.as_str()),
+            Some("1"),
+            "metadata should carry the no-deliver flag for local jobs"
+        );
+        assert!(
+            !msg.metadata.contains_key("cron_deliver_targets"),
+            "local must not emit a deliver_targets list"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_origin_uses_origin_channel_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("orig", "every 1m", None, Some(&past));
+        j.origin_channel = Some("telegram".to_string());
+        j.origin_chat_id = Some("123".to_string());
+        j.deliver = "origin".to_string();
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("publishes");
+        assert_eq!(msg.channel, "telegram");
+        assert_eq!(msg.chat_id, "123");
+        assert!(!msg.metadata.contains_key("cron_no_deliver"));
+        assert!(!msg.metadata.contains_key("cron_deliver_targets"));
+        assert_eq!(
+            msg.metadata.get("cron_wrap_response").map(|s| s.as_str()),
+            Some("1"),
+            "wrap defaults to on"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_explicit_target_overrides_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("explicit", "every 1m", None, Some(&past));
+        j.origin_channel = Some("telegram".to_string());
+        j.origin_chat_id = Some("123".to_string());
+        j.deliver = "discord:9000:42".to_string();
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("publishes");
+        assert_eq!(msg.channel, "discord");
+        assert_eq!(msg.chat_id, "9000");
+        assert_eq!(
+            msg.metadata.get("cron_deliver_thread_id").map(|s| s.as_str()),
+            Some("42")
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_multi_target_lists_in_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("multi", "every 1m", None, Some(&past));
+        j.deliver = "telegram:111,discord:222".to_string();
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("publishes");
+        // Primary target = first one.
+        assert_eq!(msg.channel, "telegram");
+        assert_eq!(msg.chat_id, "111");
+        // Full encoded list in metadata for downstream fan-out.
+        assert_eq!(
+            msg.metadata
+                .get("cron_deliver_targets")
+                .map(|s| s.as_str()),
+            Some("telegram:111,discord:222")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_response_opt_out_via_per_job_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("nowrap", "every 1m", None, Some(&past));
+        j.origin_channel = Some("cli".to_string());
+        j.origin_chat_id = Some("term".to_string());
+        j.wrap_response = Some(false);
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("publishes");
+        assert!(
+            !msg.metadata.contains_key("cron_wrap_response"),
+            "wrap_response=Some(false) must not set the wrap flag"
+        );
     }
 
     #[cfg(unix)]
