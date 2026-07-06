@@ -121,9 +121,11 @@ fn ack_envelope_format() {
 }
 
 #[test]
-fn allows_sender_empty_list_permits_all() {
+fn allows_sender_empty_list_denies_all() {
+    // Default-deny: an unconfigured allowlist refuses everyone;
+    // "*" is the explicit allow-everyone opt-in.
     let ch = SlackChannel::new("bot-tok".into(), "app-tok".into(), vec![]);
-    assert!(ch.allows_sender("anyone"));
+    assert!(!ch.allows_sender("anyone"));
 }
 
 #[test]

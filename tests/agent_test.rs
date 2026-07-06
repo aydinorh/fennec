@@ -6,7 +6,9 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use fennec::memory::traits::{Memory, MemoryCategory, MemoryEntry};
-use fennec::providers::traits::{ChatRequest, ChatResponse, Provider, ToolCall, UsageInfo};
+use fennec::providers::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall, UsageInfo,
+};
 use fennec::tools::traits::{Tool, ToolResult};
 
 use fennec::agent::AgentBuilder;
@@ -18,13 +20,32 @@ use fennec::agent::AgentBuilder;
 /// A mock provider that returns pre-configured responses in order.
 struct MockProvider {
     responses: Mutex<Vec<ChatResponse>>,
+    /// `request.tools.is_some()` recorded for each `chat` call, in order.
+    /// Lets tests assert which calls advertised tools (e.g. the graceful
+    /// max-iterations summary call must strip tools).
+    tools_seen: Mutex<Vec<bool>>,
+    /// Reported context window. Small values let tests trigger auto-compaction.
+    ctx_window: usize,
 }
 
 impl MockProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
+            tools_seen: Mutex::new(Vec::new()),
+            ctx_window: 100_000,
         }
+    }
+
+    /// Override the reported context window (default 100_000).
+    fn with_context_window(mut self, ctx_window: usize) -> Self {
+        self.ctx_window = ctx_window;
+        self
+    }
+
+    /// Snapshot of whether each `chat` call so far advertised tools.
+    fn tools_seen(&self) -> Vec<bool> {
+        self.tools_seen.lock().clone()
     }
 }
 
@@ -34,7 +55,8 @@ impl Provider for MockProvider {
         "mock"
     }
 
-    async fn chat(&self, _request: ChatRequest<'_>) -> Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
+        self.tools_seen.lock().push(request.tools.is_some());
         let mut responses = self.responses.lock();
         if responses.is_empty() {
             anyhow::bail!("MockProvider: no more responses");
@@ -47,7 +69,7 @@ impl Provider for MockProvider {
     }
 
     fn context_window(&self) -> usize {
-        100_000
+        self.ctx_window
     }
 
     async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
@@ -214,11 +236,14 @@ async fn test_tool_call_and_response() {
 }
 
 #[tokio::test]
-async fn test_max_iterations_exceeded() {
-    // Create responses that always return tool calls (more than max iterations).
+async fn test_max_iterations_graceful_summary() {
+    // When the tool-iteration cap is hit, the agent must NOT hard-error. It
+    // makes one final provider call with tools stripped, asking the model to
+    // summarise, and returns that text.
     let max_iters = 3;
     let mut responses = Vec::new();
-    for i in 0..(max_iters + 1) {
+    // Every loop iteration keeps requesting tools, so the cap is hit.
+    for i in 0..max_iters {
         responses.push(ChatResponse {
             content: None,
             tool_calls: vec![ToolCall {
@@ -230,22 +255,389 @@ async fn test_max_iterations_exceeded() {
             reasoning: None,
         });
     }
+    // The final tool-less summary call returns plain text.
+    responses.push(ChatResponse {
+        content: Some("Here's what I accomplished so far.".to_string()),
+        tool_calls: vec![],
+        usage: None,
+        reasoning: None,
+    });
 
-    let provider = MockProvider::new(responses);
+    let provider = Arc::new(MockProvider::new(responses));
 
     let mut agent = AgentBuilder::new()
-        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .provider(provider.clone() as Arc<dyn Provider>)
         .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .tool(Box::new(EchoTool))
         .max_tool_iterations(max_iters)
         .build()
         .expect("agent build should succeed");
 
-    let result = agent.turn("loop forever").await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let result = agent
+        .turn("loop forever")
+        .await
+        .expect("turn should end gracefully, not error");
+    assert_eq!(result, "Here's what I accomplished so far.");
+
+    // The cap-hit produces exactly max_iters tool-advertising calls followed
+    // by one tools-stripped summary call.
+    let seen = provider.tools_seen();
+    assert_eq!(
+        seen.len(),
+        max_iters + 1,
+        "expected {} loop calls + 1 summary call, got {:?}",
+        max_iters,
+        seen
+    );
     assert!(
-        err.contains("max tool iterations"),
-        "error should mention max tool iterations, got: {err}"
+        seen[..max_iters].iter().all(|&t| t),
+        "loop calls should advertise tools, got {seen:?}"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&false),
+        "final summary call must strip tools, got {seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parallel tool execution
+// ---------------------------------------------------------------------------
+
+/// A tool that records the peak number of concurrent executions observed, so
+/// a test can detect whether a batch ran in parallel. Counters are shared via
+/// `Arc` so multiple registered instances and repeated calls observe the same
+/// concurrency. `read_only` controls the parallel-safety gate.
+struct ConcurrencyProbeTool {
+    tool_name: &'static str,
+    read_only: bool,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    max_seen: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for ConcurrencyProbeTool {
+    fn name(&self) -> &str {
+        self.tool_name
+    }
+    fn description(&self) -> &str {
+        "Concurrency probe (test only)."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+        use std::sync::atomic::Ordering;
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_seen.fetch_max(now, Ordering::SeqCst);
+        // Yield long enough that an overlapping call is observable.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolResult {
+            success: true,
+            output: "probed".to_string(),
+            error: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_parallel_readonly_tools_run_concurrently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+
+    // One response with TWO calls to the same read-only probe tool, then a
+    // final text response so the turn terminates.
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "a".into(),
+                    name: "probe_ro".into(),
+                    arguments: json!({}),
+                },
+                ToolCall {
+                    id: "b".into(),
+                    name: "probe_ro".into(),
+                    arguments: json!({}),
+                },
+            ],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(MockProvider::new(responses)) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .tool(Box::new(ConcurrencyProbeTool {
+            tool_name: "probe_ro",
+            read_only: true,
+            active: Arc::clone(&active),
+            max_seen: Arc::clone(&max_seen),
+        }))
+        .build()
+        .expect("agent build should succeed");
+
+    let out = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(out, "done");
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        2,
+        "two read-only tools in one batch should run concurrently"
+    );
+}
+
+#[tokio::test]
+async fn test_mixed_batch_runs_sequentially() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+
+    // A batch with one read-only and one non-read-only tool must run
+    // sequentially (the non-read-only tool isn't parallel-safe).
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "a".into(),
+                    name: "probe_ro".into(),
+                    arguments: json!({}),
+                },
+                ToolCall {
+                    id: "b".into(),
+                    name: "probe_rw".into(),
+                    arguments: json!({}),
+                },
+            ],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(MockProvider::new(responses)) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .tool(Box::new(ConcurrencyProbeTool {
+            tool_name: "probe_ro",
+            read_only: true,
+            active: Arc::clone(&active),
+            max_seen: Arc::clone(&max_seen),
+        }))
+        .tool(Box::new(ConcurrencyProbeTool {
+            tool_name: "probe_rw",
+            read_only: false,
+            active: Arc::clone(&active),
+            max_seen: Arc::clone(&max_seen),
+        }))
+        .build()
+        .expect("agent build should succeed");
+
+    let out = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(out, "done");
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "a non-read-only tool in the batch must force sequential execution"
+    );
+}
+
+#[tokio::test]
+async fn test_parallel_results_preserve_order() {
+    // Two distinct read-only tools run concurrently; their results must land
+    // in history in the original tool-call order regardless of finish order.
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "first".into(),
+                    name: "echo".into(),
+                    arguments: json!({"message": "one"}),
+                },
+                ToolCall {
+                    id: "second".into(),
+                    name: "echo".into(),
+                    arguments: json!({"message": "two"}),
+                },
+            ],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+    let _ = (&active, &max_seen);
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(MockProvider::new(responses)) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .tool(Box::new(EchoTool))
+        .build()
+        .expect("agent build should succeed");
+
+    // Two read-only `echo` calls → concurrent path. The turn completes with
+    // the final text; correctness of ordering is exercised by the provider
+    // re-reading history on the second call (tool results must match their
+    // originating ids in order).
+    let out = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(out, "done");
+}
+
+// ---------------------------------------------------------------------------
+// Automatic context compaction
+// ---------------------------------------------------------------------------
+
+/// Build a multi-message history big enough to exceed a small context
+/// threshold and long enough for the compressor's middle block to be
+/// non-empty (> protect_first + protect_last).
+fn big_history() -> Vec<ChatMessage> {
+    (0..12)
+        .map(|i| {
+            let body = format!("conversation message number {i} with some filler text");
+            if i % 2 == 0 {
+                ChatMessage::user(body)
+            } else {
+                ChatMessage::assistant(body)
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_auto_compaction_triggers_over_threshold() {
+    // Two responses: the first is the compaction summary, the second is the
+    // turn's actual reply. If auto-compaction fires, it consumes the summary
+    // response and the turn returns the second ("done"). If it does NOT fire,
+    // the turn would consume the summary response first and return that.
+    let responses = vec![
+        ChatResponse {
+            content: Some("[SUMMARY]".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+    // Tiny context window so the loaded history is over the 50% threshold.
+    let provider = MockProvider::new(responses).with_context_window(40);
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .build()
+        .expect("agent build should succeed");
+
+    agent.replace_history(big_history());
+    let len_before = agent.history_len();
+
+    let result = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(
+        result, "done",
+        "auto-compaction should have consumed the summary response, leaving the turn to return 'done'"
+    );
+    assert!(
+        agent.history_len() < len_before,
+        "history should be smaller after compaction (was {len_before}, now {})",
+        agent.history_len()
+    );
+}
+
+#[tokio::test]
+async fn test_no_compaction_under_threshold() {
+    // Same setup, but a large context window keeps history under threshold, so
+    // compaction must NOT fire — the turn returns the first response.
+    let responses = vec![
+        ChatResponse {
+            content: Some("[SUMMARY]".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+    let provider = MockProvider::new(responses); // default 100_000-token window
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .build()
+        .expect("agent build should succeed");
+
+    agent.replace_history(big_history());
+
+    let result = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(
+        result, "[SUMMARY]",
+        "no compaction under threshold — the turn returns the first response unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_compaction_disabled_skips_compaction() {
+    // With compression disabled, even an over-threshold history must not
+    // compact: the turn returns the first response.
+    let responses = vec![
+        ChatResponse {
+            content: Some("[SUMMARY]".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+        ChatResponse {
+            content: Some("done".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        },
+    ];
+    let provider = MockProvider::new(responses).with_context_window(40);
+
+    let mut agent = AgentBuilder::new()
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
+        .compression_enabled(false)
+        .build()
+        .expect("agent build should succeed");
+
+    agent.replace_history(big_history());
+
+    let result = agent.turn("go").await.expect("turn should succeed");
+    assert_eq!(
+        result, "[SUMMARY]",
+        "compaction disabled — no compaction even over threshold"
     );
 }

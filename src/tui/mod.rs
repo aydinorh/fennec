@@ -116,11 +116,17 @@ where
         if event::poll(timeout).context("event poll failed")? {
             match event::read().context("event read failed")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if should_quit(&key) {
-                        return Ok(());
-                    }
+                    // ALL keys route through the app — quit policy lives
+                    // in `App::handle_key`, which is modal- and focus-
+                    // aware. The old pre-check here intercepted q/Esc/
+                    // Ctrl-C before the app saw them: typing "q" in the
+                    // composer exited the TUI, and Esc killed the app
+                    // mid-modal instead of letting the modal handle it.
                     let mut guard = app.lock();
                     guard.handle_key(key.code, key.modifiers);
+                    if guard.should_quit {
+                        return Ok(());
+                    }
                 }
                 Event::Resize(_, _) => {
                     // Ratatui auto-handles resize on next draw; no
@@ -193,11 +199,3 @@ fn handle_editor_request<B: ratatui::backend::Backend>(
     }
 }
 
-fn should_quit(key: &crossterm::event::KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-        _ => false,
-    }
-}

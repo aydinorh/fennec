@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,9 +8,14 @@ use serde::{Deserialize, Serialize};
 pub struct CronJob {
     pub id: String,
     pub name: String,
-    /// Schedule expression. Recurring: "every 30m", "every 1h", "every 24h",
-    /// "every 7d". Bare durations ("5m", "1h") are treated as one-shot
-    /// delays — fired once after the delay, then disabled.
+    /// Schedule expression. Supported formats:
+    /// - Recurring interval: `"every 30m"`, `"every 1h"`, `"every 24h"`, `"every 7d"`.
+    /// - One-shot duration:  bare `"5m"`, `"1h"`, `"30s"` — fires once after the delay.
+    /// - Cron expression:    standard 5- or 6-field syntax (`"0 9 * * 1-5"`,
+    ///   `"*/15 * * * *"`). Names (`MON`/`JAN`) and the `L`/`W`/`#` extensions
+    ///   are supported via the `croner` crate.
+    /// - Timestamp one-shot: ISO 8601 (`"2026-02-03T14:00"`, `"2026-02-03T14:00:00Z"`).
+    ///   Naive timestamps are interpreted as local time at parse time.
     pub schedule: String,
     /// Message to send to the agent when this job fires.
     pub command: String,
@@ -21,7 +27,239 @@ pub struct CronJob {
     /// The chat ID within the origin channel to deliver results to.
     #[serde(default)]
     pub origin_chat_id: Option<String>,
+    /// Lifecycle state: `"scheduled"` | `"paused"` | `"error"` | `"completed"`.
+    /// Legacy jobs without this field are treated as `"scheduled"` when
+    /// enabled and `"paused"` when disabled (see [`CronJob::effective_state`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    /// Creation timestamp (RFC3339). Populated at create time; legacy
+    /// jobs without this stay `None` and consumers must tolerate the
+    /// absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// Next scheduled run time (RFC3339). Persisted so jobs don't drift
+    /// across scheduler restarts and so missed windows can be fast-forwarded
+    /// — matches the upstream's at-most-once + stale-fast-forward semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    /// Outcome of the most recent run: `"ok"` | `"error"`. None before
+    /// the first run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    /// Error message from the most recent failed run. Cleared on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Error message from the most recent failed delivery attempt
+    /// (separate from `last_error` — a job can succeed but fail
+    /// delivery, e.g. when the destination platform is down).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivery_error: Option<String>,
+    /// When the job was paused (RFC3339). None when not paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    /// Why the job was paused. None when not paused or no reason given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<String>,
+    /// Run-count gate. `times = None` means run forever; otherwise the
+    /// job is auto-removed once `completed >= times` (mirrors the
+    /// upstream's `repeat: {times, completed}` field).
+    #[serde(default)]
+    pub repeat: RepeatConfig,
+    /// Human-readable schedule label for UI/list display (e.g.
+    /// `"every 30m"`, `"once in 30m"`, `"once at 2026-02-03 14:00"`, or
+    /// the cron expression itself). Computed at create time so a
+    /// `/cron list` doesn't re-parse the schedule string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schedule_display: String,
+    /// Path to a script whose stdout feeds the job. Resolved under
+    /// `<cron_dir>/scripts/`. With `no_agent = true` the script IS the
+    /// job — its stdout is delivered verbatim. Without `no_agent`, its
+    /// stdout is injected into the agent's prompt as context (the
+    /// data-collection / change-detection pattern). `.sh` / `.bash`
+    /// files run via bash; everything else runs via the current
+    /// Python interpreter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// Skip the agent entirely — run `script` on schedule and deliver
+    /// its stdout directly. Empty stdout = silent (no delivery).
+    /// Requires `script` to be set. Mirrors the upstream's `no_agent`
+    /// — ideal for classic watchdogs and periodic alerts that don't
+    /// need LLM reasoning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_agent: bool,
+    /// Other job IDs whose most recent output is injected into this
+    /// job's prompt as context before each run. Useful for chaining
+    /// (job A finds data, job B processes it). Output is read from
+    /// `<output_dir>/<job_id>/` (latest `.md` file), truncated to 8K
+    /// chars to avoid prompt bloat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_from: Option<Vec<String>>,
+    /// Per-job model override (e.g. `"claude-sonnet-4-6"`). When set,
+    /// the downstream agent consumer should run this job under the
+    /// named model instead of the global default. Mirrors upstream's
+    /// `create_job(..., model=...)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Per-job provider override (e.g. `"anthropic"`, `"openrouter"`).
+    /// Mirrors upstream's `create_job(..., provider=...)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Per-job base URL override for the provider (e.g. a proxy
+    /// endpoint). Trailing slashes are stripped at create time.
+    /// Mirrors upstream's `create_job(..., base_url=...)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Per-job toolset allowlist. When `Some`, the agent consumer
+    /// loads only tools from these toolsets — reduces token overhead
+    /// and lets a watchdog job avoid expensive / interactive tools.
+    /// Mirrors upstream's `enabled_toolsets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_toolsets: Option<Vec<String>>,
+    /// Per-job working directory (absolute path). When set, the job
+    /// runs as if launched from that directory: project context files
+    /// (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are injected into
+    /// the system prompt, and the terminal/file/code-exec tools use
+    /// it as their working directory. Validated at create time
+    /// ([`normalize_workdir`]). Mirrors upstream's `workdir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Per-job Fennec profile name. When set, the job runs under
+    /// that profile's `FENNEC_HOME` so profile-specific config,
+    /// credentials, scripts, skills, and memory paths resolve
+    /// consistently. Mirrors upstream's `profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Where to deliver this job's response. Tokens (single or
+    /// comma-separated):
+    /// - `"local"` — no delivery (output saved locally only).
+    /// - `"origin"` — deliver to the channel/chat the job was
+    ///   created from (`origin_channel` / `origin_chat_id`).
+    /// - `"<platform>"` — deliver to the platform's configured home
+    ///   channel (`FENNEC_<PLATFORM>_HOME_CHANNEL` env var).
+    /// - `"<platform>:<chat_id>"` (optionally `:<thread_id>`) —
+    ///   explicit target.
+    /// - `"all"` — fan-out to every platform with a configured
+    ///   home channel.
+    ///
+    /// Default is set at create time: `"origin"` when the job has an
+    /// origin, `"local"` otherwise (matches upstream's
+    /// `create_job` default).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub deliver: String,
+    /// Whether to wrap delivered responses with a `Cron Response`
+    /// header / footer noting the job name + ID so users on busy
+    /// channels can tell which scheduled task spoke. `None` defers
+    /// to the global default (wrap on, matching upstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_response: Option<bool>,
+    /// Legacy single-skill field kept for back-compat with older
+    /// `jobs.json` files. The canonical store is [`Self::skills`];
+    /// readers should treat this as a fallback when `skills` is empty.
+    /// Writers ([`JobStore::rewrite_skill_refs`], `cron_tool` create /
+    /// update) keep both fields in sync so legacy consumers stay
+    /// happy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// Ordered list of skill names loaded before this job's prompt
+    /// runs. At fire time, each name resolves to a skill in
+    /// `<skills_dir>/`; the content is prepended to the prompt with
+    /// the standard `[IMPORTANT: The user has invoked the "X" skill]`
+    /// header. Missing skills surface a `'⚠️ Skill(s) not found and
+    /// skipped'` notice the agent is told to repeat to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
 }
+
+impl CronJob {
+    /// Resolve the lifecycle state, treating an empty stored `state` as
+    /// `"scheduled"` when enabled and `"paused"` when disabled — matches
+    /// the upstream's `_normalize_job_record` fallback so legacy jobs
+    /// don't appear in an "unknown" limbo.
+    pub fn effective_state(&self) -> &str {
+        if !self.state.is_empty() {
+            return &self.state;
+        }
+        if self.enabled {
+            "scheduled"
+        } else {
+            "paused"
+        }
+    }
+}
+
+/// Repeat-count gate for a cron job. `times = None` ⇒ run forever;
+/// otherwise the scheduler auto-removes the job once
+/// `completed >= times` after its final run.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RepeatConfig {
+    /// Requested total runs. `None` means run forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub times: Option<u32>,
+    /// Completed runs so far.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub completed: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Subset of job fields that callers can update via [`JobStore::update_job`].
+/// Each `Option` wraps a single update; outer `None` = leave unchanged.
+/// For nullable fields, an outer `Some(None)` clears the field to `None`.
+#[derive(Debug, Clone, Default)]
+pub struct JobUpdates {
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub command: Option<String>,
+    pub enabled: Option<bool>,
+    pub state: Option<String>,
+    pub next_run_at: Option<Option<String>>,
+    pub last_run: Option<Option<String>>,
+    pub last_status: Option<Option<String>>,
+    pub last_error: Option<Option<String>>,
+    pub last_delivery_error: Option<Option<String>>,
+    pub paused_at: Option<Option<String>>,
+    pub paused_reason: Option<Option<String>>,
+    pub repeat: Option<RepeatConfig>,
+    pub schedule_display: Option<String>,
+    pub script: Option<Option<String>>,
+    pub no_agent: Option<bool>,
+    pub context_from: Option<Option<Vec<String>>>,
+    pub model: Option<Option<String>>,
+    pub provider: Option<Option<String>>,
+    pub base_url: Option<Option<String>>,
+    pub enabled_toolsets: Option<Option<Vec<String>>>,
+    pub workdir: Option<Option<String>>,
+    pub profile: Option<Option<String>>,
+    pub deliver: Option<String>,
+    pub wrap_response: Option<Option<bool>>,
+    pub skill: Option<Option<String>>,
+    pub skills: Option<Option<Vec<String>>>,
+}
+
+/// Error returned by [`JobStore::resolve_job_ref`] when a name matches
+/// more than one job. Mirrors the upstream's `AmbiguousJobReference` —
+/// callers should surface the matching IDs so the user can disambiguate.
+#[derive(Debug)]
+pub struct AmbiguousJobReference {
+    pub reference: String,
+    pub matches: Vec<String>,
+}
+
+impl std::fmt::Display for AmbiguousJobReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "job name '{}' is ambiguous — matches {} jobs: {}. Use the job ID instead.",
+            self.reference,
+            self.matches.len(),
+            self.matches.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousJobReference {}
 
 pub struct JobStore {
     jobs: Vec<CronJob>,
@@ -81,6 +319,11 @@ impl JobStore {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating parent dir {}", parent.display()))?;
+                // Tighten the cron directory to owner-only access (0700) on
+                // Unix. Matches the upstream's `_secure_dir` — cron jobs can
+                // carry credentials in their command/prompt, so the store
+                // should never be group/world-readable. No-op on Windows.
+                secure_dir(parent);
             }
         }
         let data = serde_json::to_string_pretty(&self.jobs)
@@ -103,6 +346,11 @@ impl JobStore {
 
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp_path);
+        } else {
+            // Lock the final file to 0600 — owner-only read/write — for the
+            // same reason as the parent dir above. Matches the upstream's
+            // `_secure_file`.
+            secure_file(&self.path);
         }
         result
     }
@@ -135,6 +383,591 @@ impl JobStore {
     }
 }
 
+impl JobStore {
+    /// Resolve a job reference (ID or name) to a job. Exact ID match
+    /// wins first; otherwise case-insensitive name match. Returns
+    /// [`AmbiguousJobReference`] when a name matches more than one job
+    /// so the caller can surface the matching IDs rather than silently
+    /// picking one — mirrors the upstream's `resolve_job_ref`.
+    pub fn resolve_job_ref(
+        &self,
+        reference: &str,
+    ) -> Result<Option<&CronJob>, AmbiguousJobReference> {
+        let ref_trim = reference.trim();
+        if ref_trim.is_empty() {
+            return Ok(None);
+        }
+        if let Some(job) = self.jobs.iter().find(|j| j.id == ref_trim) {
+            return Ok(Some(job));
+        }
+        let ref_lower = ref_trim.to_lowercase();
+        let name_matches: Vec<&CronJob> = self
+            .jobs
+            .iter()
+            .filter(|j| j.name.to_lowercase() == ref_lower)
+            .collect();
+        match name_matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(name_matches[0])),
+            _ => Err(AmbiguousJobReference {
+                reference: ref_trim.to_string(),
+                matches: name_matches.iter().map(|j| j.id.clone()).collect(),
+            }),
+        }
+    }
+
+    /// Get a job by ID or name. Returns a clone for ergonomics; callers
+    /// needing a mutable handle use [`JobStore::get_mut`] or
+    /// [`JobStore::update_job`].
+    pub fn get_job(&self, reference: &str) -> Result<Option<CronJob>, AmbiguousJobReference> {
+        self.resolve_job_ref(reference).map(|opt| opt.cloned())
+    }
+
+    /// Remove a job by ID or name. Returns the boolean removal result
+    /// inside `Result` so name ambiguity can be reported to the caller.
+    pub fn remove_by_ref(&mut self, reference: &str) -> Result<bool, AmbiguousJobReference> {
+        let id = match self.resolve_job_ref(reference)? {
+            Some(job) => job.id.clone(),
+            None => return Ok(false),
+        };
+        Ok(self.remove_job(&id))
+    }
+
+    /// Update fields on a job in place. The `id` field is immutable —
+    /// it's a filesystem path component for output directories (see
+    /// PR 3 / output persistence), so allowing renames leaks
+    /// path-escape values into output writes/deletes (matches the
+    /// upstream's `_IMMUTABLE_JOB_FIELDS` guard).
+    ///
+    /// Schedule changes auto-recompute `schedule_display` and
+    /// `next_run_at`. Persists immediately.
+    pub fn update_job(&mut self, id: &str, updates: JobUpdates) -> Result<Option<CronJob>> {
+        let Some(idx) = self.jobs.iter().position(|j| j.id == id) else {
+            return Ok(None);
+        };
+        let schedule_changed = updates.schedule.is_some();
+
+        {
+            let job = &mut self.jobs[idx];
+            if let Some(name) = updates.name {
+                job.name = name;
+            }
+            if let Some(schedule) = updates.schedule {
+                job.schedule = schedule;
+            }
+            if let Some(command) = updates.command {
+                job.command = command;
+            }
+            if let Some(enabled) = updates.enabled {
+                job.enabled = enabled;
+            }
+            if let Some(state) = updates.state {
+                job.state = state;
+            }
+            if let Some(next) = updates.next_run_at {
+                job.next_run_at = next;
+            }
+            if let Some(last) = updates.last_run {
+                job.last_run = last;
+            }
+            if let Some(s) = updates.last_status {
+                job.last_status = s;
+            }
+            if let Some(e) = updates.last_error {
+                job.last_error = e;
+            }
+            if let Some(d) = updates.last_delivery_error {
+                job.last_delivery_error = d;
+            }
+            if let Some(p) = updates.paused_at {
+                job.paused_at = p;
+            }
+            if let Some(r) = updates.paused_reason {
+                job.paused_reason = r;
+            }
+            if let Some(repeat) = updates.repeat {
+                job.repeat = repeat;
+            }
+            if let Some(disp) = updates.schedule_display {
+                job.schedule_display = disp;
+            }
+            if let Some(script) = updates.script {
+                job.script = script;
+            }
+            if let Some(no_agent) = updates.no_agent {
+                job.no_agent = no_agent;
+            }
+            if let Some(context_from) = updates.context_from {
+                job.context_from = context_from;
+            }
+            if let Some(model) = updates.model {
+                job.model = model;
+            }
+            if let Some(provider) = updates.provider {
+                job.provider = provider;
+            }
+            if let Some(base_url) = updates.base_url {
+                job.base_url = base_url;
+            }
+            if let Some(enabled_toolsets) = updates.enabled_toolsets {
+                job.enabled_toolsets = enabled_toolsets;
+            }
+            if let Some(workdir) = updates.workdir {
+                job.workdir = workdir;
+            }
+            if let Some(profile) = updates.profile {
+                job.profile = profile;
+            }
+            if let Some(deliver) = updates.deliver {
+                job.deliver = deliver;
+            }
+            if let Some(wrap_response) = updates.wrap_response {
+                job.wrap_response = wrap_response;
+            }
+            if let Some(skill) = updates.skill {
+                job.skill = skill;
+            }
+            if let Some(skills) = updates.skills {
+                job.skills = skills;
+            }
+        }
+
+        if schedule_changed {
+            let (display, next) = {
+                let job = &self.jobs[idx];
+                (
+                    schedule_display_for(&job.schedule),
+                    if job.state != "paused" {
+                        compute_next_run(&job.schedule, job.last_run.as_deref())
+                    } else {
+                        job.next_run_at.clone()
+                    },
+                )
+            };
+            let job = &mut self.jobs[idx];
+            job.schedule_display = display;
+            if job.state != "paused" {
+                job.next_run_at = next;
+            }
+        }
+
+        // Re-arm next_run_at if the job ended up enabled, scheduled, and
+        // missing it (e.g. resume_job from a state where it was cleared).
+        let needs_rearm = {
+            let job = &self.jobs[idx];
+            job.enabled && job.state != "paused" && job.next_run_at.is_none()
+        };
+        if needs_rearm {
+            let (schedule, last) = {
+                let job = &self.jobs[idx];
+                (job.schedule.clone(), job.last_run.clone())
+            };
+            self.jobs[idx].next_run_at = compute_next_run(&schedule, last.as_deref());
+        }
+
+        let updated = self.jobs[idx].clone();
+        self.save()?;
+        Ok(Some(updated))
+    }
+
+    /// Pause a job (by ID or name) without removing it. Sets
+    /// `state="paused"`, `enabled=false`, records `paused_at` and
+    /// `paused_reason`. Mirrors the upstream's `pause_job`.
+    pub fn pause_job(&mut self, reference: &str, reason: Option<&str>) -> Result<Option<CronJob>> {
+        let id = match self
+            .resolve_job_ref(reference)
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            Some(job) => job.id.clone(),
+            None => return Ok(None),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let updates = JobUpdates {
+            enabled: Some(false),
+            state: Some("paused".to_string()),
+            paused_at: Some(Some(now)),
+            paused_reason: Some(reason.map(|s| s.to_string())),
+            ..Default::default()
+        };
+        self.update_job(&id, updates)
+    }
+
+    /// Resume a paused job (by ID or name). Clears pause fields,
+    /// re-enables, and recomputes the next run. Mirrors the upstream's
+    /// `resume_job`.
+    pub fn resume_job(&mut self, reference: &str) -> Result<Option<CronJob>> {
+        let id = match self
+            .resolve_job_ref(reference)
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            Some(job) => job.id.clone(),
+            None => return Ok(None),
+        };
+        let next_run = {
+            let job = self
+                .jobs
+                .iter()
+                .find(|j| j.id == id)
+                .expect("resolve_job_ref returned id that's no longer in store");
+            compute_next_run(&job.schedule, job.last_run.as_deref())
+        };
+        let updates = JobUpdates {
+            enabled: Some(true),
+            state: Some("scheduled".to_string()),
+            paused_at: Some(None),
+            paused_reason: Some(None),
+            next_run_at: Some(next_run),
+            ..Default::default()
+        };
+        self.update_job(&id, updates)
+    }
+
+    /// Trigger a job to run on the next scheduler tick (by ID or name).
+    /// Sets `next_run_at = now` so the next tick picks it up regardless
+    /// of the schedule. Mirrors the upstream's `trigger_job`.
+    pub fn trigger_job(&mut self, reference: &str) -> Result<Option<CronJob>> {
+        let id = match self
+            .resolve_job_ref(reference)
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            Some(job) => job.id.clone(),
+            None => return Ok(None),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let updates = JobUpdates {
+            enabled: Some(true),
+            state: Some("scheduled".to_string()),
+            paused_at: Some(None),
+            paused_reason: Some(None),
+            next_run_at: Some(Some(now)),
+            ..Default::default()
+        };
+        self.update_job(&id, updates)
+    }
+
+    /// Mark a job as having run. Updates `last_run`, `last_status`,
+    /// `last_error`, `last_delivery_error`; increments `repeat.completed`
+    /// and removes the job if the repeat limit is reached; recomputes
+    /// `next_run_at` and sets the lifecycle state accordingly.
+    ///
+    /// Important parity detail: a recurring job whose `next_run_at`
+    /// can't be computed is left enabled with `state="error"` rather
+    /// than silently disabled — a missing croner / a runtime regression
+    /// shouldn't quietly turn a daily reminder into "completed".
+    /// Mirrors the upstream's `mark_job_run` (and its bug-fix history).
+    pub fn mark_job_run(
+        &mut self,
+        id: &str,
+        success: bool,
+        error: Option<&str>,
+        delivery_error: Option<&str>,
+    ) -> Result<()> {
+        let Some(idx) = self.jobs.iter().position(|j| j.id == id) else {
+            tracing::warn!("mark_job_run: job id '{}' not found, skipping save", id);
+            return Ok(());
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule_str = self.jobs[idx].schedule.clone();
+
+        {
+            let job = &mut self.jobs[idx];
+            job.last_run = Some(now.clone());
+            job.last_status = Some(if success { "ok" } else { "error" }.to_string());
+            job.last_error = if success {
+                None
+            } else {
+                error.map(|s| s.to_string())
+            };
+            job.last_delivery_error = delivery_error.map(|s| s.to_string());
+            job.repeat.completed = job.repeat.completed.saturating_add(1);
+
+            if let Some(times) = job.repeat.times {
+                if times > 0 && job.repeat.completed >= times {
+                    self.jobs.remove(idx);
+                    return self.save();
+                }
+            }
+        }
+
+        let next = compute_next_run(&schedule_str, Some(&now));
+        let kind = parse_schedule_kind(&schedule_str);
+        let is_recurring = matches!(
+            kind,
+            Some(ScheduleKind::Recurring { .. } | ScheduleKind::Cron(_))
+        );
+
+        let job = &mut self.jobs[idx];
+        job.next_run_at = next.clone();
+
+        if next.is_none() {
+            if is_recurring {
+                job.state = "error".to_string();
+                if job.last_error.is_none() {
+                    job.last_error = Some(
+                        "Failed to compute next run for recurring schedule".to_string(),
+                    );
+                }
+                tracing::error!(
+                    "Cron job '{}' ({}): could not compute next_run_at — leaving enabled and marking state=error so the job is not silently disabled",
+                    job.name, job.id
+                );
+            } else {
+                job.enabled = false;
+                job.state = "completed".to_string();
+            }
+        } else if job.state != "paused" {
+            job.state = "scheduled".to_string();
+        }
+
+        self.save()
+    }
+
+    /// Preemptively advance `next_run_at` for a recurring job BEFORE it
+    /// fires. Converts the scheduler from at-least-once to at-most-once
+    /// for recurring jobs — a crash mid-execution loses one run rather
+    /// than refiring on next restart. One-shots are left unchanged so
+    /// they can still retry on restart. Returns true if advanced.
+    /// Mirrors the upstream's `advance_next_run`.
+    pub fn advance_next_run(&mut self, id: &str) -> Result<bool> {
+        let Some(idx) = self.jobs.iter().position(|j| j.id == id) else {
+            return Ok(false);
+        };
+        let schedule_str = self.jobs[idx].schedule.clone();
+        let kind = parse_schedule_kind(&schedule_str);
+        if !matches!(
+            kind,
+            Some(ScheduleKind::Recurring { .. } | ScheduleKind::Cron(_))
+        ) {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let new_next = compute_next_run(&schedule_str, Some(&now));
+        if let Some(new_next) = new_next {
+            let job = &mut self.jobs[idx];
+            if job.next_run_at.as_deref() != Some(new_next.as_str()) {
+                job.next_run_at = Some(new_next);
+                self.save()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Return all jobs that are due to run now.
+    ///
+    /// For recurring jobs whose `next_run_at` is more than the
+    /// schedule-period-aware grace window in the past (e.g. the
+    /// scheduler was offline overnight), fast-forwards to the next
+    /// future occurrence and skips this run — preventing a burst of
+    /// stale fires on restart. Mirrors the upstream's `get_due_jobs`
+    /// + `_compute_grace_seconds` behaviour.
+    ///
+    /// May save the store as a side effect (recovered or fast-forwarded
+    /// `next_run_at` values).
+    pub fn get_due_jobs(&mut self) -> Vec<CronJob> {
+        let now = chrono::Utc::now();
+        let mut due: Vec<CronJob> = Vec::new();
+        let mut dirty = false;
+
+        for idx in 0..self.jobs.len() {
+            if !self.jobs[idx].enabled {
+                continue;
+            }
+            let id = self.jobs[idx].id.clone();
+            let schedule = self.jobs[idx].schedule.clone();
+            let last_run = self.jobs[idx].last_run.clone();
+            let mut next_run_at = self.jobs[idx].next_run_at.clone();
+
+            // Recovery: a missing next_run_at on an enabled job (legacy
+            // import, hand-edited jobs.json, or a one-shot that never
+            // anchored) — recompute from the schedule + last_run.
+            if next_run_at.is_none() {
+                if let Some(recovered) = compute_next_run(&schedule, last_run.as_deref()) {
+                    next_run_at = Some(recovered.clone());
+                    self.jobs[idx].next_run_at = Some(recovered);
+                    dirty = true;
+                } else {
+                    continue;
+                }
+            }
+
+            let next = next_run_at.expect("just set");
+            let Ok(next_dt) = chrono::DateTime::parse_from_rfc3339(&next) else {
+                tracing::warn!(
+                    "Cron job '{}': invalid next_run_at '{}', skipping",
+                    id,
+                    next
+                );
+                continue;
+            };
+            let next_dt = next_dt.with_timezone(&chrono::Utc);
+
+            if next_dt > now {
+                continue; // not yet due
+            }
+
+            // Past due — for recurring jobs, check stale fast-forward.
+            let kind = parse_schedule_kind(&schedule);
+            let is_recurring = matches!(
+                kind,
+                Some(ScheduleKind::Recurring { .. } | ScheduleKind::Cron(_))
+            );
+            if is_recurring {
+                let lateness = (now - next_dt).num_seconds();
+                let grace = grace_seconds_for(&schedule);
+                if lateness > grace {
+                    if let Some(fast_fwd) = compute_next_run(&schedule, Some(&now.to_rfc3339())) {
+                        tracing::info!(
+                            "Cron job '{}': missed scheduled time {} (grace {}s, late {}s) — fast-forwarding to {}",
+                            id, next, grace, lateness, fast_fwd
+                        );
+                        self.jobs[idx].next_run_at = Some(fast_fwd);
+                        dirty = true;
+                        continue;
+                    }
+                }
+            }
+
+            due.push(self.jobs[idx].clone());
+        }
+
+        if dirty {
+            if let Err(e) = self.save() {
+                tracing::error!("get_due_jobs: failed to save recovery updates: {}", e);
+            }
+        }
+
+        due
+    }
+}
+
+// =============================================================================
+// Curator integration: skill reference rewriting
+// =============================================================================
+
+/// Per-job entry in a [`SkillRewriteReport`]. Captures what changed
+/// so callers (the curator's invocation site, tests, the operator
+/// log) can show users exactly which jobs were touched.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillRewrite {
+    pub job_id: String,
+    pub job_name: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+    /// Old → new skill name mapping for consolidations.
+    pub mapped: std::collections::HashMap<String, String>,
+    /// Names dropped outright because they were pruned with no
+    /// forwarding target.
+    pub dropped: Vec<String>,
+}
+
+/// Summary returned by [`JobStore::rewrite_skill_refs`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SkillRewriteReport {
+    pub rewrites: Vec<SkillRewrite>,
+    pub jobs_updated: usize,
+    pub jobs_scanned: usize,
+}
+
+impl JobStore {
+    /// Rewrite cron job skill references after a curator consolidation
+    /// pass. Without this, a cron job listing a consolidated /
+    /// pruned skill would silently skip the skill at fire time —
+    /// running without the instructions it was scheduled to follow.
+    ///
+    /// Rules (mirror the upstream's `rewrite_skill_refs`):
+    /// - A skill listed in `consolidated` (old → umbrella) is replaced
+    ///   with its target. If the umbrella is already in the job's
+    ///   list, the stale name is dropped without duplication.
+    /// - A skill listed in `pruned` is dropped outright (no forwarding
+    ///   target). A name listed in both wins as `consolidated` — having
+    ///   a target is more useful than dropping.
+    /// - Ordering of other skills is preserved.
+    /// - The legacy `skill` field is realigned to the first remaining
+    ///   skill (or `None` when the list ends up empty).
+    /// - Best-effort: persisting the rewrite uses [`Self::save`], so
+    ///   IO errors propagate — the curator wraps this in a try/catch
+    ///   at its call site.
+    pub fn rewrite_skill_refs(
+        &mut self,
+        consolidated: &std::collections::HashMap<String, String>,
+        pruned: &std::collections::HashSet<String>,
+    ) -> Result<SkillRewriteReport> {
+        let mut effective_pruned: std::collections::HashSet<String> = pruned.clone();
+        for k in consolidated.keys() {
+            effective_pruned.remove(k);
+        }
+
+        let mut report = SkillRewriteReport {
+            jobs_scanned: self.jobs.len(),
+            ..Default::default()
+        };
+        if consolidated.is_empty() && effective_pruned.is_empty() {
+            return Ok(report);
+        }
+
+        let mut changed = false;
+        for job in &mut self.jobs {
+            let skills_before = crate::cron::skill_inject::canonical_skills(
+                job.skill.as_deref(),
+                job.skills.as_deref(),
+            );
+            if skills_before.is_empty() {
+                continue;
+            }
+
+            let mut mapped: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut dropped: Vec<String> = Vec::new();
+            let mut new_skills: Vec<String> = Vec::new();
+
+            for name in &skills_before {
+                if let Some(target) = consolidated.get(name) {
+                    mapped.insert(name.clone(), target.clone());
+                    if !target.is_empty() && !new_skills.iter().any(|n| n == target) {
+                        new_skills.push(target.clone());
+                    }
+                } else if effective_pruned.contains(name) {
+                    dropped.push(name.clone());
+                } else if !new_skills.iter().any(|n| n == name) {
+                    new_skills.push(name.clone());
+                }
+            }
+
+            if mapped.is_empty() && dropped.is_empty() {
+                continue;
+            }
+
+            job.skill = new_skills.first().cloned();
+            job.skills = if new_skills.is_empty() {
+                None
+            } else {
+                Some(new_skills.clone())
+            };
+            changed = true;
+
+            report.rewrites.push(SkillRewrite {
+                job_id: job.id.clone(),
+                job_name: if job.name.is_empty() {
+                    job.id.clone()
+                } else {
+                    job.name.clone()
+                },
+                before: skills_before,
+                after: new_skills,
+                mapped,
+                dropped,
+            });
+        }
+
+        if changed {
+            self.save()?;
+            report.jobs_updated = report.rewrites.len();
+        }
+        Ok(report)
+    }
+}
+
 /// How a schedule string should be interpreted by the scheduler.
 ///
 /// The old single `Option<u64>` interval lost the distinction between
@@ -142,20 +975,42 @@ impl JobStore {
 /// so bare durations like `"5m"` re-fired on every scheduler tick after
 /// the first — because `elapsed >= interval` stayed true forever. The
 /// scheduler now uses this enum to enforce one-shot semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleKind {
-    /// "every Nu" — fire every interval_secs seconds.
+    /// `"every Nu"` — fire every `interval_secs` seconds.
     Recurring { interval_secs: u64 },
-    /// bare "Nu" — fire once, delay_secs after the job is scheduled.
+    /// Bare `"Nu"` — fire once, `delay_secs` after the job is scheduled.
     OneShot { delay_secs: u64 },
+    /// Standard cron expression (5 or 6 fields). The string is re-parsed
+    /// each tick via `croner::Cron::from_str` to compute the next
+    /// occurrence after `last_run`.
+    Cron(String),
+    /// Fire once at a specific UTC timestamp. Naive ISO timestamps from
+    /// the source string are interpreted as local time at parse time and
+    /// converted to UTC, so the stored value doesn't depend on the
+    /// system timezone at fire-check time.
+    AtTimestamp(chrono::DateTime<chrono::Utc>),
 }
 
 impl ScheduleKind {
+    /// Interval-equivalent seconds. Returns 0 for non-interval kinds
+    /// (cron, timestamp) — callers that need a "next fire in N seconds"
+    /// value for those must branch on the variant and compute it
+    /// directly (via croner or the stored timestamp).
     pub fn seconds(&self) -> u64 {
         match self {
             ScheduleKind::Recurring { interval_secs } => *interval_secs,
             ScheduleKind::OneShot { delay_secs } => *delay_secs,
+            ScheduleKind::Cron(_) | ScheduleKind::AtTimestamp(_) => 0,
         }
+    }
+
+    /// True if this kind fires at most once.
+    pub fn is_one_shot(&self) -> bool {
+        matches!(
+            self,
+            ScheduleKind::OneShot { .. } | ScheduleKind::AtTimestamp(_)
+        )
     }
 }
 
@@ -178,23 +1033,53 @@ pub fn parse_schedule_kind(schedule: &str) -> Option<ScheduleKind> {
         return None;
     }
 
-    let (rest, recurring) = match trimmed.strip_prefix("every ") {
-        Some(r) => (r.trim(), true),
-        None => (trimmed, false),
-    };
-    if rest.is_empty() {
-        return None;
+    // 1. "every X" → Recurring interval.
+    if let Some(rest) = trimmed.strip_prefix("every ") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let seconds = parse_duration_seconds(rest)?;
+        return Some(ScheduleKind::Recurring {
+            interval_secs: seconds,
+        });
     }
 
-    let unit_pos = rest.find(|c: char| c.is_alphabetic())?;
-    let (num_str, unit) = rest.split_at(unit_pos);
+    // 2. 5- or 6-field cron expression — validated via croner so the parse
+    //    rejects malformed expressions up front instead of failing on a
+    //    later scheduler tick.
+    let field_count = trimmed.split_whitespace().count();
+    if (field_count == 5 || field_count == 6) && croner::Cron::from_str(trimmed).is_ok() {
+        return Some(ScheduleKind::Cron(trimmed.to_string()));
+    }
+
+    // 3. ISO 8601 timestamp ("2026-02-03T14:00", "2026-02-03 14:00:00",
+    //    "2026-02-03T14:00:00Z"). Timezone-aware variants parse via
+    //    RFC3339; naive variants are interpreted as local time then
+    //    converted to UTC, matching the upstream's pin-at-parse-time
+    //    behaviour.
+    if trimmed.contains('T') || looks_like_iso_date_prefix(trimmed) {
+        if let Some(ts) = parse_iso_timestamp(trimmed) {
+            return Some(ScheduleKind::AtTimestamp(ts));
+        }
+    }
+
+    // 4. Bare "Nu" → OneShot delay.
+    let seconds = parse_duration_seconds(trimmed)?;
+    Some(ScheduleKind::OneShot {
+        delay_secs: seconds,
+    })
+}
+
+/// Parse a duration token like `"30m"`, `"1h"`, `"7d"`, `"90s"` into
+/// seconds. Rejects zero (would busy-loop the scheduler) and overflow.
+fn parse_duration_seconds(s: &str) -> Option<u64> {
+    let unit_pos = s.find(|c: char| c.is_alphabetic())?;
+    let (num_str, unit) = s.split_at(unit_pos);
     let num: u64 = num_str.trim().parse().ok()?;
-    // Zero produces a busy-loop in the scheduler — elapsed is always
-    // >= 0, so the job would fire on every tick in a tight loop.
     if num == 0 {
         return None;
     }
-
     let multiplier: u64 = match unit.trim() {
         "s" => 1,
         "m" => 60,
@@ -202,26 +1087,312 @@ pub fn parse_schedule_kind(schedule: &str) -> Option<ScheduleKind> {
         "d" => 86400,
         _ => return None,
     };
+    num.checked_mul(multiplier)
+}
 
-    // checked_mul — prevents u64 overflow panics in debug mode on
-    // absurd inputs like "every 9999999999999999d".
-    let seconds = num.checked_mul(multiplier)?;
+/// Cheap pre-filter for the timestamp branch: looks like `YYYY-MM-DD…`.
+/// The actual parse happens in `parse_iso_timestamp`.
+fn looks_like_iso_date_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
 
-    Some(if recurring {
-        ScheduleKind::Recurring {
-            interval_secs: seconds,
+fn parse_iso_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // RFC3339 / ISO 8601 with explicit timezone.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // Naive formats — pin to local at parse time so the stored UTC value
+    // doesn't drift if the system timezone changes before the fire check.
+    use chrono::TimeZone;
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return chrono::Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&chrono::Utc));
         }
-    } else {
-        ScheduleKind::OneShot {
-            delay_secs: seconds,
-        }
-    })
+    }
+    None
 }
 
 /// Back-compat wrapper: returns just the seconds, discarding the recurring
 /// vs one-shot distinction. Prefer [`parse_schedule_kind`] in new code.
 pub fn parse_schedule(schedule: &str) -> Option<u64> {
     parse_schedule_kind(schedule).map(|k| k.seconds())
+}
+
+// =============================================================================
+// Next-run computation + grace windows + display helpers
+// =============================================================================
+
+/// Grace window for one-shot timestamp jobs (seconds). A job scheduled
+/// for HH:MM still fires if the scheduler tick happens within this many
+/// seconds after the moment — matches the upstream's `ONESHOT_GRACE_SECONDS`.
+pub const ONESHOT_GRACE_SECS: i64 = 120;
+
+/// Floor for the recurring stale-fast-forward window (seconds). A daily
+/// job missed by less than 2 minutes still fires; missed by 2h doesn't.
+const MIN_RECURRING_GRACE_SECS: i64 = 120;
+/// Ceiling for the recurring stale-fast-forward window (seconds, = 2h).
+const MAX_RECURRING_GRACE_SECS: i64 = 7200;
+
+/// Compute the next scheduled run time for a job, given its schedule
+/// string and the last-run timestamp (if any). Returns an RFC3339 string
+/// or `None` if the job has no more runs (e.g. a one-shot that already
+/// fired).
+///
+/// Semantics, mirroring the upstream's `compute_next_run`:
+/// - **Recurring interval**: `last_run + interval` (or `now + interval`
+///   if never run). Each call returns a future timestamp.
+/// - **One-shot duration** (`"30m"`): `now + delay` if never run; `None`
+///   once fired.
+/// - **Cron expression**: next occurrence after `last_run` (or `now` if
+///   never run).
+/// - **Timestamp one-shot**: the timestamp itself if never run; `None`
+///   once fired.
+pub fn compute_next_run(schedule: &str, last_run_at: Option<&str>) -> Option<String> {
+    let kind = parse_schedule_kind(schedule)?;
+    let now = chrono::Utc::now();
+    let last = last_run_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    match kind {
+        ScheduleKind::Recurring { interval_secs } => {
+            let base = last.unwrap_or(now);
+            Some((base + chrono::Duration::seconds(interval_secs as i64)).to_rfc3339())
+        }
+        ScheduleKind::OneShot { delay_secs } => {
+            if last.is_some() {
+                None
+            } else {
+                Some((now + chrono::Duration::seconds(delay_secs as i64)).to_rfc3339())
+            }
+        }
+        ScheduleKind::Cron(expr) => {
+            let cron = croner::Cron::from_str(&expr).ok()?;
+            let base = last.unwrap_or(now);
+            cron.find_next_occurrence(&base, false)
+                .ok()
+                .map(|dt| dt.to_rfc3339())
+        }
+        ScheduleKind::AtTimestamp(ts) => {
+            if last.is_some() {
+                None
+            } else {
+                Some(ts.to_rfc3339())
+            }
+        }
+    }
+}
+
+/// Stale-fast-forward grace window (seconds) for a recurring job.
+///
+/// A recurring job missed by less than this window still fires on the
+/// next tick (catch-up). Missed by more, the scheduler fast-forwards to
+/// the next future occurrence instead of replaying a stale run.
+///
+/// Uses *half the schedule period*, clamped to [120s, 2h] — matches the
+/// upstream's `_compute_grace_seconds`. One-shot kinds return the fixed
+/// [`ONESHOT_GRACE_SECS`].
+pub fn grace_seconds_for(schedule: &str) -> i64 {
+    let Some(kind) = parse_schedule_kind(schedule) else {
+        return MIN_RECURRING_GRACE_SECS;
+    };
+    match kind {
+        ScheduleKind::OneShot { .. } | ScheduleKind::AtTimestamp(_) => ONESHOT_GRACE_SECS,
+        ScheduleKind::Recurring { interval_secs } => {
+            let period = interval_secs as i64;
+            let half = period / 2;
+            half.clamp(MIN_RECURRING_GRACE_SECS, MAX_RECURRING_GRACE_SECS)
+        }
+        ScheduleKind::Cron(expr) => {
+            // Approximate the cron job's period via two successive occurrences
+            // after now; fall back to MIN_RECURRING_GRACE_SECS on parse/iter
+            // failure so the scheduler never blocks on a fancy expression.
+            let now = chrono::Utc::now();
+            (|| -> Option<i64> {
+                let cron = croner::Cron::from_str(&expr).ok()?;
+                let first = cron.find_next_occurrence(&now, false).ok()?;
+                let second = cron.find_next_occurrence(&first, false).ok()?;
+                let period = (second - first).num_seconds();
+                let half = period / 2;
+                Some(half.clamp(MIN_RECURRING_GRACE_SECS, MAX_RECURRING_GRACE_SECS))
+            })()
+            .unwrap_or(MIN_RECURRING_GRACE_SECS)
+        }
+    }
+}
+
+/// Compose a user-friendly schedule label for `cron list` and similar UI.
+/// Mirrors the upstream's `display` field in the parsed schedule dict.
+pub fn schedule_display_for(schedule: &str) -> String {
+    let trimmed = schedule.trim();
+    let Some(kind) = parse_schedule_kind(trimmed) else {
+        return trimmed.to_string();
+    };
+    match kind {
+        ScheduleKind::Recurring { interval_secs } => {
+            format!("every {}", humanize_seconds(interval_secs))
+        }
+        ScheduleKind::OneShot { delay_secs } => {
+            format!("once in {}", humanize_seconds(delay_secs))
+        }
+        ScheduleKind::Cron(expr) => expr,
+        ScheduleKind::AtTimestamp(ts) => format!(
+            "once at {}",
+            ts.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+        ),
+    }
+}
+
+// =============================================================================
+// Per-job override validation
+// =============================================================================
+
+/// Validate + canonicalise a per-job workdir override.
+///
+/// Rules (mirror the upstream's `_normalize_workdir`):
+/// - `None` / empty / whitespace ⇒ `Ok(None)` (feature off — preserves
+///   the no-workdir behaviour).
+/// - `~` is expanded; relative paths are rejected because cron jobs run
+///   detached from any shell cwd, so a relative path has no stable
+///   meaning at fire time.
+/// - The path must exist and be a directory at create/update time. We
+///   intentionally do NOT re-check at run time — a temporarily
+///   unmounted directory should log a warning downstream rather than
+///   prevent scheduling.
+pub fn normalize_workdir(workdir: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = workdir else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // Manual `~` expansion: keep this dep-free. Anything more complex
+    // (`~user`, env-var substitution) is rejected as ambiguous.
+    let expanded: std::path::PathBuf = if let Some(stripped) = trimmed.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cron workdir uses ~ but HOME is not set; pass an absolute path"
+                )
+            })?;
+        home.join(stripped)
+    } else if trimmed == "~" {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("cron workdir is ~ but HOME is not set"))?
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+
+    if !expanded.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "cron workdir must be an absolute path (got {:?}). \
+             Cron jobs run detached from any shell cwd, so relative paths are ambiguous.",
+            raw
+        ));
+    }
+    let resolved = expanded
+        .canonicalize()
+        .with_context(|| format!("cron workdir does not exist: {}", expanded.display()))?;
+    if !resolved.is_dir() {
+        return Err(anyhow::anyhow!(
+            "cron workdir is not a directory: {}",
+            resolved.display()
+        ));
+    }
+    Ok(Some(resolved.to_string_lossy().to_string()))
+}
+
+/// Normalise an optional per-job string override: trim, return `None`
+/// for empty. Trailing slashes are stripped if `strip_trailing_slash`
+/// is set (use for `base_url`).
+pub fn normalize_optional_str(value: Option<&str>, strip_trailing_slash: bool) -> Option<String> {
+    let raw = value?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if strip_trailing_slash {
+        Some(trimmed.trim_end_matches('/').to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Normalise a per-job string-list override: trim each entry, drop
+/// empties, return `None` for an empty result.
+pub fn normalize_optional_list(value: Option<&[String]>) -> Option<Vec<String>> {
+    let raw = value?;
+    let cleaned: Vec<String> = raw
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+// =============================================================================
+// Secure filesystem helpers
+// =============================================================================
+
+/// Tighten a directory to owner-only (0700) on Unix. No-op on Windows
+/// and on permission-denied (we don't own the parent — best-effort).
+#[cfg(unix)]
+fn secure_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn secure_dir(_path: &Path) {}
+
+/// Tighten a regular file to owner-only read+write (0600) on Unix.
+/// No-op on Windows.
+#[cfg(unix)]
+fn secure_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if path.exists() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) {}
+
+/// Pick the most-compact "Nu" representation for `secs`: "7d" over
+/// "168h" when divisible, etc.
+fn humanize_seconds(secs: u64) -> String {
+    if secs == 0 {
+        return "0s".to_string();
+    }
+    if secs.is_multiple_of(86400) {
+        format!("{}d", secs / 86400)
+    } else if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +1449,159 @@ mod tests {
     }
 
     #[test]
+    fn parse_schedule_kind_recognises_cron_expression() {
+        // Standard 5-field cron — weekdays at 9am.
+        assert_eq!(
+            parse_schedule_kind("0 9 * * 1-5"),
+            Some(ScheduleKind::Cron("0 9 * * 1-5".to_string()))
+        );
+        // Step + wildcard.
+        assert_eq!(
+            parse_schedule_kind("*/15 * * * *"),
+            Some(ScheduleKind::Cron("*/15 * * * *".to_string()))
+        );
+        // 6-field cron (with seconds) — first of every month at midnight.
+        assert!(matches!(
+            parse_schedule_kind("0 0 0 1 * *"),
+            Some(ScheduleKind::Cron(_))
+        ));
+    }
+
+    #[test]
+    fn parse_schedule_kind_recognises_cron_with_extensions() {
+        // croner supports the Quartz/croniter `L` (last day of month) extension.
+        // We want parity with that.
+        assert!(matches!(
+            parse_schedule_kind("0 0 L * *"),
+            Some(ScheduleKind::Cron(_))
+        ));
+    }
+
+    #[test]
+    fn parse_schedule_kind_rejects_invalid_cron_falls_through_to_other_kinds() {
+        // "99 99 * * *" has 5 fields but is invalid (out-of-range). Without a
+        // duration/timestamp fallback match, it must return None — never
+        // accept-as-cron silently.
+        assert_eq!(parse_schedule_kind("99 99 * * *"), None);
+    }
+
+    #[test]
+    fn parse_schedule_kind_recognises_iso_timestamp() {
+        // RFC3339 with Z.
+        match parse_schedule_kind("2026-02-03T14:00:00Z") {
+            Some(ScheduleKind::AtTimestamp(dt)) => {
+                assert_eq!(dt.to_rfc3339(), "2026-02-03T14:00:00+00:00");
+            }
+            other => panic!("expected AtTimestamp, got {:?}", other),
+        }
+        // Naive ISO — parses as local time. We only assert the variant +
+        // round-trip, not a specific UTC value (depends on the test host TZ).
+        assert!(matches!(
+            parse_schedule_kind("2026-02-03T14:00"),
+            Some(ScheduleKind::AtTimestamp(_))
+        ));
+        assert!(matches!(
+            parse_schedule_kind("2026-02-03 14:00:00"),
+            Some(ScheduleKind::AtTimestamp(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_workdir_handles_empty_and_missing() {
+        assert_eq!(normalize_workdir(None).unwrap(), None);
+        assert_eq!(normalize_workdir(Some("")).unwrap(), None);
+        assert_eq!(normalize_workdir(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_workdir_rejects_relative_paths() {
+        let err = normalize_workdir(Some("relative/path")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absolute"),
+            "expected absolute-path error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn normalize_workdir_rejects_nonexistent_dir() {
+        let err = normalize_workdir(Some("/this/definitely/does/not/exist/anywhere")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist") || msg.contains("No such"),
+            "expected does-not-exist error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn normalize_workdir_accepts_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+        let resolved = normalize_workdir(Some(&path_str)).unwrap().unwrap();
+        // canonicalize may add /private on macOS for /tmp paths; compare
+        // resolved-against-resolved instead of substring matching.
+        let expected = tmp.path().canonicalize().unwrap();
+        assert_eq!(std::path::PathBuf::from(&resolved), expected);
+    }
+
+    #[test]
+    fn normalize_workdir_rejects_file_not_dir() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let err = normalize_workdir(Some(&tmp.path().to_string_lossy())).unwrap_err();
+        assert!(err.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn normalize_optional_str_trims_and_strips_slash() {
+        assert_eq!(normalize_optional_str(None, false), None);
+        assert_eq!(normalize_optional_str(Some(""), false), None);
+        assert_eq!(normalize_optional_str(Some("  "), false), None);
+        assert_eq!(
+            normalize_optional_str(Some(" claude-opus "), false),
+            Some("claude-opus".to_string())
+        );
+        // base_url trailing-slash strip.
+        assert_eq!(
+            normalize_optional_str(Some("https://api.example.com/"), true),
+            Some("https://api.example.com".to_string())
+        );
+        assert_eq!(
+            normalize_optional_str(Some("https://api.example.com///"), true),
+            Some("https://api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_optional_list_trims_and_drops_empties() {
+        let input = vec![
+            "  filesystem  ".to_string(),
+            "".to_string(),
+            "web".to_string(),
+            "   ".to_string(),
+        ];
+        let out = normalize_optional_list(Some(&input)).unwrap();
+        assert_eq!(out, vec!["filesystem".to_string(), "web".to_string()]);
+        // All-empty input collapses to None.
+        let all_empty = vec!["".to_string(), "   ".to_string()];
+        assert_eq!(normalize_optional_list(Some(&all_empty)), None);
+        assert_eq!(normalize_optional_list(None), None);
+    }
+
+    #[test]
+    fn schedule_kind_is_one_shot_classification() {
+        assert!(!ScheduleKind::Recurring { interval_secs: 60 }.is_one_shot());
+        assert!(ScheduleKind::OneShot { delay_secs: 60 }.is_one_shot());
+        assert!(!ScheduleKind::Cron("* * * * *".to_string()).is_one_shot());
+        assert!(ScheduleKind::AtTimestamp(chrono::Utc::now()).is_one_shot());
+    }
+
+    #[test]
+    fn seconds_returns_zero_for_non_interval_kinds() {
+        assert_eq!(ScheduleKind::Cron("* * * * *".to_string()).seconds(), 0);
+        assert_eq!(ScheduleKind::AtTimestamp(chrono::Utc::now()).seconds(), 0);
+    }
+
+    #[test]
     fn parse_schedule_rejects_zero() {
         // Without this, "every 0s" would return Some(0) and cause the
         // scheduler to fire the job on every tick in a tight loop.
@@ -314,6 +1638,29 @@ mod tests {
             last_run: None,
             origin_channel: None,
             origin_chat_id: None,
+            state: String::new(),
+            created_at: None,
+            next_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            paused_at: None,
+            paused_reason: None,
+            repeat: RepeatConfig::default(),
+            schedule_display: String::new(),
+            script: None,
+            no_agent: false,
+            context_from: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            enabled_toolsets: None,
+            workdir: None,
+            profile: None,
+            deliver: String::new(),
+            wrap_response: None,
+            skill: None,
+            skills: None,
         });
         store.save().unwrap();
         // After a clean save, the parent directory must contain exactly
@@ -376,6 +1723,29 @@ mod tests {
             last_run: None,
             origin_channel: Some("telegram".into()),
             origin_chat_id: Some("123".into()),
+            state: String::new(),
+            created_at: None,
+            next_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            paused_at: None,
+            paused_reason: None,
+            repeat: RepeatConfig::default(),
+            schedule_display: String::new(),
+            script: None,
+            no_agent: false,
+            context_from: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            enabled_toolsets: None,
+            workdir: None,
+            profile: None,
+            deliver: String::new(),
+            wrap_response: None,
+            skill: None,
+            skills: None,
         });
         store.save().unwrap();
 

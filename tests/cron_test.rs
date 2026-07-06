@@ -1,5 +1,5 @@
 use fennec::bus::MessageBus;
-use fennec::cron::{parse_schedule, CronJob, CronScheduler, JobStore};
+use fennec::cron::{parse_schedule, CronJob, CronScheduler, JobStore, RepeatConfig};
 
 // ---------------------------------------------------------------------------
 // Schedule parsing
@@ -59,13 +59,39 @@ fn sample_job(id: &str, name: &str, schedule: &str) -> CronJob {
         last_run: None,
         origin_channel: None,
         origin_chat_id: None,
+        state: String::new(),
+        created_at: None,
+        next_run_at: None,
+        last_status: None,
+        last_error: None,
+        last_delivery_error: None,
+        paused_at: None,
+        paused_reason: None,
+        repeat: RepeatConfig::default(),
+        schedule_display: String::new(),
+        script: None,
+        no_agent: false,
+        context_from: None,
+        model: None,
+        provider: None,
+        base_url: None,
+        enabled_toolsets: None,
+        workdir: None,
+        profile: None,
+        deliver: String::new(),
+        wrap_response: None,
+        skill: None,
+        skills: None,
     }
 }
 
 #[test]
 fn test_job_store_add_and_list() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut store = JobStore::new(tmp.path());
+    // Each scheduler test gets its own tempdir so the cross-process
+    // `.tick.lock` file (sibling of jobs.json) doesn't collide when
+    // cargo runs multiple integration tests in parallel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = JobStore::new(tmp.path().join("jobs.json"));
 
     assert!(store.list_jobs().is_empty());
 
@@ -79,8 +105,11 @@ fn test_job_store_add_and_list() {
 
 #[test]
 fn test_job_store_remove() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut store = JobStore::new(tmp.path());
+    // Each scheduler test gets its own tempdir so the cross-process
+    // `.tick.lock` file (sibling of jobs.json) doesn't collide when
+    // cargo runs multiple integration tests in parallel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = JobStore::new(tmp.path().join("jobs.json"));
 
     store.add_job(sample_job("1", "a", "every 1h"));
     store.add_job(sample_job("2", "b", "every 1h"));
@@ -95,8 +124,11 @@ fn test_job_store_remove() {
 
 #[test]
 fn test_job_store_get_mut() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut store = JobStore::new(tmp.path());
+    // Each scheduler test gets its own tempdir so the cross-process
+    // `.tick.lock` file (sibling of jobs.json) doesn't collide when
+    // cargo runs multiple integration tests in parallel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = JobStore::new(tmp.path().join("jobs.json"));
 
     store.add_job(sample_job("1", "a", "every 1h"));
     {
@@ -144,16 +176,18 @@ fn test_job_store_load_missing_file() {
 
 #[tokio::test]
 async fn test_scheduler_tick_fires_due_job() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut store = JobStore::new(tmp.path());
+    // Each scheduler test gets its own tempdir so the cross-process
+    // `.tick.lock` file (sibling of jobs.json) doesn't collide when
+    // cargo runs multiple integration tests in parallel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = JobStore::new(tmp.path().join("jobs.json"));
 
-    // PR #19 changed behavior: newly-added jobs no longer fire on the
-    // first tick (avoids surprise execution at startup). To exercise the
-    // due-job path here, plant a last_run far enough in the past that the
-    // job's interval has unambiguously elapsed.
+    // The scheduler now reads stored `next_run_at` (post-refactor). Plant
+    // next_run_at a few seconds in the past — within "every 1m"'s 120s
+    // grace window — so the tick fires it instead of fast-forwarding.
     let mut job = sample_job("fire_me", "test_fire", "every 1m");
-    let past = chrono::Utc::now() - chrono::Duration::hours(1);
-    job.last_run = Some(past.to_rfc3339());
+    let past = chrono::Utc::now() - chrono::Duration::seconds(5);
+    job.next_run_at = Some(past.to_rfc3339());
     store.add_job(job);
 
     let (bus, mut receiver) = MessageBus::new(16);
@@ -161,20 +195,34 @@ async fn test_scheduler_tick_fires_due_job() {
 
     scheduler.tick().await;
 
-    // Should have published one inbound message.
     let msg = receiver
         .inbound_rx
         .try_recv()
         .expect("expected an inbound message from cron");
     assert_eq!(msg.channel, "cron");
     assert!(msg.sender.contains("fire_me"));
-    assert_eq!(msg.content, "run test_fire");
+    // Agent jobs get the cron execution hint prepended (delivery is
+    // automatic + [SILENT] semantics); the command follows it.
+    assert!(
+        msg.content
+            .starts_with("[IMPORTANT: You are running as a scheduled cron job."),
+        "missing cron hint: {}",
+        msg.content
+    );
+    assert!(
+        msg.content.ends_with("run test_fire"),
+        "missing original command: {}",
+        msg.content
+    );
 }
 
 #[tokio::test]
 async fn test_scheduler_tick_skips_recently_run_job() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut store = JobStore::new(tmp.path());
+    // Each scheduler test gets its own tempdir so the cross-process
+    // `.tick.lock` file (sibling of jobs.json) doesn't collide when
+    // cargo runs multiple integration tests in parallel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = JobStore::new(tmp.path().join("jobs.json"));
 
     // Job that was just run -- should not fire again within the interval.
     let mut job = sample_job("skip_me", "test_skip", "every 1h");
@@ -192,8 +240,11 @@ async fn test_scheduler_tick_skips_recently_run_job() {
 
 #[tokio::test]
 async fn test_scheduler_tick_skips_disabled_job() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut store = JobStore::new(tmp.path());
+    // Each scheduler test gets its own tempdir so the cross-process
+    // `.tick.lock` file (sibling of jobs.json) doesn't collide when
+    // cargo runs multiple integration tests in parallel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = JobStore::new(tmp.path().join("jobs.json"));
 
     let mut job = sample_job("disabled", "test_disabled", "every 1m");
     job.enabled = false;
@@ -209,22 +260,31 @@ async fn test_scheduler_tick_skips_disabled_job() {
 
 #[tokio::test]
 async fn test_scheduler_tick_updates_last_run() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut store = JobStore::new(tmp.path());
-    store.add_job(sample_job("updater", "test_update", "every 1m"));
+    // After the refactor, `last_run` is written by `mark_job_run` after a
+    // real fire (not anchored on first sight). Set up a job whose
+    // `next_run_at` is past so the tick fires it; then verify the
+    // post-run bookkeeping (last_run + last_status) is persisted.
+    // Each scheduler test gets its own tempdir so the cross-process
+    // `.tick.lock` file (sibling of jobs.json) doesn't collide when
+    // cargo runs multiple integration tests in parallel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = JobStore::new(tmp.path().join("jobs.json"));
+    let mut job = sample_job("updater", "test_update", "every 1m");
+    let past = chrono::Utc::now() - chrono::Duration::seconds(5);
+    job.next_run_at = Some(past.to_rfc3339());
+    store.add_job(job);
 
     let (bus, _receiver) = MessageBus::new(16);
     let mut scheduler = CronScheduler::new(store, bus, Some(60));
 
     scheduler.tick().await;
 
-    // After tick we can't directly access the store through scheduler,
-    // but we can reload from disk and check.
-    let mut reloaded = JobStore::new(tmp.path());
+    let mut reloaded = JobStore::new(tmp.path().join("jobs.json"));
     reloaded.load().unwrap();
     let job = &reloaded.list_jobs()[0];
     assert!(
         job.last_run.is_some(),
         "last_run should be set after firing"
     );
+    assert_eq!(job.last_status.as_deref(), Some("ok"));
 }

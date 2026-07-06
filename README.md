@@ -80,7 +80,7 @@ overwrite.
 | `fennec agent` | Interactive chat session. `--message <text>` for single-shot. `--model <id>` to override. |
 | `fennec gateway` | Start the multi-channel server. Runs all configured channels, the HTTP gateway, the cron scheduler, and the heartbeat loop together. |
 | `fennec onboard` | Interactive setup wizard. `--force` overwrites an existing config. |
-| `fennec login` | Anthropic OAuth (PKCE) flow. Persists encrypted token. Alternative to setting `provider.api_key`. |
+| `fennec login` | OAuth flow. Default: Anthropic (PKCE). `--provider copilot` runs the GitHub device-code flow for the Copilot provider. |
 | `fennec doctor` | Self-diagnostic — verifies provider reachability, API key validity, memory DB schema, Plurum connectivity, skill loading, and channel config. |
 | `fennec status` | Print version and quick status. |
 
@@ -108,9 +108,16 @@ both paths work.
 |---|---|---|
 | Anthropic | SSE | Extended thinking, budget tokens |
 | OpenAI | chunked | `reasoning_effort` (o1 family) |
+| Google Gemini | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
+| Gemini (Cloud Code) | SSE (`alt=sse`) | `thinkingConfig` budget (2.5 family) |
+| OpenAI Codex (Responses API) | SSE | `reasoning.effort` (gpt-5 / codex) |
+| Azure OpenAI / Foundry | chunked | `reasoning_effort` (o-series / gpt-5) |
+| AWS Bedrock | event-stream (Converse) | temperature fallback |
+| GitHub Copilot | chunked | `reasoning_effort` (per underlying model) |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
+| DeepSeek | OpenAI-shaped | `thinking` + `reasoning_effort` (V4 / R1) |
 
 Switch providers by setting `provider.name` in config; no code changes. The
 `reliable_provider` wrapper (in `src/providers/reliable.rs`) lets you list a
@@ -118,7 +125,54 @@ fallback chain with cooldowns and an overall deadline.
 
 Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KIMI_API_KEY`).
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
+`KIMI_API_KEY`, `DEEPSEEK_API_KEY`).
+
+**DeepSeek** (`provider.name = "deepseek"`) uses DeepSeek's OpenAI-compatible
+endpoint (`https://api.deepseek.com/v1`, key `DEEPSEEK_API_KEY`). Thinking-capable
+models (`deepseek-reasoner`, `deepseek-v4-*` and later) get an explicit
+`thinking: {type: enabled|disabled}` field driven by the `/think:<level>`
+setting, so `/think:off` truly disables reasoning; `deepseek-chat` (V3) is a
+plain non-thinking model. The `reasoning_content` echo-back that DeepSeek's
+thinking mode requires across turns is handled automatically.
+
+Gemini has two flavors: `gemini` uses a `GEMINI_API_KEY`, while `gemini-cloudcode`
+signs in with your Google account (`fennec login --provider gemini-cloudcode`)
+for the Cloud Code Assist free tier — no API key, generous personal quota. The
+login runs a loopback OAuth flow (with a paste fallback for headless/SSH hosts)
+and discovers your Code Assist project automatically.
+
+Set `provider.name = "codex"` to use OpenAI's Responses API (`/v1/responses`,
+for gpt-5 / Codex models) instead of Chat Completions; it authenticates with the
+same `OPENAI_API_KEY`.
+
+**Azure OpenAI / Foundry** (`provider.name = "azure"`) is configured via
+`config.toml`: set `provider.base_url` to your resource endpoint
+(`https://<resource>.openai.azure.com`) and `provider.model` to the model family
+(`gpt-5`, `o3-mini`, …). The deployment used for routing defaults to that model
+name; set `AZURE_DEPLOYMENT` when your deployment is named differently. Auth is
+auto-detected — an `AZURE_OPENAI_API_KEY` (or `provider.api_key`) uses key auth;
+otherwise it goes keyless via Microsoft Entra ID, either through
+`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` (service principal) or
+the Azure CLI (`az login`). Override `AZURE_OPENAI_API_VERSION` /
+`AZURE_OPENAI_SCOPE` if needed.
+
+**AWS Bedrock** (`provider.name = "bedrock"`) uses the Converse API with
+SigV4-signed requests — no AWS SDK dependency. Set `provider.model` to the
+Bedrock model or inference-profile id (e.g.
+`anthropic.claude-3-5-sonnet-20241022-v2:0` or `us.anthropic.claude-…`).
+Credentials resolve through a chain (env static keys → web-identity / EKS IRSA
+via `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` → named profile from
+`~/.aws/credentials` (`AWS_PROFILE`) → EC2/EKS instance role via IMDSv2); region
+from `AWS_REGION` / `AWS_DEFAULT_REGION` (default `us-east-1`). SSO /
+assume-role profiles are a follow-up.
+**GitHub Copilot** (`provider.name = "copilot"`) uses the OpenAI-compatible
+Copilot chat API. It needs a Copilot-enabled GitHub OAuth token (`gho_`/`ghu_`,
+not a classic PAT), resolved from `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` /
+`GITHUB_TOKEN`, then `gh auth token`, then a token saved by
+`fennec login --provider copilot` (GitHub device-code flow). The provider
+exchanges it for a short-lived Copilot token automatically. Set
+`provider.model` to a Copilot model id (`gpt-4o`, `o1`, `claude-3.5-sonnet`, …).
 
 ## Tools
 

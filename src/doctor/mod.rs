@@ -96,6 +96,54 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         return CheckResult::pass("api_key", "ollama requires no key");
     }
 
+    // gemini-cloudcode authenticates via Google OAuth, not an API key.
+    if matches!(config.provider.name.as_str(), "gemini-cloudcode" | "google-cloudcode") {
+        return CheckResult::pass(
+            "api_key",
+            "OAuth provider — sign in with `fennec login --provider gemini-cloudcode`",
+        );
+    }
+
+    // Azure can use an API key OR keyless Entra ID, so a missing key isn't a
+    // failure here.
+    if matches!(config.provider.name.as_str(), "azure" | "foundry") {
+        for key_var in ["AZURE_OPENAI_API_KEY", "AZURE_FOUNDRY_API_KEY"] {
+            if std::env::var(key_var).map(|v| !v.is_empty()).unwrap_or(false) {
+                return CheckResult::pass("api_key", format!("from {key_var} env"));
+            }
+        }
+        if !config.provider.api_key.is_empty() {
+            return CheckResult::pass("api_key", "from config.toml");
+        }
+        return CheckResult::pass("api_key", "keyless — using Microsoft Entra ID (CLI / service principal)");
+    }
+
+    // Bedrock authenticates with AWS credentials (env vars or instance role),
+    // not a single API key.
+    if matches!(config.provider.name.as_str(), "bedrock" | "aws") {
+        if std::env::var("AWS_ACCESS_KEY_ID").map(|v| !v.is_empty()).unwrap_or(false) {
+            return CheckResult::pass("api_key", "AWS credentials from env");
+        }
+        return CheckResult::pass(
+            "api_key",
+            "AWS credentials via env or instance role (IMDS)",
+        );
+    }
+
+    // Copilot authenticates with a GitHub token (env / gh CLI / device login),
+    // exchanged for a Copilot token by the provider — not a single API key.
+    if matches!(config.provider.name.as_str(), "copilot" | "github-copilot") {
+        for var in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+            if std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false) {
+                return CheckResult::pass("api_key", format!("GitHub token from {var}"));
+            }
+        }
+        return CheckResult::pass(
+            "api_key",
+            "GitHub token via `gh auth token` or `fennec login --provider copilot`",
+        );
+    }
+
     if !config.provider.api_key.is_empty() {
         match secret_store.decrypt(&config.provider.api_key) {
             Ok(k) if !k.is_empty() => {
@@ -118,6 +166,9 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "google" | "gemini" => "GEMINI_API_KEY",
+        "codex" | "openai-responses" => "OPENAI_API_KEY",
         _ => "ANTHROPIC_API_KEY",
     };
     match std::env::var(env_var) {
@@ -159,6 +210,38 @@ pub async fn check_provider_reachable(
     config: &FennecConfig,
     api_key: &str,
 ) -> CheckResult {
+    let is_oauth_provider =
+        matches!(config.provider.name.as_str(), "gemini-cloudcode" | "google-cloudcode");
+    if is_oauth_provider {
+        return CheckResult::warn(
+            "provider_reachable",
+            "skipped — OAuth provider; verify with `fennec login --provider gemini-cloudcode`",
+        );
+    }
+    // Azure routing + Entra token acquisition are involved enough that a
+    // trivial GET probe isn't representative — verify it by actually running.
+    if matches!(config.provider.name.as_str(), "azure" | "foundry") {
+        return CheckResult::warn(
+            "provider_reachable",
+            "skipped — Azure provider (verify with a real request)",
+        );
+    }
+    // Bedrock requires SigV4-signed requests, so a trivial GET probe isn't
+    // representative — verify it by actually running.
+    if matches!(config.provider.name.as_str(), "bedrock" | "aws") {
+        return CheckResult::warn(
+            "provider_reachable",
+            "skipped — Bedrock (verify with a real request)",
+        );
+    }
+    // Copilot needs a GitHub-token → Copilot-token exchange before a request,
+    // so a trivial probe isn't representative.
+    if matches!(config.provider.name.as_str(), "copilot" | "github-copilot") {
+        return CheckResult::warn(
+            "provider_reachable",
+            "skipped — Copilot (verify with a real request after `fennec login --provider copilot`)",
+        );
+    }
     if api_key.is_empty() && config.provider.name != "ollama" {
         return CheckResult::warn(
             "provider_reachable",
@@ -183,7 +266,7 @@ pub async fn check_provider_reachable(
                 .header("anthropic-version", "2023-06-01");
             (url, req)
         }
-        "openai" => {
+        "openai" | "codex" | "openai-responses" => {
             let url = "https://api.openai.com/v1/models".to_string();
             let req = client.get(&url).bearer_auth(api_key);
             (url, req)
@@ -193,9 +276,24 @@ pub async fn check_provider_reachable(
             let req = client.get(&url).bearer_auth(api_key);
             (url, req)
         }
+        "deepseek" => {
+            let url = "https://api.deepseek.com/v1/models".to_string();
+            let req = client.get(&url).bearer_auth(api_key);
+            (url, req)
+        }
         "kimi" | "moonshot" => {
             let url = "https://api.moonshot.ai/v1/models".to_string();
             let req = client.get(&url).bearer_auth(api_key);
+            (url, req)
+        }
+        "google" | "gemini" => {
+            let base = if config.provider.base_url.is_empty() {
+                "https://generativelanguage.googleapis.com/v1beta"
+            } else {
+                config.provider.base_url.trim_end_matches('/')
+            };
+            let url = format!("{}/models", base);
+            let req = client.get(&url).header("x-goog-api-key", api_key);
             (url, req)
         }
         "ollama" => {
@@ -345,6 +443,9 @@ pub async fn run_all(
                     "openai" => "OPENAI_API_KEY",
                     "kimi" | "moonshot" => "KIMI_API_KEY",
                     "openrouter" => "OPENROUTER_API_KEY",
+                    "deepseek" => "DEEPSEEK_API_KEY",
+                    "google" | "gemini" => "GEMINI_API_KEY",
+                    "codex" | "openai-responses" => "OPENAI_API_KEY",
                     _ => "",
                 };
                 std::env::var(env_var).unwrap_or_default()

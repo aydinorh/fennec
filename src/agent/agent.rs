@@ -6,10 +6,11 @@ use anyhow::{Result, bail};
 use crate::collective::search::{CollectiveSearch, RankedExperience, SearchConfidence};
 use crate::memory::decay::apply_time_decay;
 use crate::memory::traits::Memory;
-use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent};
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall};
 use crate::security::prompt_guard::{PromptGuard, ScanResult};
 use crate::tools::traits::{Tool, ToolSpec};
 
+use super::compressor::ContextCompressor;
 use super::context::SystemPromptBuilder;
 use super::scrub;
 use super::thinking::{self, ThinkingLevel};
@@ -71,10 +72,14 @@ pub struct Agent {
     /// but are filtered out of `tool_specs` shown to the model
     /// and rejected at dispatch time.
     disabled_tools: HashSet<String>,
+    /// Per-turn tool-call loop guardrails (repeated failures,
+    /// read-only no-progress). Warnings by default; block/halt only
+    /// when `[agent.tool_loop_guardrails] hard_stop_enabled` opts in.
+    loop_guard: super::loop_::LoopGuard,
     /// Image attachments queued by `/image` and `/paste` for
     /// the next user turn. Drained at the top of `turn` /
     /// `turn_streaming` and attached to the outbound user
-    /// `ChatMessage`. Mirrors Hermes'
+    /// `ChatMessage`. Mirrors the upstream's
     /// `session["attached_images"]` (`tui_gateway/server.py:3361-3401`).
     pending_attachments: Vec<super::attachment::ImageAttachment>,
     /// Steer text queued via `/steer` while a turn is running
@@ -84,6 +89,16 @@ pub struct Agent {
     /// reply. Multiple steer calls concatenate with newlines.
     /// Mirrors `run_agent.py:4493-4527` + `:4545-4600`.
     pending_steer: Option<String>,
+    /// Automatic context compactor. Consulted at the top of each tool-loop
+    /// iteration: when the conversation exceeds the provider's context
+    /// threshold it summarises the middle of history in place, so long
+    /// multi-iteration turns don't grow past the model's window.
+    context_compressor: ContextCompressor,
+    /// Master switch for automatic compaction. When false, `maybe_compact`
+    /// is a no-op and history is never altered mid-turn (useful when an
+    /// operator wants strict prompt-cache stability and accepts the risk of
+    /// hitting the context limit on very long turns).
+    compression_enabled: bool,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
     max_tool_iterations: usize,
@@ -339,6 +354,7 @@ impl Agent {
         if let Some(ref flag) = self.interrupt_flag {
             flag.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+        self.loop_guard.reset_for_turn();
         let turn_start = std::time::Instant::now();
         let tokens_before_input = self.total_input_tokens;
         let tokens_before_output = self.total_output_tokens;
@@ -349,6 +365,9 @@ impl Agent {
             if self.is_interrupted() {
                 bail!("interrupted by user");
             }
+            // Auto-compact before the call so a long, tool-heavy turn can't
+            // grow history past the model's context window.
+            self.maybe_compact().await;
             self.callbacks.on_status("calling provider");
             let response = self.call_provider().await?;
             self.total_api_calls += 1;
@@ -420,51 +439,11 @@ impl Agent {
             assistant_msg.reasoning = response.reasoning.clone();
             self.history.push(assistant_msg);
 
-            // Execute each tool call and push results. Combines:
-            //  - plugin lifecycle hooks (pre/post can skip or rewrite),
-            //  - frontend callbacks (start + complete for live UI).
-            for tc in &response.tool_calls {
-                tracing::info!(tool = %tc.name, "Executing tool call");
-                self.callbacks.on_tool_start(super::callbacks::ToolStart {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    preview: preview_for_args(&tc.arguments),
-                    args: tc.arguments.clone(),
-                });
-                let started = std::time::Instant::now();
-                let (final_output, final_success) =
-                    match self.hooks.fire_pre_tool(&tc.name, &tc.arguments) {
-                        crate::plugins::PreToolResolution::Skip { reason } => {
-                            tracing::warn!(
-                                tool = %tc.name,
-                                reason = %reason,
-                                "Tool call skipped by plugin pre_tool_call hook"
-                            );
-                            (format!("[skipped by plugin: {reason}]"), false)
-                        }
-                        crate::plugins::PreToolResolution::Continue { effective_args } => {
-                            let (output, success) =
-                                self.execute_tool(&tc.name, &effective_args).await;
-                            let post = self.hooks.fire_post_tool(
-                                &tc.name,
-                                &effective_args,
-                                &output,
-                                success,
-                            );
-                            (post.output, post.success)
-                        }
-                    };
-                tracing::info!(tool = %tc.name, success = %final_success, "Tool call complete");
-                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    error: if final_success { None } else { Some(final_output.clone()) },
-                    summary: Some(truncate_summary(&final_output)),
-                });
-                self.history
-                    .push(ChatMessage::tool_result(&tc.id, &final_output));
-            }
+            // Execute the tool calls — concurrently when the batch is
+            // parallel-safe, else sequentially — running plugin pre/post-tool
+            // hooks and firing the frontend start/complete callbacks. Results
+            // are appended to history in the original order.
+            self.execute_tool_calls(&response.tool_calls, true).await;
 
             // Drain any /steer text queued during the tool
             // batch so the model sees it before its next
@@ -472,9 +451,24 @@ impl Agent {
             // point — the loop body ran), apply_pending_steer
             // is a no-op.
             self.apply_pending_steer_to_tool_results();
+
+            // Loop-guardrail halt: a circuit-breaker decision fired
+            // during this batch (hard_stop_enabled only). End the
+            // turn in a controlled way instead of letting the model
+            // keep burning iterations on a stuck path.
+            if let Some(msg) = self.loop_guard.halt_message() {
+                let text = format!("⚠️ Tool loop guardrail halted this turn: {msg}");
+                self.history.push(ChatMessage::assistant(&text));
+                self.callbacks.on_turn_complete(&text);
+                return Ok(text);
+            }
         }
 
-        bail!("max tool iterations ({}) exceeded", self.max_tool_iterations)
+        // Budget exhausted: end gracefully with a tool-less summary instead of
+        // erroring the whole turn. See `summarize_after_max_iterations`.
+        self.callbacks
+            .on_status("max iterations reached — requesting summary");
+        self.summarize_after_max_iterations().await
     }
 
     /// Execute a single conversational turn with streaming.
@@ -673,6 +667,7 @@ impl Agent {
         if let Some(ref flag) = self.interrupt_flag {
             flag.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+        self.loop_guard.reset_for_turn();
 
         // Tool-iteration loop, streaming each LLM call.
         for _iteration in 0..self.max_tool_iterations {
@@ -680,6 +675,9 @@ impl Agent {
             if self.is_interrupted() {
                 bail!("interrupted by user");
             }
+            // Auto-compact before the call so a long, tool-heavy turn can't
+            // grow history past the model's context window.
+            self.maybe_compact().await;
             self.callbacks.on_status("calling provider");
 
             let enabled = self.enabled_tool_specs();
@@ -735,10 +733,7 @@ impl Agent {
                     }
                     StreamEvent::ToolCallEnd { id: _ } => {
                         if let Some((id, name, args)) = current_tool.take() {
-                            let arguments: serde_json::Value =
-                                serde_json::from_str(&args).unwrap_or_else(|_| {
-                                    serde_json::Value::Object(serde_json::Map::new())
-                                });
+                            let arguments = parse_streamed_tool_args(&name, &args);
                             tool_calls.push(ToolCall {
                                 id,
                                 name,
@@ -780,36 +775,30 @@ impl Agent {
             }
             self.history.push(assistant_msg);
 
-            for tc in &tool_calls {
-                self.callbacks.on_tool_start(super::callbacks::ToolStart {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    preview: preview_for_args(&tc.arguments),
-                    args: tc.arguments.clone(),
-                });
-                let started = std::time::Instant::now();
-                let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
-                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
-                    tool_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    error: if success { None } else { Some(output.clone()) },
-                    summary: Some(truncate_summary(&output)),
-                });
-                self.history
-                    .push(ChatMessage::tool_result(&tc.id, &output));
-            }
+            // Execute the tool calls (concurrently when parallel-safe). The
+            // streaming path does not run plugin pre/post-tool hooks, matching
+            // prior behaviour (`with_hooks = false`).
+            self.execute_tool_calls(&tool_calls, false).await;
 
             // Drain any /steer text queued during the tool batch
             // (streaming path). Same hook as turn(): inject after
             // tool results before looping for the next provider call.
             self.apply_pending_steer_to_tool_results();
+
+            // Loop-guardrail halt — same controlled turn end as turn().
+            if let Some(msg) = self.loop_guard.halt_message() {
+                let text = format!("⚠️ Tool loop guardrail halted this turn: {msg}");
+                self.history.push(ChatMessage::assistant(&text));
+                self.callbacks.on_text_delta(&text);
+                self.callbacks.on_turn_complete(&text);
+                return Ok(text);
+            }
         }
 
-        bail!(
-            "max tool iterations ({}) exceeded",
-            self.max_tool_iterations
-        )
+        // Budget exhausted (streaming path): same graceful tool-less summary.
+        self.callbacks
+            .on_status("max iterations reached — requesting summary");
+        self.summarize_after_max_iterations().await
     }
 
     /// Record the final assistant text after a [`Self::turn_streamed`]
@@ -865,64 +854,381 @@ impl Agent {
         response
     }
 
-    /// Find a tool by name and execute it. Returns the formatted output string
-    /// with credentials scrubbed, plus the structured success flag from the
-    /// tool itself (`true` only when the tool reported success — tool output
-    /// containing the substring "error" must not be confused with failure).
-    async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
-        // Disabled tools must not run.
-        if self.disabled_tools.contains(name) {
-            return (
-                format!("Error: tool '{name}' is currently disabled"),
-                false,
-            );
+    /// Graceful end-of-budget handler. When the tool-iteration cap is hit we
+    /// do NOT error the turn — instead we make one final provider call with
+    /// tools disabled, nudging the model to summarise what it accomplished,
+    /// and return that text. A budget-exhausted turn should still give the
+    /// user a usable answer, not a stack-trace-style failure.
+    ///
+    /// The summary instruction is appended to the trailing tool-result message
+    /// — the same channel `/steer` uses — so providers that require strict
+    /// user/assistant role alternation (Anthropic in particular) never see two
+    /// consecutive user turns. When there is no trailing tool result to attach
+    /// to (degenerate case, e.g. a zero-iteration cap), we fall back to a
+    /// standalone user message.
+    async fn summarize_after_max_iterations(&mut self) -> Result<String> {
+        const SUMMARY_INSTRUCTION: &str = "[System] You've reached the maximum \
+            number of tool-calling iterations allowed for this turn. Provide a \
+            final response summarising what you found and accomplished so far. \
+            Do not attempt to call any more tools.";
+
+        match self.history.last_mut() {
+            Some(last) if last.role == "tool" => {
+                let content = last.content.get_or_insert_with(String::new);
+                content.push_str("\n\n");
+                content.push_str(SUMMARY_INSTRUCTION);
+            }
+            _ => {
+                self.history.push(ChatMessage::user(SUMMARY_INSTRUCTION));
+            }
         }
 
-        // Route memory-provider-contributed tools to the manager first.
-        if self.memory_manager.handles_tool(name) {
-            let (raw, success) = match self
-                .memory_manager
-                .handle_tool_call(name, args.clone())
-                .await
-            {
-                Ok(result) => {
-                    if result.success {
-                        (result.output, true)
-                    } else {
-                        (
-                            format!(
-                                "Error: {}",
-                                result.error.unwrap_or_else(|| "unknown error".to_string())
-                            ),
-                            false,
-                        )
-                    }
-                }
-                Err(e) => (format!("Memory provider tool failed: {e}"), false),
-            };
-            return (scrub::scrub_credentials(&raw), success);
-        }
-
-        let (raw, success) = match self.tools.iter().find(|t| t.name() == name) {
-            Some(t) => match t.execute(args.clone()).await {
-                Ok(result) => {
-                    if result.success {
-                        (result.output, true)
-                    } else {
-                        (
-                            format!(
-                                "Error: {}",
-                                result.error.unwrap_or_else(|| "unknown error".to_string())
-                            ),
-                            false,
-                        )
-                    }
-                }
-                Err(e) => (format!("Tool execution failed: {e}"), false),
-            },
-            None => (format!("Unknown tool: {name}"), false),
+        // Tools stripped — the model must answer in text. Clone the provider
+        // Arc so the request can borrow `self` immutably across the await
+        // without conflicting with the provider handle.
+        let provider = Arc::clone(&self.provider);
+        let request = ChatRequest {
+            system: self.system_prompt.as_deref(),
+            messages: &self.history,
+            tools: None,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            thinking_level: self.thinking_level,
         };
-        (scrub::scrub_credentials(&raw), success)
+        let response = provider.chat(request).await?;
+        self.total_api_calls += 1;
+
+        // Track usage from the summary call so /usage stays accurate.
+        if let Some(ref usage) = response.usage {
+            self.total_input_tokens += usage.input_tokens;
+            self.total_output_tokens += usage.output_tokens;
+            self.last_prompt_tokens = usage.input_tokens
+                + usage.cache_read_tokens.unwrap_or(0)
+                + usage.cache_write_tokens.unwrap_or(0);
+            if let Some(c) = usage.cache_read_tokens {
+                self.total_cache_read_tokens += c;
+            }
+            if let Some(c) = usage.cache_write_tokens {
+                self.total_cache_write_tokens += c;
+            }
+        }
+
+        let text = response.content.unwrap_or_default();
+        self.history.push(ChatMessage::assistant(&text));
+        self.callbacks.on_turn_complete(&text);
+        Ok(text)
+    }
+
+    /// Compact the conversation in place if it has grown past the context
+    /// threshold. Called at the top of each tool-loop iteration. No-op when
+    /// compaction is disabled, the provider reports no context window, or the
+    /// history is still under threshold. On a successful compaction the cached
+    /// system prompt is left untouched — compaction alters message history, not
+    /// the system prefix, so the provider's prompt cache stays valid.
+    async fn maybe_compact(&mut self) {
+        if !self.compression_enabled {
+            return;
+        }
+        let ctx_window = self.provider.context_window();
+        if ctx_window == 0 {
+            return;
+        }
+        if !self
+            .context_compressor
+            .should_compress(&self.history, ctx_window)
+        {
+            return;
+        }
+        let before = self.history.len();
+        // Own the compressor + provider handle so neither aliases the
+        // `&mut self.history` borrow during the summarisation call.
+        let compressor = self.context_compressor.clone();
+        let provider = Arc::clone(&self.provider);
+        match compressor
+            .compress(&mut self.history, provider.as_ref(), ctx_window)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    before_messages = before,
+                    after_messages = self.history.len(),
+                    "auto-compacted conversation context"
+                );
+                self.callbacks.on_status("compacted context");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // A compaction failure must never abort the turn — log it and
+                // continue with the uncompacted history (the provider call may
+                // still succeed, or surface its own context error).
+                tracing::warn!("context compaction failed: {e}");
+            }
+        }
+    }
+
+    /// Execute a batch of tool calls — concurrently when the batch is
+    /// parallel-safe, otherwise sequentially. Pushes one tool-result message
+    /// per call to `history` in the original order and fires the start /
+    /// complete frontend callbacks. `with_hooks` enables the plugin pre/post-
+    /// tool hooks: the `turn` path passes `true`; the streaming path passes
+    /// `false`, matching prior behaviour.
+    async fn execute_tool_calls(&mut self, tool_calls: &[ToolCall], with_hooks: bool) {
+        // Loop-guard pre-check: if ANY call in the batch is currently
+        // blocked (hard-stop mode), run the whole batch sequentially —
+        // the sequential path handles per-call block/halt resolution.
+        let any_blocked = tool_calls.iter().any(|tc| {
+            !self
+                .loop_guard
+                .before_call(&tc.name, &tc.arguments)
+                .allows_execution()
+        });
+        if !any_blocked && self.should_parallelize(tool_calls) {
+            self.execute_tool_calls_concurrent(tool_calls, with_hooks).await;
+        } else {
+            self.execute_tool_calls_sequential(tool_calls, with_hooks).await;
+        }
+    }
+
+    /// Whether a batch of tool calls can safely run concurrently.
+    ///
+    /// A batch parallelises only when it has more than one call, contains no
+    /// interactive tool (`ask_user`), and every call is either read-only (no
+    /// shared mutable state) or a path-scoped file tool whose target path does
+    /// not overlap another path-scoped call in the same batch. Writes to
+    /// overlapping paths, non-read-only tools, and tools we can't classify all
+    /// keep the whole batch sequential — correctness over speed.
+    fn should_parallelize(&self, tool_calls: &[ToolCall]) -> bool {
+        if tool_calls.len() <= 1 {
+            return false;
+        }
+        let mut reserved: Vec<std::path::PathBuf> = Vec::new();
+        for tc in tool_calls {
+            let name = tc.name.as_str();
+            // Interactive tools block on user input — never parallel.
+            if name == "ask_user" {
+                return false;
+            }
+            // Path-scoped file tools may overlap with each other; reserve each
+            // target path and fall back to sequential on any overlap.
+            if matches!(name, "read_file" | "write_file" | "edit_file") {
+                match Self::parallel_scope_path(&tc.arguments) {
+                    Some(path) => {
+                        if reserved.iter().any(|r| Self::paths_overlap(r, &path)) {
+                            return false;
+                        }
+                        reserved.push(path);
+                    }
+                    None => return false,
+                }
+                continue;
+            }
+            // Everything else is parallel-safe only if it's read-only.
+            if !self.tool_is_read_only(name) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Read-only flag for a registered tool by name. Unknown or memory-
+    /// provider tools default to NOT read-only (conservative — keeps them
+    /// sequential).
+    fn tool_is_read_only(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.is_read_only())
+            .unwrap_or(false)
+    }
+
+    /// Normalised absolute target path for a path-scoped file tool, or `None`
+    /// when the `path` argument is missing / empty (treated as "can't tell —
+    /// don't parallelise").
+    fn parallel_scope_path(args: &serde_json::Value) -> Option<std::path::PathBuf> {
+        let raw = args.get("path").and_then(|v| v.as_str())?;
+        if raw.trim().is_empty() {
+            return None;
+        }
+        let p = std::path::Path::new(raw);
+        if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            Some(std::env::current_dir().ok()?.join(p))
+        }
+    }
+
+    /// Two paths overlap when one is a prefix of the other at component
+    /// granularity: `a/b` conflicts with `a/b/c`, but `a/b` and `a/c` don't.
+    fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
+        let ac: Vec<_> = a.components().collect();
+        let bc: Vec<_> = b.components().collect();
+        let n = ac.len().min(bc.len());
+        ac[..n] == bc[..n]
+    }
+
+    /// Clone the owned handles `run_tool_call` needs for one call — the tool
+    /// Arc (if registered), disabled flag, and memory-provider routing flag —
+    /// so the per-call future captures no `&self` borrow.
+    fn tool_call_handles(
+        &self,
+        name: &str,
+    ) -> (Option<Arc<dyn Tool>>, bool, bool) {
+        (
+            self.tools.iter().find(|t| t.name() == name).cloned(),
+            self.disabled_tools.contains(name),
+            self.memory_manager.handles_tool(name),
+        )
+    }
+
+    /// Sequential tool dispatch — one call at a time, in order.
+    async fn execute_tool_calls_sequential(
+        &mut self,
+        tool_calls: &[ToolCall],
+        with_hooks: bool,
+    ) {
+        for tc in tool_calls {
+            tracing::info!(tool = %tc.name, "Executing tool call");
+            self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                tool_id: tc.id.clone(),
+                name: tc.name.clone(),
+                preview: preview_for_args(&tc.arguments),
+                args: tc.arguments.clone(),
+            });
+            // Loop guardrails: a blocked call is NOT executed — the
+            // guard's message becomes the (failed) tool result so the
+            // model learns why. Warnings ride along on the result.
+            let (output, success, dur) =
+                match self.loop_guard.before_call(&tc.name, &tc.arguments) {
+                    super::loop_::GuardAction::Block(msg)
+                    | super::loop_::GuardAction::Halt(msg) => {
+                        (format!("Error: {msg}"), false, std::time::Duration::ZERO)
+                    }
+                    _ => {
+                        let (tool, disabled, mem_handles) = self.tool_call_handles(&tc.name);
+                        let (mut output, success, dur) = run_tool_call(
+                            Arc::clone(&self.hooks),
+                            Arc::clone(&self.memory_manager),
+                            tool,
+                            disabled,
+                            mem_handles,
+                            tc.name.clone(),
+                            tc.arguments.clone(),
+                            with_hooks,
+                        )
+                        .await;
+                        let read_only = self.tool_is_read_only(&tc.name);
+                        match self.loop_guard.after_call(
+                            &tc.name,
+                            &tc.arguments,
+                            &output,
+                            !success,
+                            read_only,
+                        ) {
+                            super::loop_::GuardAction::Warn(msg)
+                            | super::loop_::GuardAction::Halt(msg) => {
+                                output.push_str("\n\n⚠️ ");
+                                output.push_str(&msg);
+                            }
+                            _ => {}
+                        }
+                        (output, success, dur)
+                    }
+                };
+            tracing::info!(tool = %tc.name, success = %success, "Tool call complete");
+            self.callbacks
+                .on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: dur.as_millis() as u64,
+                    error: if success { None } else { Some(output.clone()) },
+                    summary: Some(truncate_summary(&output)),
+                });
+            self.history
+                .push(ChatMessage::tool_result(&tc.id, &output));
+        }
+    }
+
+    /// Concurrent tool dispatch — runs the batch with bounded parallelism and
+    /// reassembles results in the original order. Start callbacks fire for the
+    /// whole batch up front (so every tool shows as in-flight); complete
+    /// callbacks and history pushes happen in order once results are in.
+    ///
+    /// Each per-tool future owns its handles (Arc clones), so the batch runs
+    /// without borrowing `&self` across the await — which keeps the turn future
+    /// `Send` for the gateway / channel spawn paths.
+    async fn execute_tool_calls_concurrent(
+        &mut self,
+        tool_calls: &[ToolCall],
+        with_hooks: bool,
+    ) {
+        use futures::StreamExt;
+        // Worker cap: overlaps I/O-bound tools without unbounded fan-out.
+        const MAX_TOOL_CONCURRENCY: usize = 8;
+
+        for tc in tool_calls {
+            tracing::info!(tool = %tc.name, "Executing tool call (concurrent)");
+            self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                tool_id: tc.id.clone(),
+                name: tc.name.clone(),
+                preview: preview_for_args(&tc.arguments),
+                args: tc.arguments.clone(),
+            });
+        }
+
+        // Build owned futures (no `&self` captured) then run them with bounded
+        // concurrency. `buffered` preserves the input order in the results.
+        let pending: Vec<_> = tool_calls
+            .iter()
+            .map(|tc| {
+                let (tool, disabled, mem_handles) = self.tool_call_handles(&tc.name);
+                run_tool_call(
+                    Arc::clone(&self.hooks),
+                    Arc::clone(&self.memory_manager),
+                    tool,
+                    disabled,
+                    mem_handles,
+                    tc.name.clone(),
+                    tc.arguments.clone(),
+                    with_hooks,
+                )
+            })
+            .collect();
+        let results: Vec<(String, bool, std::time::Duration)> =
+            futures::stream::iter(pending)
+                .buffered(MAX_TOOL_CONCURRENCY)
+                .collect()
+                .await;
+
+        for (tc, (mut output, success, dur)) in tool_calls.iter().zip(results.into_iter()) {
+            // Loop-guard accounting runs post-batch in original order —
+            // identical counting semantics to the sequential path.
+            let read_only = self.tool_is_read_only(&tc.name);
+            match self.loop_guard.after_call(
+                &tc.name,
+                &tc.arguments,
+                &output,
+                !success,
+                read_only,
+            ) {
+                super::loop_::GuardAction::Warn(msg)
+                | super::loop_::GuardAction::Halt(msg) => {
+                    output.push_str("\n\n⚠️ ");
+                    output.push_str(&msg);
+                }
+                _ => {}
+            }
+            tracing::info!(tool = %tc.name, success = %success, "Tool call complete (concurrent)");
+            self.callbacks
+                .on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: dur.as_millis() as u64,
+                    error: if success { None } else { Some(output.clone()) },
+                    summary: Some(truncate_summary(&output)),
+                });
+            self.history
+                .push(ChatMessage::tool_result(&tc.id, &output));
+        }
     }
 
     /// Load memory context for the given query.
@@ -1022,6 +1328,32 @@ impl Agent {
                 });
             }
         }
+        // Session-end memory consolidation: extract a daily summary +
+        // core facts from the ending conversation into persistent
+        // memory before the history is wiped. Best-effort + detached
+        // (a slow/failed extraction can't block `/new`), skipped for
+        // trivial sessions. All four reset paths (gateway /new, TUI
+        // reset, HTTP session reset) funnel through clear_history, so
+        // this is the single choke point.
+        if self.history.len() >= 4 {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let provider = Arc::clone(&self.provider);
+                let memory = Arc::clone(&self.memory);
+                let history = self.history.clone();
+                let session_id = self.session_id.clone();
+                handle.spawn(async move {
+                    let consolidator =
+                        crate::memory::consolidation::MemoryConsolidator::from_arc(provider);
+                    if let Err(e) = consolidator
+                        .consolidate(memory.as_ref(), &history, &session_id)
+                        .await
+                    {
+                        tracing::warn!("session-end memory consolidation failed: {e}");
+                    }
+                });
+            }
+        }
+
         self.history.clear();
         self.system_prompt = None;
         self.session_id = uuid::Uuid::new_v4().to_string();
@@ -1066,7 +1398,7 @@ impl Agent {
     /// in that case).
     ///
     /// Used by `/undo` (to drop the last exchange) and `/retry`
-    /// (to drop + re-submit the user message). Mirrors Hermes'
+    /// (to drop + re-submit the user message). Mirrors the upstream's
     /// `session.undo` (`tui_gateway/server.py:2424-2449`) which
     /// pops in reverse until a user-role row is found.
     pub fn pop_last_turn(&mut self) -> Option<(usize, String)> {
@@ -1238,8 +1570,19 @@ impl Agent {
             anyhow::bail!("provider returned empty summary");
         }
 
+        // Memory-provider pre-compress hook: an active provider can
+        // contribute text it wants preserved across compression (e.g.
+        // facts it extracted from the soon-to-be-dropped messages).
+        // Fired on the OLD history so the provider sees what's about
+        // to be summarized away.
+        let provider_context = self.memory_manager.on_pre_compress(&self.history).await;
+
         // Replace older history with a single system message.
-        let summary_marker = format!("[/compress summary] {summary}");
+        let mut summary_marker = format!("[/compress summary] {summary}");
+        if !provider_context.trim().is_empty() {
+            summary_marker.push_str("\n\n[memory-provider context]\n");
+            summary_marker.push_str(provider_context.trim());
+        }
         let mut new_history = Vec::with_capacity(recent.len() + 1);
         new_history.push(ChatMessage::system(&summary_marker));
         new_history.extend(recent);
@@ -1336,7 +1679,7 @@ impl Agent {
     /// Append `text` to the pending-steer queue. Multiple calls
     /// before the next tool batch concatenate with newlines, so
     /// the model sees them as one block. Returns `true` if the
-    /// text was accepted (matches Hermes' `agent.steer` return
+    /// text was accepted (matches the upstream's `agent.steer` return
     /// at `run_agent.py:4493-4527`).
     pub fn steer(&mut self, text: &str) -> bool {
         let trimmed = text.trim();
@@ -1361,7 +1704,7 @@ impl Agent {
 
     /// Drain any pending steer text onto the most recent tool
     /// result message in `history`, formatted with the
-    /// "User guidance:" marker that mirrors Hermes'
+    /// "User guidance:" marker that mirrors the upstream's
     /// `_apply_pending_steer_to_tool_results`
     /// (`run_agent.py:4545-4600`). Returns `true` if a steer
     /// was applied — callers can use this to decide whether to
@@ -1479,6 +1822,9 @@ pub struct AgentBuilder {
     auxiliary_client: Option<Arc<crate::providers::AuxiliaryClient>>,
     callbacks: Option<super::callbacks::CallbacksHandle>,
     interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    context_compressor: Option<ContextCompressor>,
+    compression_enabled: Option<bool>,
+    loop_guard_config: Option<super::loop_::LoopGuardConfig>,
 }
 
 impl AgentBuilder {
@@ -1503,7 +1849,32 @@ impl AgentBuilder {
             auxiliary_client: None,
             callbacks: None,
             interrupt_flag: None,
+            context_compressor: None,
+            compression_enabled: None,
+            loop_guard_config: None,
         }
+    }
+
+    /// Configure the per-turn tool-loop guardrails (thresholds +
+    /// warn/hard-stop switches). Defaults: warnings on, hard stops off.
+    pub fn loop_guard_config(mut self, config: super::loop_::LoopGuardConfig) -> Self {
+        self.loop_guard_config = Some(config);
+        self
+    }
+
+    /// Set the automatic context compactor. Defaults to
+    /// `ContextCompressor::default()` (compress at 50% of the context window)
+    /// when not supplied.
+    pub fn context_compressor(mut self, compressor: ContextCompressor) -> Self {
+        self.context_compressor = Some(compressor);
+        self
+    }
+
+    /// Enable or disable automatic mid-turn context compaction. Defaults to
+    /// `true`.
+    pub fn compression_enabled(mut self, enabled: bool) -> Self {
+        self.compression_enabled = Some(enabled);
+        self
     }
 
     /// Wire the resolved Fennec home directory.
@@ -1690,11 +2061,18 @@ impl AgentBuilder {
             tools: self.tools,
             tool_specs,
             disabled_tools: HashSet::new(),
+            loop_guard: super::loop_::LoopGuard::new(
+                self.loop_guard_config.unwrap_or_default(),
+            ),
+            context_compressor: self
+                .context_compressor
+                .unwrap_or_default(),
+            compression_enabled: self.compression_enabled.unwrap_or(true),
             pending_attachments: Vec::new(),
             pending_steer: None,
             memory,
             prompt_builder,
-            max_tool_iterations: self.max_tool_iterations.unwrap_or(15),
+            max_tool_iterations: self.max_tool_iterations.unwrap_or(90),
             history: Vec::new(),
             system_prompt: None,
             max_tokens: self.max_tokens.unwrap_or(8192),
@@ -1743,6 +2121,132 @@ impl AgentBuilder {
 // Callback helpers
 // ---------------------------------------------------------------------------
 
+/// Execute a single tool call end-to-end with owned handles (no `&Agent`
+/// borrow), so a batch can run concurrently and the resulting future stays
+/// `Send`. Mirrors the former `Agent::execute_tool` (disabled check →
+/// memory-provider routing → tool registry → credential scrub) wrapped with
+/// the plugin pre/post-tool hooks when `with_hooks` is set. Returns
+/// `(output, success, duration)`.
+async fn run_tool_call(
+    hooks: Arc<crate::plugins::HookRegistry>,
+    memory_manager: Arc<crate::plugins::MemoryManager>,
+    tool: Option<Arc<dyn Tool>>,
+    disabled: bool,
+    mem_handles: bool,
+    name: String,
+    args: serde_json::Value,
+    with_hooks: bool,
+) -> (String, bool, std::time::Duration) {
+    let started = std::time::Instant::now();
+
+    // `Null` arguments are the sentinel for "the provider sent argument
+    // JSON that did not parse" (truncated stream, malformed output — see
+    // `parse_streamed_tool_args` and the providers' non-streaming
+    // parsers). Executing anyway would run the tool with arguments the
+    // model never chose; surface a retryable error instead.
+    if args.is_null() {
+        return (
+            format!(
+                "Error: the arguments for tool '{name}' were not valid JSON \
+                 (the stream may have been truncated). The call was NOT \
+                 executed — re-issue it with complete arguments."
+            ),
+            false,
+            started.elapsed(),
+        );
+    }
+
+    // Plugin pre-tool hook: may skip the call or rewrite the arguments.
+    let effective_args = if with_hooks {
+        match hooks.fire_pre_tool(&name, &args) {
+            crate::plugins::PreToolResolution::Skip { reason } => {
+                tracing::warn!(
+                    tool = %name,
+                    reason = %reason,
+                    "Tool call skipped by plugin pre_tool_call hook"
+                );
+                return (
+                    format!("[skipped by plugin: {reason}]"),
+                    false,
+                    started.elapsed(),
+                );
+            }
+            crate::plugins::PreToolResolution::Continue { effective_args } => effective_args,
+        }
+    } else {
+        args
+    };
+
+    // Core execution: disabled → memory-provider tool → tool registry. The
+    // disabled message is returned unscrubbed (it carries no credentials),
+    // matching prior behaviour; real tool output is run through the scrubber.
+    let (executed, success) = if disabled {
+        (
+            format!("Error: tool '{name}' is currently disabled"),
+            false,
+        )
+    } else if mem_handles {
+        let (raw, success) = match memory_manager
+            .handle_tool_call(&name, effective_args.clone())
+            .await
+        {
+            Ok(result) if result.success => (result.output, true),
+            Ok(result) => (
+                format!(
+                    "Error: {}",
+                    result.error.unwrap_or_else(|| "unknown error".to_string())
+                ),
+                false,
+            ),
+            Err(e) => (format!("Memory provider tool failed: {e}"), false),
+        };
+        (scrub::scrub_credentials(&raw), success)
+    } else {
+        let (raw, success) = match tool {
+            Some(t) => match t.execute(effective_args.clone()).await {
+                Ok(result) if result.success => (result.output, true),
+                Ok(result) => (
+                    format!(
+                        "Error: {}",
+                        result.error.unwrap_or_else(|| "unknown error".to_string())
+                    ),
+                    false,
+                ),
+                Err(e) => (format!("Tool execution failed: {e}"), false),
+            },
+            None => (format!("Unknown tool: {name}"), false),
+        };
+        (scrub::scrub_credentials(&raw), success)
+    };
+
+    // Plugin post-tool hook: may rewrite the output / success flag.
+    let (output, success) = if with_hooks {
+        let post = hooks.fire_post_tool(&name, &effective_args, &executed, success);
+        (post.output, post.success)
+    } else {
+        (executed, success)
+    };
+
+    // Memory-write observer: mirror successful built-in memory writes
+    // to the active memory provider (if any) so a hosted index stays in
+    // sync with the local store.
+    if success && (name == "memory_store" || name == "memory_forget") {
+        let action = if name == "memory_store" {
+            crate::plugins::MemoryWriteAction::Store
+        } else {
+            crate::plugins::MemoryWriteAction::Forget
+        };
+        let key = effective_args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let content = effective_args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        memory_manager.on_memory_write(action, key, content).await;
+    }
+
+    (output, success, started.elapsed())
+}
+
 /// One-line preview of a tool call's args for the inline display
 /// and the TOOL LIVE panel header. We render JSON compactly and
 /// truncate aggressively — frontends show the full args in their
@@ -1766,5 +2270,92 @@ fn truncate_summary(s: &str) -> String {
         let mut out: String = single_line.chars().take(MAX - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// Parse the accumulated argument buffer of a streamed tool call.
+///
+/// - Empty buffer → `{}`: providers legitimately send no argument deltas
+///   for parameter-less tools.
+/// - Valid JSON → parsed as-is.
+/// - Non-empty but unparseable (truncated stream, malformed provider
+///   output) → `Value::Null`, the sentinel `run_tool_call` refuses to run.
+///   The old behavior coerced this case to `{}` and executed the tool
+///   with arguments the model never chose.
+fn parse_streamed_tool_args(name: &str, buf: &str) -> serde_json::Value {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "streamed tool-call '{}' arguments did not parse ({}); \
+                 marking the call malformed instead of executing with empty args",
+                name,
+                e
+            );
+            serde_json::Value::Null
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_arg_tests {
+    use super::parse_streamed_tool_args;
+
+    #[test]
+    fn empty_buffer_is_valid_no_arg_call() {
+        let v = parse_streamed_tool_args("noop", "");
+        assert!(v.as_object().is_some_and(|m| m.is_empty()));
+        let v = parse_streamed_tool_args("noop", "   ");
+        assert!(v.as_object().is_some_and(|m| m.is_empty()));
+    }
+
+    #[test]
+    fn valid_json_parses() {
+        let v = parse_streamed_tool_args("shell", r#"{"command": "ls"}"#);
+        assert_eq!(v["command"], "ls");
+    }
+
+    #[test]
+    fn truncated_json_becomes_null_sentinel() {
+        // A stream cut mid-arguments must NOT become {} (which would
+        // execute the tool with args the model never chose).
+        let v = parse_streamed_tool_args("write_file", r#"{"path": "/tmp/x", "conte"#);
+        assert!(v.is_null());
+        let v = parse_streamed_tool_args("shell", "not json at all");
+        assert!(v.is_null());
+    }
+}
+
+#[cfg(test)]
+mod parallel_gate_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn paths_overlap_when_one_is_prefix_of_other() {
+        assert!(Agent::paths_overlap(Path::new("/a/b"), Path::new("/a/b/c")));
+        assert!(Agent::paths_overlap(Path::new("/a/b/c"), Path::new("/a/b")));
+        assert!(Agent::paths_overlap(Path::new("/a/b"), Path::new("/a/b")));
+    }
+
+    #[test]
+    fn paths_do_not_overlap_for_siblings_or_disjoint() {
+        assert!(!Agent::paths_overlap(Path::new("/a/b"), Path::new("/a/c")));
+        assert!(!Agent::paths_overlap(Path::new("/x/y"), Path::new("/p/q")));
+    }
+
+    #[test]
+    fn parallel_scope_path_handles_absolute_and_missing() {
+        assert_eq!(
+            Agent::parallel_scope_path(&serde_json::json!({"path": "/tmp/f"})),
+            Some(std::path::PathBuf::from("/tmp/f"))
+        );
+        // Missing or blank `path` → None (treated as "can't tell, stay sequential").
+        assert!(Agent::parallel_scope_path(&serde_json::json!({})).is_none());
+        assert!(Agent::parallel_scope_path(&serde_json::json!({"path": "   "})).is_none());
     }
 }

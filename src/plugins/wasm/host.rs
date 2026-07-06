@@ -108,6 +108,8 @@ pub fn host_http_request(
 ) -> Result<WasmHttpResponse, String> {
     url_guard::validate_url_str(&req.url)
         .map_err(|e| format!("url rejected by sandbox: {e}"))?;
+    // DNS-resolution check (a domain pointing at a private IP) runs
+    // inside the blocking section below where we have the runtime.
 
     let method = match req.method.to_ascii_uppercase().as_str() {
         "GET" => reqwest::Method::GET,
@@ -134,6 +136,9 @@ pub fn host_http_request(
     // "Cannot start a runtime from within a runtime" when called
     // from a context that's already on an async worker thread.
     tokio::task::block_in_place(|| state.rt_handle.block_on(async move {
+        url_guard::validate_url_str_resolved(&req.url)
+            .await
+            .map_err(|e| format!("url rejected by sandbox: {e}"))?;
         let resp = builder
             .send()
             .await

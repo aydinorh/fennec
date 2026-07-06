@@ -51,8 +51,9 @@ fn test_default_security() {
 #[test]
 fn test_default_agent() {
     let cfg = FennecConfig::default();
-    assert_eq!(cfg.agent.max_tool_iterations, 15);
+    assert_eq!(cfg.agent.max_tool_iterations, 90);
     assert_eq!(cfg.agent.context_window, 200_000);
+    assert!(cfg.agent.compression_enabled);
 }
 
 #[test]

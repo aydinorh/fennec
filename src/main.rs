@@ -23,6 +23,7 @@ use fennec::memory::sqlite::SqliteMemory;
 use fennec::memory::Memory;
 use fennec::providers::anthropic::AnthropicProvider;
 use fennec::providers::openai::OpenAIProvider;
+use fennec::providers::gemini::GeminiProvider;
 use fennec::providers::ollama::OllamaProvider;
 use fennec::providers::traits::Provider;
 use fennec::security::prompt_guard::{GuardAction, PromptGuard};
@@ -112,8 +113,19 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Authenticate with Anthropic via OAuth
-    Login,
+    /// Authenticate via OAuth. Defaults to Anthropic; pass
+    /// `--provider gemini-cloudcode` to sign in with Google for the Gemini
+    /// Cloud Code Assist free tier, or `--provider copilot` to sign in to
+    /// GitHub for the Copilot provider.
+    Login {
+        /// Which provider to authenticate: `anthropic` (default),
+        /// `gemini-cloudcode` (Google sign-in), or `copilot` (GitHub).
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        /// Force re-authentication even if valid credentials already exist.
+        #[arg(long)]
+        force: bool,
+    },
     /// Run diagnostic checks — provider reachability, API key, memory DB, Plurum, config.
     Doctor,
     /// Manage the skill curator — periodic background consolidation
@@ -186,19 +198,297 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
             .context("decrypting API key from config")?;
         return Ok(decrypted);
     }
+    resolve_api_key_for(&config.provider.name)
+}
 
-    // Fall back to provider-specific environment variable.
-    let env_var = match config.provider.name.as_str() {
+/// Resolve the API key for `provider_name` from its usual environment
+/// variable. Used directly by failover-chain entries (the
+/// `provider.api_key` config value belongs to the PRIMARY provider
+/// only — a cross-provider fallback must not inherit it).
+fn resolve_api_key_for(provider_name: &str) -> Result<String> {
+    // Azure can authenticate with an API key OR keyless Entra ID — so accept
+    // an Azure key from env if present, but don't error when absent (the
+    // provider falls back to Entra: az CLI / service principal). Living
+    // here (rather than only in resolve_api_key) also makes Azure usable
+    // as a failover-chain target.
+    if matches!(provider_name, "azure" | "foundry") {
+        for key_var in ["AZURE_OPENAI_API_KEY", "AZURE_FOUNDRY_API_KEY"] {
+            if let Ok(v) = std::env::var(key_var) {
+                if !v.is_empty() {
+                    return Ok(v);
+                }
+            }
+        }
+        return Ok(String::new()); // Entra mode — no key
+    }
+
+    let env_var = match provider_name {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "google" | "gemini" => "GEMINI_API_KEY",
+        // OAuth-authenticated; the provider resolves a Google bearer token
+        // from stored credentials, so there's no API key to read here.
+        "gemini-cloudcode" | "google-cloudcode" => return Ok(String::new()),
+        "codex" | "openai-responses" => "OPENAI_API_KEY",
+        // Bedrock authenticates with AWS credentials (resolved by the provider
+        // from env/IMDS), not a single API key.
+        "bedrock" | "aws" => return Ok(String::new()),
+        // Copilot uses a GitHub OAuth token exchanged for a Copilot token by
+        // the provider — there's no single API key to read here.
+        "copilot" | "github-copilot" => return Ok(String::new()),
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
 
     std::env::var(env_var)
         .with_context(|| format!("API key not found: set provider.api_key in config or {} env var", env_var))
+}
+
+/// One planned failover-chain entry, after normalization + dedup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedFallback {
+    provider: String,
+    model: String,
+    base_url: String,
+}
+
+/// Normalize the config's failover settings into an ordered, deduped
+/// chain. Mirrors the upstream's chain seeding: `fallback_models`
+/// (same-provider shorthand) first, then the full `fallbacks` entries;
+/// entries that resolve to the PRIMARY backend or duplicate an earlier
+/// entry are dropped — falling back to the backend that just failed
+/// only loops the failure.
+fn plan_failover_chain(provider_cfg: &fennec::config::ProviderConfig) -> Vec<PlannedFallback> {
+    let primary_provider = provider_cfg.name.trim().to_lowercase();
+    let primary_model = provider_cfg.model.trim().to_string();
+
+    let mut chain: Vec<PlannedFallback> = Vec::new();
+    let mut push = |entry: PlannedFallback| {
+        if entry.model.is_empty() {
+            return; // model is required; skip invalid entries
+        }
+        if entry.provider == primary_provider && entry.model == primary_model {
+            return; // same backend as primary
+        }
+        if chain.iter().any(|e| *e == entry) {
+            return; // duplicate of an earlier chain entry
+        }
+        chain.push(entry);
+    };
+
+    for model in &provider_cfg.fallback_models {
+        push(PlannedFallback {
+            provider: primary_provider.clone(),
+            model: model.trim().to_string(),
+            base_url: provider_cfg.base_url.trim().to_string(),
+        });
+    }
+    for fb in &provider_cfg.fallbacks {
+        let provider = {
+            let p = fb.provider.trim().to_lowercase();
+            if p.is_empty() { primary_provider.clone() } else { p }
+        };
+        push(PlannedFallback {
+            provider,
+            model: fb.model.trim().to_string(),
+            base_url: fb.base_url.trim().to_string(),
+        });
+    }
+    chain
+}
+
+/// Build the failover providers for the planned chain. Entries whose
+/// API key can't be resolved are skipped with a warning (the upstream
+/// skips invalid chain entries the same way) — a missing fallback key
+/// must not prevent startup.
+fn build_failover_providers(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    secret_store: &SecretStore,
+    chain: &[PlannedFallback],
+) -> Vec<Box<dyn Provider>> {
+    let primary_provider = config.provider.name.trim().to_lowercase();
+    let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+    for entry in chain {
+        // Same-provider fallbacks (the `fallback_models` shorthand — a
+        // different model on the SAME backend) share the primary's
+        // credentials, so resolve their key from the decrypted config
+        // exactly like the primary does. Only CROSS-provider fallbacks fall
+        // through to the env-only path, since `provider.api_key` belongs to
+        // the primary backend and must not be handed to a different one.
+        //
+        // Without this, a config-only install (key in config.toml, nothing
+        // in env — the default onboarding flow) had its whole chain skipped
+        // at startup: every same-provider fallback resolved to an empty env
+        // key, so failover silently never engaged.
+        let key_result = if entry.provider == primary_provider {
+            resolve_api_key(config, secret_store)
+        } else {
+            resolve_api_key_for(&entry.provider)
+        };
+        let api_key = match key_result {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(
+                    "failover entry {}/{} skipped: {e}",
+                    entry.provider,
+                    entry.model
+                );
+                continue;
+            }
+        };
+        // Reuse build_provider's routing by overlaying the entry onto a
+        // clone of the config's provider section.
+        let mut cfg = config.clone();
+        cfg.provider.name = entry.provider.clone();
+        cfg.provider.base_url = entry.base_url.clone();
+        providers.push(build_provider(&cfg, home_dir, api_key, Some(entry.model.clone())));
+    }
+    providers
+}
+
+#[cfg(test)]
+mod deepseek_tests {
+    use super::deepseek_context_window;
+
+    #[test]
+    fn known_models_get_1m_window() {
+        assert_eq!(deepseek_context_window("deepseek-chat"), 1_000_000);
+        assert_eq!(deepseek_context_window("deepseek-reasoner"), 1_000_000);
+        assert_eq!(deepseek_context_window("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(deepseek_context_window("deepseek-v4-flash"), 1_000_000);
+        assert_eq!(deepseek_context_window("DeepSeek-V5-Foo"), 1_000_000);
+    }
+
+    #[test]
+    fn v3_and_unknown_fall_back_to_128k() {
+        assert_eq!(deepseek_context_window("deepseek-v3-0324"), 128_000);
+        assert_eq!(deepseek_context_window("deepseek-coder-legacy"), 128_000);
+        assert_eq!(deepseek_context_window(""), 128_000);
+    }
+}
+
+#[cfg(test)]
+mod failover_chain_tests {
+    use super::{plan_failover_chain, PlannedFallback};
+    use fennec::config::{FallbackEntry, ProviderConfig};
+
+    fn cfg() -> ProviderConfig {
+        ProviderConfig {
+            name: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_config_yields_empty_chain() {
+        assert!(plan_failover_chain(&cfg()).is_empty());
+    }
+
+    #[test]
+    fn same_provider_fallback_uses_config_key_without_env() {
+        use super::{build_failover_providers, plan_failover_chain};
+        use fennec::config::FennecConfig;
+        use fennec::security::SecretStore;
+
+        // Config-only install: primary key in config, NOTHING in env, and a
+        // same-provider fallback model. The fallback must still build,
+        // because it inherits the primary's decrypted config key. (Before
+        // the fix, env-only resolution skipped it and failover never
+        // engaged.)
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(tmp.path().to_path_buf()).unwrap();
+
+        let mut config = FennecConfig::default();
+        config.provider.name = "anthropic".into();
+        config.provider.model = "claude-sonnet-4-6".into();
+        config.provider.api_key = "sk-test-primary".into(); // plaintext passthrough
+        config.provider.fallback_models = vec!["claude-haiku-4-5".into()];
+
+        let chain = plan_failover_chain(&config.provider);
+        assert_eq!(chain.len(), 1, "one same-provider fallback planned");
+
+        let providers = build_failover_providers(&config, tmp.path(), &store, &chain);
+        assert_eq!(
+            providers.len(),
+            1,
+            "same-provider fallback should build from the config key with no env var set"
+        );
+    }
+
+    #[test]
+    fn fallback_models_use_primary_provider() {
+        let mut c = cfg();
+        c.fallback_models = vec!["claude-haiku-4-5".into()];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(
+            chain,
+            vec![PlannedFallback {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5".into(),
+                base_url: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn cross_provider_entries_follow_same_provider_shorthand() {
+        let mut c = cfg();
+        c.fallback_models = vec!["claude-haiku-4-5".into()];
+        c.fallbacks = vec![FallbackEntry {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].provider, "anthropic");
+        assert_eq!(chain[1].provider, "openai");
+    }
+
+    /// Entries equal to the primary backend are dropped — falling back
+    /// to the backend that just failed only loops the failure (mirrors
+    /// the upstream's same-backend dedup).
+    #[test]
+    fn primary_backend_and_duplicates_are_deduped() {
+        let mut c = cfg();
+        c.fallback_models = vec![
+            "claude-sonnet-4-6".into(), // == primary → dropped
+            "claude-haiku-4-5".into(),
+            "claude-haiku-4-5".into(), // duplicate → dropped
+        ];
+        c.fallbacks = vec![FallbackEntry {
+            provider: "ANTHROPIC".into(), // case-normalized
+            model: "claude-haiku-4-5".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain.len(), 1, "{chain:?}");
+        assert_eq!(chain[0].model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn empty_provider_in_entry_means_primary() {
+        let mut c = cfg();
+        c.fallbacks = vec![FallbackEntry {
+            provider: String::new(),
+            model: "claude-haiku-4-5".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain[0].provider, "anthropic");
+    }
+
+    #[test]
+    fn entries_without_model_are_skipped() {
+        let mut c = cfg();
+        c.fallbacks = vec![FallbackEntry::default()];
+        assert!(plan_failover_chain(&c).is_empty());
+    }
 }
 
 /// Build the auxiliary client. Used by background tasks (curator,
@@ -220,6 +510,7 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
 /// vision chain just excludes the local-only provider).
 fn build_auxiliary_client(
     config: &FennecConfig,
+    home_dir: &std::path::Path,
     primary: Arc<dyn Provider>,
     secret_store: &SecretStore,
 ) -> fennec::providers::AuxiliaryClient {
@@ -265,10 +556,11 @@ fn build_auxiliary_client(
                 temperature: 0.7,
                 max_tokens: 8192,
                 fallback_models: Vec::new(),
+                fallbacks: Vec::new(),
             },
             ..config.clone()
         };
-        let provider_box = build_provider(&aux_config, key, None);
+        let provider_box = build_provider(&aux_config, home_dir, key, None);
         let provider: Arc<dyn Provider> = Arc::from(provider_box);
         let entry = fennec::providers::ChainEntry {
             name: name.to_string(),
@@ -308,6 +600,13 @@ fn build_auxiliary_client(
         &mut vision_chain,
         false, // Kimi vision support is variable; conservative skip
     );
+    try_add(
+        "gemini",
+        "GEMINI_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true, // Gemini is natively multimodal
+    );
     let _ = secret_store; // reserved for future encrypted-aux-key
                           // resolution; placeholder so callers can
                           // pass it without breaking when we wire it.
@@ -332,18 +631,37 @@ fn resolve_provider_with_model(
             ))
         } else {
             let api_key = resolve_api_key(config, &secret_store)?;
-            build_provider(config, api_key, Some(model.to_string()))
+            build_provider(config, home_dir, api_key, Some(model.to_string()))
         }
     } else {
         let api_key = resolve_api_key(config, &secret_store)?;
-        build_provider(config, api_key, Some(model.to_string()))
+        build_provider(config, home_dir, api_key, Some(model.to_string()))
     };
     Ok(Arc::from(provider))
+}
+
+/// Context window for a DeepSeek model id.
+///
+/// The V4 family (`deepseek-v4-*`, `deepseek-v5-*`, …) and the legacy
+/// `deepseek-chat` / `deepseek-reasoner` aliases (server-mapped to V4
+/// modes) ship a 1M-token window; unknown or older DeepSeek ids fall
+/// back to 128K. Mirrors the upstream's model_metadata DeepSeek table.
+fn deepseek_context_window(model: &str) -> usize {
+    let m = model.trim().to_lowercase();
+    let one_million = m == "deepseek-chat"
+        || m == "deepseek-reasoner"
+        || (m.starts_with("deepseek-v") && !m.starts_with("deepseek-v3"));
+    if one_million {
+        1_000_000
+    } else {
+        128_000
+    }
 }
 
 /// Build the LLM provider based on config.
 fn build_provider(
     config: &FennecConfig,
+    home_dir: &std::path::Path,
     api_key: String,
     model_override: Option<String>,
 ) -> Box<dyn Provider> {
@@ -390,6 +708,114 @@ fn build_provider(
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
             Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+        }
+        "deepseek" => {
+            // DeepSeek's OpenAI-compatible endpoint. The DeepSeek wire
+            // dialect adds the explicit `thinking` field for V4+/reasoner
+            // models (see OpenAiDialect::DeepSeek); the reasoning_content
+            // echo-back is handled generically by the openai provider.
+            let ds_url =
+                base_url.unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
+            // Back-compat: if the user switched provider to DeepSeek but
+            // kept an Anthropic-flavored default model string, fall back
+            // to DeepSeek's non-thinking default rather than passing a
+            // non-DeepSeek id. (Same pattern as the kimi/gemini arms.)
+            let ds_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "deepseek-chat".to_string()
+            } else {
+                model
+            };
+            // Context window: the V4 family + the deepseek-chat/reasoner
+            // aliases (server-mapped to V4 modes) ship a 1M window;
+            // unknown/older DeepSeek ids fall back to 128K.
+            let ctx = deepseek_context_window(&ds_model);
+            Box::new(
+                OpenAIProvider::new(api_key, Some(ds_model), Some(ds_url), Some(ctx))
+                    .with_dialect(fennec::providers::openai::OpenAiDialect::DeepSeek),
+            )
+        }
+        "google" | "gemini" => {
+            // Back-compat: if the user switched provider to Gemini but kept an
+            // Anthropic-flavored default model string, fall back to Gemini's
+            // own default rather than passing a non-Gemini model id.
+            let gemini_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "gemini-2.5-flash".to_string()
+            } else {
+                model
+            };
+            Box::new(GeminiProvider::new(api_key, Some(gemini_model), base_url, None))
+        }
+        "gemini-cloudcode" | "google-cloudcode" => {
+            // OAuth/free-tier flavor — no API key; the provider resolves a
+            // Google bearer token (and the project) from credentials stored
+            // under `home_dir` by `fennec login --provider gemini-cloudcode`.
+            let cc_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "gemini-2.5-flash".to_string()
+            } else {
+                model
+            };
+            Box::new(fennec::providers::GeminiCloudCodeProvider::new(
+                home_dir.to_path_buf(),
+                Some(cc_model),
+                None,
+                None,
+            ))
+        }
+        "codex" | "openai-responses" => {
+            // Back-compat: if the user switched to Codex but kept an
+            // Anthropic-flavored default model string, fall back to a
+            // Responses-capable default rather than passing a non-OpenAI id.
+            let codex_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "gpt-5-codex".to_string()
+            } else {
+                model
+            };
+            Box::new(fennec::providers::CodexResponsesProvider::new(
+                api_key,
+                Some(codex_model),
+                base_url,
+                None,
+            ))
+        }
+        "copilot" | "github-copilot" => {
+            // OpenAI-compatible chat over api.githubcopilot.com; auth is a
+            // GitHub-token → Copilot-token exchange handled by the provider.
+            let _ = api_key; // Copilot uses a GitHub OAuth token, not the api_key.
+            Box::new(fennec::providers::CopilotProvider::new(Some(model), base_url, None))
+        }
+        "azure" | "foundry" => {
+            // `model` is the Azure *deployment* name; base_url is the resource
+            // endpoint (https://<resource>.openai.azure.com). Auth auto-detects
+            // API key vs keyless Entra inside the provider.
+            Box::new(fennec::providers::AzureProvider::new(
+                api_key,
+                Some(model),
+                base_url,
+                None,
+            ))
+        }
+        "bedrock" | "aws" => {
+            // `model` is the Bedrock model / inference-profile id; auth comes
+            // from AWS credentials (env vars or IMDS instance role). base_url,
+            // if set, overrides the derived bedrock-runtime endpoint.
+            let _ = api_key; // Bedrock uses AWS creds, not the api_key.
+            Box::new(fennec::providers::BedrockProvider::new(
+                Some(model),
+                base_url,
+                None,
+            ))
         }
         "ollama" => {
             // Same back-compat as kimi: accept both new and old Anthropic
@@ -489,11 +915,46 @@ async fn build_agent_with_callbacks(
             Box::new(AnthropicProvider::new_with_oauth(oauth_token, Some(model)))
         } else {
             let api_key = resolve_api_key(config, &secret_store)?;
-            build_provider(config, api_key, model_override)
+            build_provider(config, home_dir, api_key, model_override)
         }
     } else {
         let api_key = resolve_api_key(config, &secret_store)?;
-        build_provider(config, api_key, model_override)
+        build_provider(config, home_dir, api_key, model_override)
+    };
+
+    // Failover: when the config declares fallback models/providers,
+    // wrap the primary in a ReliableProvider that tries each chain
+    // entry in order (rate-limit cooldowns + retry/backoff inside).
+    // Mirrors the upstream's fallback-chain activation when the
+    // current model keeps failing after retries.
+    let provider: Box<dyn Provider> = {
+        let chain = plan_failover_chain(&config.provider);
+        if chain.is_empty() {
+            provider
+        } else {
+            let fallback_providers =
+                build_failover_providers(config, home_dir, &secret_store, &chain);
+            if fallback_providers.is_empty() {
+                tracing::warn!(
+                    "failover configured but no chain entry was buildable; running without failover"
+                );
+                provider
+            } else {
+                tracing::info!(
+                    "provider failover enabled: primary {} + {} fallback(s): {}",
+                    config.provider.name,
+                    fallback_providers.len(),
+                    chain
+                        .iter()
+                        .map(|e| format!("{}/{}", e.provider, e.model))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let mut all = vec![provider];
+                all.extend(fallback_providers);
+                Box::new(fennec::providers::ReliableProvider::new(all, None))
+            }
+        }
     };
 
     // Promote the provider to `Arc` so it can be shared with DelegateTool
@@ -508,6 +969,7 @@ async fn build_agent_with_callbacks(
     // provider not known to handle multimodal input.
     let aux_client = build_auxiliary_client(
         &config,
+        home_dir,
         Arc::clone(&provider),
         &secret_store,
     );
@@ -584,8 +1046,8 @@ async fn build_agent_with_callbacks(
     let browser_tool = BrowserTool::new();
 
     // Vision tool: only wired when the configured provider supports vision
-    // (anthropic, openai) AND we can resolve an API key. OAuth-only users and
-    // non-vision providers silently skip it.
+    // (anthropic, openai, gemini) AND we can resolve an API key. OAuth-only
+    // users and non-vision providers silently skip it.
     let vision_api_key = resolve_api_key(config, &secret_store)
         .ok()
         .unwrap_or_default();
@@ -774,6 +1236,35 @@ async fn build_agent_with_callbacks(
     }
     if let Some(t) = tts_tool {
         builder = builder.tool(Box::new(t));
+    }
+
+    // Session search/list tools — let the agent search its own past
+    // conversations (FTS5 over the shared `sessions.db`). The store opens in
+    // WAL mode, so this read-mostly handle is safe alongside the TUI/gateway's
+    // writer handle on the same file. Best-effort: if the store can't open,
+    // skip the tools rather than fail agent startup.
+    {
+        let session_db = home_dir.join("sessions.db");
+        match tokio::task::spawn_blocking(move || {
+            fennec::sessions::store::SessionStore::new(&session_db)
+        })
+        .await
+        {
+            Ok(Ok(store)) => {
+                let store = Arc::new(store);
+                builder = builder
+                    .tool(Box::new(fennec::tools::session_tools::SessionSearchTool::new(
+                        store.clone(),
+                    )))
+                    .tool(Box::new(fennec::tools::session_tools::SessionListTool::new(store)));
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("session search/list tools disabled: store open failed: {e}");
+            }
+            Err(e) => {
+                tracing::debug!("session search/list tools disabled: join error: {e}");
+            }
+        }
     }
 
     // Shared turn-context handles. These are returned from build_agent so
@@ -1017,6 +1508,7 @@ async fn build_agent_with_callbacks(
     builder = builder.memory_manager(Arc::new(runtime.memory_manager));
     builder = builder.home_dir(home_dir.to_path_buf());
 
+    let guard_cfg = &config.agent.tool_loop_guardrails;
     let mut configured_builder = builder
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)
@@ -1026,7 +1518,23 @@ async fn build_agent_with_callbacks(
         .memory_context_limit(config.memory.context_limit)
         .half_life_days(config.memory.half_life_days)
         .prompt_guard(prompt_guard)
-        .auxiliary_client(Arc::clone(&aux_client));
+        .auxiliary_client(Arc::clone(&aux_client))
+        .context_compressor(fennec::agent::compressor::ContextCompressor::new(
+            config.agent.compression_threshold,
+            3,
+            4,
+        ))
+        .compression_enabled(config.agent.compression_enabled)
+        .loop_guard_config(fennec::agent::loop_::LoopGuardConfig {
+            warnings_enabled: guard_cfg.warnings_enabled,
+            hard_stop_enabled: guard_cfg.hard_stop_enabled,
+            exact_failure_warn_after: guard_cfg.exact_failure_warn_after,
+            exact_failure_block_after: guard_cfg.exact_failure_block_after,
+            same_tool_failure_warn_after: guard_cfg.same_tool_failure_warn_after,
+            same_tool_failure_halt_after: guard_cfg.same_tool_failure_halt_after,
+            no_progress_warn_after: guard_cfg.no_progress_warn_after,
+            no_progress_block_after: guard_cfg.no_progress_block_after,
+        });
     if let Some(handle) = callbacks {
         configured_builder = configured_builder.callbacks(handle);
     }
@@ -1419,6 +1927,9 @@ async fn run_tui(
                 .iter()
                 .cloned()
                 .collect();
+            // Grab an auxiliary-client handle before releasing the agent lock —
+            // used below to auto-title a new session in the background.
+            let aux_for_title = agent_guard.auxiliary_client().clone();
             drop(agent_guard);
             if let (Some(store), Some(sid)) = (submit_store.as_ref(), session_id) {
                 for msg in &appended {
@@ -1473,6 +1984,32 @@ async fn run_tui(
                     .await
                 {
                     tracing::warn!("checkpoint record failed: {e}");
+                }
+
+                // Auto-title a brand-new session from its opening exchange.
+                // `history_before == 0` means this was the session's very first
+                // turn (resumed sessions hydrate history, so they're skipped).
+                // Best-effort + background so it never blocks the loop.
+                if history_before == 0 && assistant_preview.as_str() != "<no reply>" {
+                    let aux = aux_for_title.clone();
+                    let store = std::sync::Arc::clone(store);
+                    let sid = sid.clone();
+                    let user_text = prompt.to_string();
+                    let assistant_text = assistant_preview.clone();
+                    tokio::spawn(async move {
+                        if let Some(title) = fennec::agent::title_generator::generate_title(
+                            &aux,
+                            &user_text,
+                            &assistant_text,
+                        )
+                        .await
+                        {
+                            match store.set_session_title(&sid, &title).await {
+                                Ok(_) => tracing::debug!("auto-titled session: {title}"),
+                                Err(e) => tracing::debug!("auto-title set failed: {e}"),
+                            }
+                        }
+                    });
                 }
             }
 
@@ -1809,7 +2346,7 @@ async fn handle_command_outcome(
 
 /// `/title` worker — reads or writes the current session's
 /// title via the SessionStore. `payload = None` reads, `Some`
-/// writes. Mirrors Hermes' `session.title` RPC: read returns
+/// writes. Mirrors the upstream's `session.title` RPC: read returns
 /// "title: <name>" or "no title set"; write returns "session
 /// title set: <name>" with an optional "(queued while session
 /// initializes)" suffix when the row hasn't been created yet.
@@ -1857,7 +2394,7 @@ async fn handle_session_title(
 
 /// `/resume` worker — looks up the target session by id, then
 /// by exact title, fetches its message history, and replays
-/// it into the agent. Mirrors Hermes' `session.resume`
+/// it into the agent. Mirrors the upstream's `session.resume`
 /// (`tui_gateway/server.py:2180-2221`): reset agent, load
 /// messages as conversation, re-emit a system line so the
 /// chat shows what was loaded. Empty store / unknown id
@@ -1973,7 +2510,7 @@ async fn handle_session_resume(
 /// user can pick one. `Some(name)` rebuilds the provider with
 /// the new model, swaps it on the live agent, and confirms.
 ///
-/// Mid-turn swap is rejected (matching Hermes'
+/// Mid-turn swap is rejected (matching the upstream's
 /// `_apply_model_switch` at server.py:1067-1145, which raises
 /// "session busy"). Detection here is a `try_lock` on the
 /// agent's tokio mutex — if it's held, a turn is in flight.
@@ -2043,7 +2580,7 @@ async fn handle_switch_model(
             agent_lock.set_provider(provider);
             drop(agent_lock);
             // Persist the new model to disk so the change survives
-            // a restart, mirroring Hermes' `_persist_model_switch`.
+            // a restart, mirroring the upstream's `_persist_model_switch`.
             // A failure here is non-fatal — the live agent already
             // has the swap applied; we just warn the user.
             let mut persisted = config.clone();
@@ -2064,7 +2601,7 @@ async fn handle_switch_model(
 /// enabled/disabled status, or toggle the listed names. After
 /// any toggle, persist the new disabled set to
 /// `~/.fennec/config.toml` and clear the agent's chat history
-/// (matching Hermes' `_reset_session_agent` behavior on
+/// (matching the upstream's `_reset_session_agent` behavior on
 /// tools.configure: previously-fired tool_calls in history
 /// would otherwise reference tools the model can no longer
 /// invoke). Mid-turn toggles are rejected.
@@ -2125,11 +2662,11 @@ async fn handle_tools_toggle(
                 }
                 // If the tool exists but is already in the requested
                 // state, set_tool_enabled returns false — no error,
-                // just no-op (matches Hermes' silent idempotence).
+                // just no-op (matches the upstream's silent idempotence).
             }
             // Capture the new disabled set for persistence.
             let new_disabled = agent_lock.disabled_tool_names();
-            // Tool change must clear chat history (Hermes' behavior).
+            // Tool change must clear chat history (the upstream's behavior).
             if !changed.is_empty() {
                 agent_lock.clear_history();
             }
@@ -2144,7 +2681,7 @@ async fn handle_tools_toggle(
             }
 
             // Reset visible chat history too so the user sees the
-            // reset Hermes also performs.
+            // reset the upstream also performs.
             if !changed.is_empty() {
                 let mut g = app.lock();
                 g.chat.clear();
@@ -2171,7 +2708,7 @@ async fn handle_tools_toggle(
 /// `/reload` worker — re-read `~/.fennec/.env` into the
 /// running process. Newly-set keys take effect on the next
 /// provider call without a restart. Already-built provider
-/// Arcs keep their cached credentials, same as Hermes (which
+/// Arcs keep their cached credentials, same as the upstream (which
 /// docstrings this same caveat at server.py:4147-4165).
 fn handle_reload_env(
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
@@ -2624,7 +3161,7 @@ async fn handle_reload_skills(
 /// after the next tool batch with the "User guidance:" marker.
 /// If a turn isn't currently running (try_lock succeeds), the
 /// queued text still lands on the next tool result of whatever
-/// turn fires next, mirroring Hermes' "no active turn — queued
+/// turn fires next, mirroring the upstream's "no active turn — queued
 /// for next" fallback (`core.ts:527-563`).
 ///
 /// `/steer` itself returns immediately — actual injection
@@ -2658,7 +3195,7 @@ async fn handle_steer(
             Err(_) => {
                 // Turn is mid-flight. We still want the steer to
                 // land — fall back to a non-blocking lock that
-                // suspends the submit task briefly. Hermes' RPC
+                // suspends the submit task briefly. the upstream's RPC
                 // path takes the agent lock unconditionally, same
                 // shape.
                 let mut g = agent.lock().await;
@@ -2679,7 +3216,7 @@ async fn handle_steer(
 
 /// `/undo` worker — drop the last user / assistant exchange
 /// from the agent's history. Mid-turn rejection via try_lock
-/// matches Hermes' "session busy" guard at server.py:2424-2449.
+/// matches the upstream's "session busy" guard at server.py:2424-2449.
 /// The chat-side cleanup (popping ChatLines) was done by the
 /// command handler before we got here.
 async fn handle_undo(
@@ -2718,7 +3255,7 @@ async fn handle_undo(
 /// then re-submit the user message as a fresh streaming turn.
 /// Mid-turn rejection via try_lock. If there's no prior user
 /// message to retry, surfaces "nothing to retry" rather than
-/// silently no-op (matches Hermes' core.ts:587-610).
+/// silently no-op (matches the upstream's core.ts:587-610).
 async fn handle_retry(
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
     agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
@@ -2906,7 +3443,7 @@ fn handle_copy_assistant(
 /// `/image` worker — load + base64-encode the file, queue it
 /// on the agent for the next user turn, and echo metadata back
 /// to the chat (filename, dimensions, token estimate). Mirrors
-/// Hermes' image.attach RPC (`tui_gateway/server.py:3361-3401`).
+/// the upstream's image.attach RPC (`tui_gateway/server.py:3361-3401`).
 async fn handle_attach_image(
     path: std::path::PathBuf,
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
@@ -2941,7 +3478,7 @@ async fn handle_attach_image(
     });
 }
 
-/// `/reload_mcp` worker — Hermes calls
+/// `/reload_mcp` worker — the upstream calls
 /// `shutdown_mcp_servers` + `discover_mcp_tools` against the
 /// active session's MCP clients. Fennec's agent doesn't
 /// currently boot MCP clients (the `mcp` module exists but
@@ -3176,10 +3713,42 @@ async fn run_gateway(
         )
         .filter(|t| !t.is_empty())
         {
+            // Pairing flow: a fresh 6-digit code each gateway boot lets
+            // a new user pair by DM-ing the code, instead of editing
+            // allowed_users in config. Paired users persist across
+            // restarts (pairing.json, 0600). 5 wrong codes → lockout.
+            let pairing = {
+                let mut guard =
+                    fennec::security::PairingGuard::new(Some(home_dir.join("pairing.json")));
+                let code = guard.generate_code();
+                // Surface the code on stdout, not just via tracing. The
+                // operator MUST see it to share it out-of-band — but the
+                // default tracing filter (EnvFilter with RUST_LOG unset)
+                // drops everything below ERROR, so a `tracing::info!` line
+                // is invisible in a normal `fennec gateway` run and the
+                // pairing flow becomes unusable. A plain stdout banner is
+                // reliable on both an interactive console and under
+                // systemd (journald captures stdout regardless of
+                // RUST_LOG). The tracing line is kept for structured-log
+                // capture when INFO logging is explicitly enabled.
+                println!(
+                    "\n┌─ Telegram pairing ────────────────────────────────────────┐\n\
+                     │  Pairing code for this session: {code}\n\
+                     │  Share it out-of-band with anyone who should DM the bot.\n\
+                     │  A new code is generated each time the gateway starts.\n\
+                     └───────────────────────────────────────────────────────────┘\n"
+                );
+                tracing::info!(
+                    "Telegram pairing code for this session: {code} — share it \
+                     out-of-band with anyone who should be able to DM the bot."
+                );
+                Arc::new(parking_lot::Mutex::new(guard))
+            };
             let ch = fennec::channels::TelegramChannel::new(
                 token,
                 ch_config.telegram.allowed_users.clone(),
-            );
+            )
+            .with_pairing(pairing);
             channels.push(Arc::new(ch));
             tracing::info!("Telegram channel enabled");
         }
@@ -3397,6 +3966,47 @@ async fn run_gateway(
         }))
     };
 
+    // 5b. Curator auto-run ticker. Long-running gateways get periodic
+    //     skill maintenance without restarts — the upstream wires this
+    //     the same way, piggy-backed on its gateway ticker. The hourly
+    //     poll only bounds latency; the REAL gate (paused flag +
+    //     interval_hours, default one week) lives in should_auto_run,
+    //     so work fires at most once per configured interval. The idle
+    //     gate is bypassed (None), matching the upstream's gateway
+    //     call which passes an infinite idle measurement.
+    let _curator_handle = {
+        let config = config.clone();
+        let home_dir = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(e) = maybe_auto_run_curator(&config, &home_dir).await {
+                    tracing::debug!("curator auto-run check failed: {e}");
+                }
+            }
+        })
+    };
+
+    // 5c. Heartbeat — proactive agent wake-ups. The HeartbeatService
+    //     (publish a "check pending work" prompt every 30 minutes, with
+    //     the prompt overridable via ~/.fennec/HEARTBEAT.md and [SILENT]
+    //     suppression downstream) was fully implemented + tested but
+    //     never started. `cron.enabled` is its documented gate —
+    //     default OFF, so nothing changes for existing users until
+    //     they opt in.
+    let _heartbeat_handle = if config.cron.enabled {
+        let svc = fennec::heartbeat::HeartbeatService::new(None, bus.clone(), None);
+        tracing::info!("Heartbeat service started (cron.enabled = true)");
+        Some(tokio::spawn(async move {
+            svc.run().await;
+        }))
+    } else {
+        None
+    };
+
     // 6. Start GatewayServer in a background task.
     let host = host_override.unwrap_or_else(|| config.gateway.host.clone());
     let port = port_override.unwrap_or(config.gateway.port);
@@ -3533,27 +4143,213 @@ async fn run_gateway(
                     });
                 }
 
+                // Cron-sourced messages run with cron-mode safety: the
+                // protected tools (`cronjob` — recursive scheduling,
+                // `send_message` — interactive messaging, `ask_user` —
+                // blocks on a user who isn't there) are disabled for the
+                // duration of the turn, layered on top of whatever the
+                // user already disabled, then restored. Per-job
+                // `enabled_toolsets` overrides can never widen past this
+                // set. The message also carries `cron_auto_approve=1`
+                // (set by the scheduler): the gateway's callbacks
+                // auto-approve by default today, so there is no gate to
+                // bypass here — the flag is the contract for any future
+                // interactive approval system.
+                let is_cron = msg
+                    .metadata
+                    .get("source")
+                    .map(|s| s.as_str())
+                    == Some("cron");
+
                 // Hold the agent lock only for the LLM turn itself. All
                 // subsequent I/O (typing-indicator abort, streaming
                 // delivery, bus publish) runs without the lock so that
                 // gateway HTTP /chat — which also takes agent.lock() —
                 // doesn't serialize behind a finished agent's outbound
                 // publish.
+                //
+                // The turn runs under a wall-clock timeout: a hung
+                // provider call (network black hole, provider outage)
+                // would otherwise hold the agent mutex forever and
+                // freeze every channel. The gateway HTTP path has its
+                // own 600s request timeout; this bus path had none.
+                // Cron-sourced messages honour FENNEC_CRON_TIMEOUT,
+                // everything else FENNEC_TURN_TIMEOUT_SECS (both
+                // default 600s; 0 disables). The timeout covers only
+                // the turn, not the lock wait, so queued messages
+                // behind a slow turn don't mis-report as timed out.
+                // On expiry the in-flight provider future is dropped
+                // (request cancelled); the agent's history may keep
+                // the user message without an assistant reply — an
+                // accepted cost vs. a permanently frozen gateway.
+                let turn_timeout = resolve_turn_timeout(is_cron);
                 let turn_result = {
                     let mut agent_lock = agent.lock().await;
-                    agent_lock.turn(&msg.content).await
+                    if is_cron {
+                        // Cron turn: protected-tool swap AROUND the
+                        // timeout-wrapped turn, so the restore always
+                        // runs — including on a timeout.
+                        let prior = agent_lock.disabled_tool_names();
+                        agent_lock.set_disabled_tools(
+                            fennec::cron::safety::resolve_cron_disabled_tools(
+                                prior.iter().map(|s| s.as_str()),
+                            ),
+                        );
+                        let result = match turn_timeout {
+                            Some(limit) => {
+                                match tokio::time::timeout(limit, agent_lock.turn(&msg.content))
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => Err(anyhow::anyhow!(
+                                        "agent turn timed out after {}s — the provider call was cancelled. \
+                                         Set FENNEC_CRON_TIMEOUT to adjust (0 disables).",
+                                        limit.as_secs(),
+                                    )),
+                                }
+                            }
+                            None => agent_lock.turn(&msg.content).await,
+                        };
+                        agent_lock.set_disabled_tools(prior);
+                        result
+                    } else {
+                        match turn_timeout {
+                            Some(limit) => {
+                                match tokio::time::timeout(limit, agent_lock.turn(&msg.content))
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => Err(anyhow::anyhow!(
+                                        "agent turn timed out after {}s — the provider call was cancelled. \
+                                         Set FENNEC_TURN_TIMEOUT_SECS to adjust (0 disables).",
+                                        limit.as_secs(),
+                                    )),
+                                }
+                            }
+                            None => agent_lock.turn(&msg.content).await,
+                        }
+                    }
                 };
                 match turn_result {
                     Ok(response) => {
                         // Stop typing indicator.
                         typing_handle.abort();
 
-                        // If the response starts with "[SILENT]", the agent
-                        // decided nothing needs to be said — skip outbound.
-                        if response.starts_with("[SILENT]") {
+                        // Silent marker: agent (or no_agent script) says
+                        // "nothing to report" — skip delivery. Case-
+                        // insensitive containment matches the upstream's
+                        // `SILENT_MARKER in resp.upper()` semantics.
+                        if fennec::cron::delivery::is_silent_response(&response) {
                             tracing::debug!(
                                 "Agent response marked [SILENT], suppressing outbound"
                             );
+                            continue;
+                        }
+
+                        // Cron-sourced messages route through the cron
+                        // delivery system: local/origin/platform/all
+                        // fan-out + optional response wrap. Done BEFORE
+                        // the streaming-channel branch because cron is a
+                        // batched delivery (matches the upstream's
+                        // non-streaming `_deliver_result` path) and a
+                        // multi-target tick can't sensibly stream.
+                        if is_cron {
+                            // local: agent ran (so we recorded a turn)
+                            // but no outbound is sent.
+                            if msg
+                                .metadata
+                                .get("cron_no_deliver")
+                                .map(|s| s.as_str())
+                                == Some("1")
+                            {
+                                tracing::debug!(
+                                    "Cron job '{}': deliver=local, no outbound",
+                                    msg.metadata
+                                        .get("cron_job_id")
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("?")
+                                );
+                                continue;
+                            }
+
+                            // Optional cron header/footer wrap so users
+                            // on busy channels can tell which scheduled
+                            // task spoke.
+                            let final_content = if msg
+                                .metadata
+                                .get("cron_wrap_response")
+                                .map(|s| s.as_str())
+                                == Some("1")
+                            {
+                                let job_name = msg
+                                    .metadata
+                                    .get("cron_job_name")
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("cron job");
+                                let job_id = msg
+                                    .metadata
+                                    .get("cron_job_id")
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                fennec::cron::delivery::wrap_response(
+                                    &response, job_name, job_id,
+                                )
+                            } else {
+                                response.clone()
+                            };
+
+                            // Fan-out targets: either the explicit
+                            // multi-target list from
+                            // `cron_deliver_targets`, or the implicit
+                            // single target from msg.channel +
+                            // msg.chat_id (+ optional thread).
+                            let targets: Vec<
+                                fennec::cron::delivery::DeliveryTarget,
+                            > = match msg.metadata.get("cron_deliver_targets") {
+                                Some(encoded) => {
+                                    fennec::cron::delivery::decode_targets(
+                                        encoded,
+                                    )
+                                }
+                                None => vec![
+                                    fennec::cron::delivery::DeliveryTarget {
+                                        platform: msg.channel.clone(),
+                                        chat_id: msg.chat_id.clone(),
+                                        thread_id: msg
+                                            .metadata
+                                            .get("cron_deliver_thread_id")
+                                            .cloned(),
+                                    },
+                                ],
+                            };
+
+                            for target in targets {
+                                let mut out_meta =
+                                    std::collections::HashMap::new();
+                                if let Some(thread) = &target.thread_id {
+                                    out_meta.insert(
+                                        "thread_id".to_string(),
+                                        thread.clone(),
+                                    );
+                                }
+                                let outbound = fennec::bus::OutboundMessage {
+                                    content: final_content.clone(),
+                                    channel: target.platform.clone(),
+                                    chat_id: target.chat_id.clone(),
+                                    reply_to: Some(msg.id.clone()),
+                                    metadata: out_meta,
+                                    attachments: Vec::new(),
+                                };
+                                if let Err(e) =
+                                    bus.publish_outbound(outbound).await
+                                {
+                                    tracing::error!(
+                                        "Cron outbound to {}:{} failed: {e}",
+                                        target.platform,
+                                        target.chat_id
+                                    );
+                                }
+                            }
                             continue;
                         }
 
@@ -3695,6 +4491,65 @@ async fn run_gateway(
     dispatch_handle.abort();
 
     Ok(())
+}
+
+/// Resolve the wall-clock timeout for one bus-driven agent turn.
+///
+/// Cron-fired turns read `FENNEC_CRON_TIMEOUT` (mirrors the upstream's
+/// cron kill switch); user-initiated turns read
+/// `FENNEC_TURN_TIMEOUT_SECS`. Both default to 600 seconds — matching
+/// the gateway HTTP path's request timeout — and `0` (or any
+/// unparseable value being absent) disables the limit entirely.
+fn resolve_turn_timeout(is_cron: bool) -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 600;
+    let var = if is_cron {
+        "FENNEC_CRON_TIMEOUT"
+    } else {
+        "FENNEC_TURN_TIMEOUT_SECS"
+    };
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod turn_timeout_tests {
+    use super::resolve_turn_timeout;
+
+    /// Env-mutating tests serialize through a lock to avoid races with
+    /// parallel test threads.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn defaults_to_600s_for_both_paths() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("FENNEC_CRON_TIMEOUT");
+            std::env::remove_var("FENNEC_TURN_TIMEOUT_SECS");
+        }
+        assert_eq!(
+            resolve_turn_timeout(false).map(|d| d.as_secs()),
+            Some(600)
+        );
+        assert_eq!(resolve_turn_timeout(true).map(|d| d.as_secs()), Some(600));
+    }
+
+    #[test]
+    fn zero_disables_and_env_overrides() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("FENNEC_TURN_TIMEOUT_SECS", "0");
+            std::env::set_var("FENNEC_CRON_TIMEOUT", "120");
+        }
+        assert_eq!(resolve_turn_timeout(false), None);
+        assert_eq!(resolve_turn_timeout(true).map(|d| d.as_secs()), Some(120));
+        unsafe {
+            std::env::remove_var("FENNEC_TURN_TIMEOUT_SECS");
+            std::env::remove_var("FENNEC_CRON_TIMEOUT");
+        }
+    }
 }
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM and log which one fired.
@@ -3871,9 +4726,44 @@ async fn main() -> Result<()> {
             }
             fennec::onboard::run_wizard(&home_dir)?;
         }
-        Commands::Login => {
-            auth::run_oauth_login(&home_dir)?;
-        }
+        Commands::Login { provider, force } => match provider.as_str() {
+            "anthropic" => {
+                auth::run_oauth_login(&home_dir)?;
+            }
+            "gemini-cloudcode" | "google-cloudcode" | "gemini" | "google" => {
+                auth::google_oauth::run_google_login(&home_dir, force)?;
+                println!("Discovering your Gemini Code Assist project…");
+                match fennec::providers::gemini_cloudcode::ensure_project_context(&home_dir) {
+                    Ok(project) if !project.is_empty() => {
+                        println!("Signed in. Using project: {project}");
+                    }
+                    Ok(_) => {
+                        println!(
+                            "Signed in. No managed project was returned; set \
+                             FENNEC_GEMINI_PROJECT_ID or GOOGLE_CLOUD_PROJECT if requests fail."
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "Signed in, but project discovery failed: {e}\n\
+                             You can still try running; set FENNEC_GEMINI_PROJECT_ID if needed."
+                        );
+                    }
+                }
+                println!(
+                    "Set `provider.name = \"gemini-cloudcode\"` in your config to use it."
+                );
+            }
+            "copilot" | "github-copilot" => {
+                auth::github_copilot::run_device_login()?;
+                println!("Signed in to GitHub. Set `provider.name = \"copilot\"` to use Copilot.");
+            }
+            other => {
+                anyhow::bail!(
+                    "unknown login provider '{other}'. Use 'anthropic', 'gemini-cloudcode', or 'copilot'."
+                );
+            }
+        },
         Commands::Doctor => {
             run_doctor(&config, &home_dir).await?;
         }
@@ -4196,6 +5086,57 @@ async fn run_curator_command(
     Ok(())
 }
 
+/// One curator auto-run gate check, called periodically by the
+/// gateway's curator ticker. Loads the persisted curator state, asks
+/// [`should_auto_run`] whether the interval/paused gates pass, and on
+/// `Run` executes the same runner the manual `fennec curator run`
+/// command uses (which records the run into the state store, arming
+/// the next interval).
+async fn maybe_auto_run_curator(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) -> Result<()> {
+    use fennec::skills::curator::{
+        run_curator, AutoRunDecision, CuratorScheduleConfig, CuratorStateStore, RunContext,
+    };
+    use fennec::skills::UsageStore;
+
+    let skills_dir = home_dir.join("skills");
+    if !skills_dir.exists() {
+        return Ok(()); // nothing to curate
+    }
+    let state = Arc::new(CuratorStateStore::open(&skills_dir));
+    let sched = CuratorScheduleConfig::default();
+    match fennec::skills::curator::should_auto_run(
+        &sched,
+        &state.snapshot(),
+        None,
+        chrono::Utc::now(),
+    ) {
+        AutoRunDecision::Skip(reason) => {
+            tracing::debug!("curator auto-run skipped: {}", reason.as_human_string());
+            Ok(())
+        }
+        AutoRunDecision::Run => {
+            tracing::info!("curator auto-run: interval gate passed, starting run");
+            let usage = Arc::new(UsageStore::open(&skills_dir));
+            let logs_dir = home_dir.join("logs");
+            let aux = build_provider_for_curator(config, home_dir)
+                .await?
+                .map(Arc::new);
+            let mut ctx = RunContext::new(skills_dir, logs_dir, usage, state);
+            ctx.aux = aux;
+            let summary = run_curator(&ctx).await?;
+            tracing::info!(
+                "curator auto-run finished in {:.2}s: {}",
+                summary.duration_seconds,
+                summary.one_line_summary
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Build the auxiliary client for the curator CLI command. Returns
 /// `Ok(None)` when the operator hasn't configured any provider — the
 /// curator falls back to auto-only mode rather than failing.
@@ -4212,8 +5153,8 @@ async fn build_provider_for_curator(
             return Ok(None);
         }
     };
-    let primary: Arc<dyn Provider> = build_provider(config, api_key, None).into();
-    Ok(Some(build_auxiliary_client(config, primary, &secret_store)))
+    let primary: Arc<dyn Provider> = build_provider(config, home_dir, api_key, None).into();
+    Ok(Some(build_auxiliary_client(config, home_dir, primary, &secret_store)))
 }
 
 /// Run Fennec as an MCP server on stdio. Logs to stderr (stdout is

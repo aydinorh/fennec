@@ -409,8 +409,14 @@ impl Channel for SlackChannel {
     }
 
     fn allows_sender(&self, sender_id: &str) -> bool {
+        // Default-DENY: an empty allowlist refuses everyone ("*" opts
+        // into allow-everyone). See the telegram channel for rationale.
         if self.allowed_users.is_empty() {
-            return true;
+            tracing::warn!(
+                "Slack: refusing message from '{sender_id}' — no allowed_users configured. \
+                 Add your user ID to [channels.slack].allowed_users (or \"*\" to allow everyone)."
+            );
+            return false;
         }
         if self.allowed_users.iter().any(|u| u == "*") {
             return true;

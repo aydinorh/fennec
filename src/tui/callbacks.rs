@@ -225,7 +225,7 @@ impl AgentCallbacks for TuiBridge {
 /// If a modal is already open, the new request replaces it (the
 /// previous request's oneshot is dropped, which makes the
 /// awaiting agent task receive an `Err` and treat the prompt as
-/// denied — matches Hermes' last-write-wins semantics, which we
+/// denied — matches the upstream's last-write-wins semantics, which we
 /// document as a deliberate gap rather than a guarantee).
 pub fn install_approval_modal(
     app: &mut App,

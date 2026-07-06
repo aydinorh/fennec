@@ -8,6 +8,25 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall, UsageInfo,
 };
 
+/// Wire dialect for OpenAI-compatible backends that need provider-specific
+/// request shaping beyond the standard Chat Completions format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiDialect {
+    /// Stock OpenAI / Kimi / OpenRouter — no extra shaping.
+    Standard,
+    /// DeepSeek. Thinking-capable models (`deepseek-reasoner`,
+    /// `deepseek-v4-*` and later) need an explicit
+    /// `thinking: {type: enabled|disabled}` field: DeepSeek defaults
+    /// thinking ON when the field is omitted and then enforces a
+    /// `reasoning_content` echo-back contract on subsequent turns.
+    /// Setting it explicitly lets `/think:off` actually disable
+    /// reasoning and removes the default-on ambiguity. Mirrors the
+    /// upstream's DeepSeek provider profile; the `reasoning_content`
+    /// echo itself is handled generically in `convert_messages`, and
+    /// non-thinking `deepseek-chat` (V3) is left untouched.
+    DeepSeek,
+}
+
 /// OpenAI-compatible API provider.
 ///
 /// Works with OpenAI, Azure OpenAI, and any API that follows the
@@ -19,6 +38,7 @@ pub struct OpenAIProvider {
     base_url: String,
     ctx_window: usize,
     extra_headers: Vec<(String, String)>,
+    dialect: OpenAiDialect,
 }
 
 impl OpenAIProvider {
@@ -39,7 +59,14 @@ impl OpenAIProvider {
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             ctx_window: context_window.unwrap_or(128_000),
             extra_headers: Vec::new(),
+            dialect: OpenAiDialect::Standard,
         }
+    }
+
+    /// Set the wire dialect for provider-specific request shaping.
+    pub fn with_dialect(mut self, dialect: OpenAiDialect) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// Add extra headers to be sent with every request.
@@ -162,74 +189,54 @@ impl OpenAIProvider {
     }
 
     /// Build the common request body (shared by chat and chat_stream).
-    fn build_request_body(
-        &self,
-        request: &ChatRequest<'_>,
-        stream: bool,
-    ) -> (Vec<Value>, Value) {
-        let mut messages = Vec::new();
-
-        if let Some(system_text) = request.system {
-            messages.push(json!({
-                "role": "system",
-                "content": system_text
-            }));
-        }
-
-        messages.extend(Self::convert_messages(request.messages));
-
-        // Reasoning-family models (o1, o3, o4-*, gpt-5*) REJECT `max_tokens`
-        // at the Chat Completions endpoint and require `max_completion_tokens`
-        // instead. They also reject `temperature`. See Azure/OpenAI reasoning
-        // docs: "Reasoning models will only work with the
-        // max_completion_tokens parameter when using the Chat Completions API."
-        let token_field = if is_reasoning_model(&self.model) {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        };
-
-        let mut body = json!({
-            "model": self.model,
-            token_field: request.max_tokens,
-            "messages": messages,
-        });
-
-        // Only non-reasoning models accept `temperature` — reasoning models
-        // reject it at the API level.
-        if !is_reasoning_model(&self.model) {
-            body["temperature"] = json!(request.temperature);
-        }
-
-        if stream {
-            body["stream"] = json!(true);
-            // Request a usage payload in the final streaming chunk
-            // (per OpenAI's stream_options spec). Without this the
-            // streamed response doesn't carry token counts at all
-            // and `/usage` would silently report zero for every
-            // streaming turn. Servers that don't recognise the field
-            // ignore it.
-            body["stream_options"] = json!({"include_usage": true});
-        }
-
-        if let Some(tools) = request.tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(Self::convert_tools(tools));
-            }
-        }
-
-        // Apply reasoning_effort if the agent selected a thinking level.
-        crate::agent::thinking::apply_thinking_params(
-            &mut body,
-            request.thinking_level,
-            "openai",
-        );
-
-        (messages, body)
+    fn build_request_body(&self, request: &ChatRequest<'_>, stream: bool) -> Value {
+        let mut body = build_openai_request_body(&self.model, request, stream);
+        self.apply_dialect_shaping(&mut body, request.thinking_level);
+        body
     }
 
-    /// Parse the OpenAI response JSON into our ChatResponse.
-    fn parse_response(body: &Value) -> Result<ChatResponse> {
+    /// Apply provider-dialect-specific request shaping on top of the
+    /// standard Chat Completions body. No-op for the Standard dialect.
+    fn apply_dialect_shaping(
+        &self,
+        body: &mut Value,
+        level: crate::agent::thinking::ThinkingLevel,
+    ) {
+        use crate::agent::thinking::ThinkingLevel;
+        if self.dialect != OpenAiDialect::DeepSeek {
+            return;
+        }
+        if is_deepseek_thinking_model(&self.model) {
+            // Thinking-capable model: set the explicit on/off field so
+            // `/think:off` truly disables reasoning and the default-on
+            // echo-back contract is unambiguous.
+            let enabled = level != ThinkingLevel::Off;
+            body["thinking"] =
+                json!({ "type": if enabled { "enabled" } else { "disabled" } });
+            if enabled {
+                // reasoning_effort: pass low/medium/high through and map
+                // Max → DeepSeek's "max" tier — matching the upstream's
+                // DeepSeek profile. DeepSeek accepts low/medium and maps
+                // them to high server-side (per the vendor docs), so no
+                // client-side remap is needed; Low/Medium/High were set
+                // by the generic openai path (apply_thinking_params).
+                if level == ThinkingLevel::Max {
+                    body["reasoning_effort"] = json!("max");
+                }
+            } else if let Some(o) = body.as_object_mut() {
+                o.remove("reasoning_effort");
+            }
+        } else if let Some(o) = body.as_object_mut() {
+            // Non-thinking DeepSeek (V3 / deepseek-chat): strip any
+            // reasoning_effort the generic path added — V3 has no
+            // thinking mode. Matches the upstream's V3 no-op.
+            o.remove("reasoning_effort");
+        }
+    }
+
+    /// Parse the OpenAI response JSON into our ChatResponse. Shared with the
+    /// Azure provider, which receives the identical Chat Completions shape.
+    pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse> {
         let choice = body
             .get("choices")
             .and_then(|c| c.as_array())
@@ -314,6 +321,58 @@ impl OpenAIProvider {
     }
 }
 
+/// Build an OpenAI Chat Completions request body. Shared by [`OpenAIProvider`]
+/// and the Azure provider (which sends the identical body to Azure's
+/// deployment-routed endpoint) — see [`super::azure`].
+pub(crate) fn build_openai_request_body(
+    model: &str,
+    request: &ChatRequest<'_>,
+    stream: bool,
+) -> Value {
+    let mut messages = Vec::new();
+
+    if let Some(system_text) = request.system {
+        messages.push(json!({ "role": "system", "content": system_text }));
+    }
+    messages.extend(OpenAIProvider::convert_messages(request.messages));
+
+    // Reasoning-family models (o1, o3, o4-*, gpt-5*) REJECT `max_tokens` at the
+    // Chat Completions endpoint and require `max_completion_tokens` instead.
+    // They also reject `temperature`.
+    let token_field = if is_reasoning_model(model) {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+
+    let mut body = json!({
+        "model": model,
+        token_field: request.max_tokens,
+        "messages": messages,
+    });
+
+    if !is_reasoning_model(model) {
+        body["temperature"] = json!(request.temperature);
+    }
+
+    if stream {
+        body["stream"] = json!(true);
+        // Request a usage payload in the final streaming chunk (per OpenAI's
+        // stream_options spec); servers that don't recognise it ignore it.
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+
+    if let Some(tools) = request.tools {
+        if !tools.is_empty() {
+            body["tools"] = json!(OpenAIProvider::convert_tools(tools));
+        }
+    }
+
+    crate::agent::thinking::apply_thinking_params(&mut body, request.thinking_level, "openai");
+
+    body
+}
+
 /// Return `true` for OpenAI model names that belong to the "reasoning"
 /// family — these models reject `max_tokens` (and `temperature`) at the
 /// Chat Completions endpoint and require `max_completion_tokens` instead.
@@ -364,6 +423,24 @@ pub(crate) fn is_reasoning_model(model: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Return `true` for DeepSeek model names that support thinking mode.
+///
+/// Covers the V4+ generations (`deepseek-v4-*`, `deepseek-v5-*`, …) and
+/// the legacy `deepseek-reasoner` (R1). `deepseek-chat` is V3 — no
+/// thinking mode — and any `deepseek-v3*` is explicitly excluded.
+/// Mirrors the upstream's `_model_supports_thinking`.
+pub(crate) fn is_deepseek_thinking_model(model: &str) -> bool {
+    let m = model.trim().to_lowercase();
+    if m.is_empty() {
+        return false;
+    }
+    if m == "deepseek-reasoner" {
+        return true;
+    }
+    // deepseek-v4-*, deepseek-v5-*, … (v3 explicitly excluded).
+    m.starts_with("deepseek-v") && !m.starts_with("deepseek-v3")
 }
 
 /// Dispatch one OpenAI streaming chunk payload.
@@ -468,7 +545,7 @@ impl Provider for OpenAIProvider {
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
-        let (_messages, body) = self.build_request_body(&request, false);
+        let body = self.build_request_body(&request, false);
 
         let mut req = self
             .client
@@ -533,7 +610,7 @@ impl Provider for OpenAIProvider {
         &self,
         request: ChatRequest<'_>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
-        let (_messages, body) = self.build_request_body(&request, true);
+        let body = self.build_request_body(&request, true);
 
         let mut req = self
             .client
@@ -574,87 +651,97 @@ impl Provider for OpenAIProvider {
             anyhow::bail!("OpenAI API error ({}): {}", status, error_msg);
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let mut byte_stream = response.bytes_stream();
+        Ok(spawn_openai_stream(response))
+    }
+}
 
-        tokio::spawn(async move {
-            let mut sse = SseBuffer::new();
-            let mut usage_acc = UsageInfo::default();
-            let mut usage_seen = false;
-            // Emit `StreamEvent::Usage` exactly once when we have data
-            // for it. The accumulator may be populated either by an
-            // intermediate chunk that already carried `usage` or by
-            // the final chunk that arrives with empty `choices`.
-            let emit_usage = |usage: &UsageInfo,
-                              tx: &tokio::sync::mpsc::Sender<StreamEvent>,
-                              seen: &mut bool|
-             -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-                let usage = usage.clone();
-                let tx = tx.clone();
-                let seen_now = !*seen
-                    && (usage.input_tokens > 0
-                        || usage.output_tokens > 0
-                        || usage.cache_read_tokens.is_some());
+/// Spawn the SSE-processing task for an OpenAI-style streaming response and
+/// return the event receiver. Shared by [`OpenAIProvider`] and the Azure
+/// provider, whose streaming response is the identical Chat Completions SSE
+/// shape.
+pub(crate) fn spawn_openai_stream(
+    response: reqwest::Response,
+) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let mut byte_stream = response.bytes_stream();
+
+    tokio::spawn(async move {
+        let mut sse = SseBuffer::new();
+        let mut usage_acc = UsageInfo::default();
+        let mut usage_seen = false;
+        // Emit `StreamEvent::Usage` exactly once when we have data
+        // for it. The accumulator may be populated either by an
+        // intermediate chunk that already carried `usage` or by
+        // the final chunk that arrives with empty `choices`.
+        let emit_usage = |usage: &UsageInfo,
+                          tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+                          seen: &mut bool|
+         -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let usage = usage.clone();
+            let tx = tx.clone();
+            let seen_now = !*seen
+                && (usage.input_tokens > 0
+                    || usage.output_tokens > 0
+                    || usage.cache_read_tokens.is_some());
+            if seen_now {
+                *seen = true;
+            }
+            Box::pin(async move {
                 if seen_now {
-                    *seen = true;
+                    let _ = tx.send(StreamEvent::Usage(usage)).await;
                 }
-                Box::pin(async move {
-                    if seen_now {
-                        let _ = tx.send(StreamEvent::Usage(usage)).await;
-                    }
-                })
+            })
+        };
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                    return;
+                }
             };
+            sse.extend(&chunk);
 
-            while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                        return;
-                    }
+            while let Some(line_bytes) = sse.next_line() {
+                let line = match std::str::from_utf8(&line_bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
                 };
-                sse.extend(&chunk);
 
-                while let Some(line_bytes) = sse.next_line() {
-                    let line = match std::str::from_utf8(&line_bytes) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
+                let data_str = match line.strip_prefix("data: ") {
+                    Some(s) => s,
+                    None => continue,
+                };
 
-                    let data_str = match line.strip_prefix("data: ") {
-                        Some(s) => s,
-                        None => continue,
-                    };
+                if data_str == "[DONE]" {
+                    emit_usage(&usage_acc, &tx, &mut usage_seen).await;
+                    let _ = tx.send(StreamEvent::Done).await;
+                    return;
+                }
 
-                    if data_str == "[DONE]" {
-                        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
-                        let _ = tx.send(StreamEvent::Done).await;
-                        return;
-                    }
+                let data: Value = match serde_json::from_str(data_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
 
-                    let data: Value = match serde_json::from_str(data_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    if dispatch_openai_chunk(&data, &tx, &mut usage_acc).await {
-                        // finish_reason observed — still prefer [DONE] as
-                        // the authoritative terminator when the server
-                        // sends it, but close now so we don't hang if it
-                        // doesn't.
-                        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
-                        let _ = tx.send(StreamEvent::Done).await;
-                        return;
-                    }
+                if dispatch_openai_chunk(&data, &tx, &mut usage_acc).await {
+                    // finish_reason observed — still prefer [DONE] as
+                    // the authoritative terminator when the server
+                    // sends it, but close now so we don't hang if it
+                    // doesn't.
+                    emit_usage(&usage_acc, &tx, &mut usage_seen).await;
+                    let _ = tx.send(StreamEvent::Done).await;
+                    return;
                 }
             }
+        }
 
-            emit_usage(&usage_acc, &tx, &mut usage_seen).await;
-            let _ = tx.send(StreamEvent::Done).await;
-        });
+        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
+        let _ = tx.send(StreamEvent::Done).await;
+    });
 
-        Ok(rx)
-    }
+    rx
 }
 
 #[cfg(test)]
@@ -852,7 +939,7 @@ mod tests {
             temperature: 0.42,
             thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
-        let (_, body) = p.build_request_body(&req, false);
+        let body = p.build_request_body(&req, false);
         assert_eq!(body["max_tokens"], 1234);
         assert!(body.get("max_completion_tokens").is_none());
         assert_eq!(body["temperature"], 0.42);
@@ -869,7 +956,7 @@ mod tests {
             temperature: 0.42,
             thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
-        let (_, body) = p.build_request_body(&req, false);
+        let body = p.build_request_body(&req, false);
         assert_eq!(body["max_completion_tokens"], 1234);
         assert!(body.get("max_tokens").is_none());
         // Reasoning models reject `temperature`; we must not send it.
@@ -887,10 +974,84 @@ mod tests {
             temperature: 0.7,
             thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
-        let (_, body) = p.build_request_body(&req, false);
+        let body = p.build_request_body(&req, false);
         assert_eq!(body["max_completion_tokens"], 100);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("temperature").is_none());
+    }
+
+    // ---- DeepSeek dialect ----
+
+    #[test]
+    fn deepseek_thinking_model_detection() {
+        assert!(is_deepseek_thinking_model("deepseek-reasoner"));
+        assert!(is_deepseek_thinking_model("deepseek-v4-pro"));
+        assert!(is_deepseek_thinking_model("deepseek-v4-flash"));
+        assert!(is_deepseek_thinking_model("deepseek-v5-anything"));
+        // V3 / chat = non-thinking.
+        assert!(!is_deepseek_thinking_model("deepseek-chat"));
+        assert!(!is_deepseek_thinking_model("deepseek-v3-0324"));
+        assert!(!is_deepseek_thinking_model(""));
+    }
+
+    fn deepseek(model: &str) -> OpenAIProvider {
+        OpenAIProvider::new("k".into(), Some(model.into()), None, None)
+            .with_dialect(OpenAiDialect::DeepSeek)
+    }
+
+    fn req(level: crate::agent::thinking::ThinkingLevel) -> ChatRequest<'static> {
+        ChatRequest {
+            messages: &[],
+            system: None,
+            tools: None,
+            max_tokens: 100,
+            temperature: 0.7,
+            thinking_level: level,
+        }
+    }
+
+    #[test]
+    fn deepseek_thinking_model_enables_thinking_with_effort() {
+        use crate::agent::thinking::ThinkingLevel;
+        let body = deepseek("deepseek-reasoner").build_request_body(&req(ThinkingLevel::Medium), false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn deepseek_thinking_off_disables_and_strips_effort() {
+        use crate::agent::thinking::ThinkingLevel;
+        let body = deepseek("deepseek-v4-pro").build_request_body(&req(ThinkingLevel::Off), false);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_max_uses_max_effort_tier() {
+        use crate::agent::thinking::ThinkingLevel;
+        let body = deepseek("deepseek-v4-flash").build_request_body(&req(ThinkingLevel::Max), false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn deepseek_v3_chat_gets_no_thinking_fields() {
+        use crate::agent::thinking::ThinkingLevel;
+        // Non-thinking V3: no `thinking` field, and any reasoning_effort
+        // the generic path added is stripped (matches the upstream no-op).
+        let body = deepseek("deepseek-chat").build_request_body(&req(ThinkingLevel::High), false);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn standard_dialect_never_adds_thinking_field() {
+        use crate::agent::thinking::ThinkingLevel;
+        // Even a deepseek-named model on the Standard dialect (e.g. via
+        // OpenRouter) gets no DeepSeek-specific shaping.
+        let p = OpenAIProvider::new("k".into(), Some("deepseek-reasoner".into()), None, None);
+        let body = p.build_request_body(&req(ThinkingLevel::Medium), false);
+        assert!(body.get("thinking").is_none());
     }
 
     /// Drain a receiver after a dispatch call into a Vec<StreamEvent>.

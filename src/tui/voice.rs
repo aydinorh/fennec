@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "audio")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// State of the voice subsystem at any moment.
@@ -148,6 +149,7 @@ impl VoiceController {
         }
     }
 
+    #[cfg(feature = "audio")]
     fn spawn_capture_thread(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -161,6 +163,18 @@ impl VoiceController {
             })?;
         *self.inner.stop_signal.lock().unwrap() = Some(stop_tx);
         Ok(())
+    }
+
+    /// Built without the `audio` cargo feature: mic capture is
+    /// unavailable, surface a clear error instead of failing to link
+    /// against ALSA/CoreAudio. TTS playback and file transcription
+    /// are unaffected (they don't go through cpal).
+    #[cfg(not(feature = "audio"))]
+    fn spawn_capture_thread(&self) -> Result<()> {
+        anyhow::bail!(
+            "this build has no microphone support (cargo feature `audio` disabled). \
+             Rebuild with default features — on Linux servers install libasound2-dev first."
+        )
     }
 
     /// Stop mic capture, write the buffered samples to a WAV
@@ -198,18 +212,7 @@ impl VoiceController {
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         ));
 
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&path, spec)
-            .with_context(|| format!("open WAV writer: {}", path.display()))?;
-        for s in samples {
-            writer.write_sample(s)?;
-        }
-        writer.finalize()?;
+        write_wav(&path, &samples, sample_rate)?;
         *self.inner.state.lock().unwrap() = VoiceState::Transcribing;
         *self.inner.pending_wav.lock().unwrap() = Some(path.clone());
         Ok(path)
@@ -236,10 +239,37 @@ impl Default for VoiceController {
     }
 }
 
+/// Serialize buffered PCM samples to a 16-bit mono WAV.
+#[cfg(feature = "audio")]
+fn write_wav(path: &std::path::Path, samples: &[i16], sample_rate: u32) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("open WAV writer: {}", path.display()))?;
+    for s in samples {
+        writer.write_sample(*s)?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Unreachable in practice without `audio` (recording can never
+/// start, so `samples` is always empty and `stop_recording` errors
+/// before calling this) — present so the module compiles.
+#[cfg(not(feature = "audio"))]
+fn write_wav(_path: &std::path::Path, _samples: &[i16], _sample_rate: u32) -> Result<()> {
+    anyhow::bail!("this build has no audio support (cargo feature `audio` disabled)")
+}
+
 /// Run the cpal capture loop until a stop signal arrives. Buffers
 /// samples into `inner.samples`. Sample format conversions
 /// (i16, i32, f32) handled inline so we accept whatever the
 /// default input device exposes.
+#[cfg(feature = "audio")]
 fn run_capture(
     inner: Arc<VoiceInner>,
     stop_rx: std::sync::mpsc::Receiver<()>,

@@ -86,15 +86,28 @@ impl CodeExecTool {
 
     /// Execute the code file with the language runner. Returns stdout,
     /// stderr, exit code, and a timed_out flag.
+    ///
+    /// The child runs with a SCRUBBED environment: model-authored code
+    /// must not inherit Fennec's provider API keys or other secrets (a
+    /// one-line `print(os.environ)` would exfiltrate all of them). See
+    /// `security::child_env` for the deny-first allowlist.
     async fn run(&self, path: &std::path::Path, lang: Language) -> Result<ExecOutcome> {
         let mut cmd = Command::new(lang.runner());
         cmd.arg(path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        crate::security::child_env::apply_scrubbed_env(&mut cmd);
+        // Own process group (Unix) so a timeout can kill the whole tree
+        // (a script that spawned subprocesses) and not just the runner.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {}", lang.runner()))?;
+        #[cfg(unix)]
+        let child_pid = child.id();
 
         let mut stdout = child.stdout.take().context("no stdout")?;
         let mut stderr = child.stderr.take().context("no stderr")?;
@@ -116,6 +129,17 @@ impl CodeExecTool {
                 })
             }
             Err(_elapsed) => {
+                // Kill the whole process group first (Unix) — `kill()`
+                // alone reaps only the runner, leaving any subprocess the
+                // script spawned running unsupervised.
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    // SAFETY: plain libc call; pgid == child pid because
+                    // we spawned with process_group(0).
+                    unsafe {
+                        libc::killpg(pid as i32, libc::SIGKILL);
+                    }
+                }
                 let _ = child.kill().await;
                 let mut out = String::new();
                 let mut err = String::new();
@@ -468,6 +492,42 @@ mod tests {
             .unwrap();
         assert!(!r.success);
         assert!(r.output.contains("timed out"), "output: {}", r.output);
+    }
+
+    #[tokio::test]
+    async fn child_env_is_scrubbed_of_secrets() {
+        if which("bash").is_none() {
+            return;
+        }
+        // Plant a secret-named var in the parent env; the child must not
+        // see it, while an operational var (PATH) survives.
+        // SAFETY: test-scoped env mutation, removed below.
+        unsafe {
+            std::env::set_var("FENNEC_W0_TEST_API_KEY", "sk-super-secret");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let t = CodeExecTool::new(15, tmp.path().to_path_buf());
+        let r = t
+            .execute(json!({
+                "code": "echo \"key=[$FENNEC_W0_TEST_API_KEY] path_set=[${PATH:+yes}]\"",
+                "language": "bash"
+            }))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("FENNEC_W0_TEST_API_KEY");
+        }
+        assert!(r.success, "output: {}", r.output);
+        assert!(
+            r.output.contains("key=[]"),
+            "secret leaked into child env: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("path_set=[yes]"),
+            "PATH must survive scrubbing: {}",
+            r.output
+        );
     }
 
     #[tokio::test]

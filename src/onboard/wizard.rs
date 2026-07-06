@@ -46,6 +46,10 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         "OpenAI (GPT-4o)",
         "Kimi (Moonshot)",
         "OpenRouter (any model)",
+        "Google Gemini (API key)",
+        "Google Gemini (free — Google sign-in)",
+        "OpenAI Codex (Responses API)",
+        "DeepSeek (V3, R1, V4)",
         "Ollama (local)",
     ];
     let provider_idx = Select::new()
@@ -63,7 +67,11 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
             "anthropic/claude-sonnet-4",
             "OPENROUTER_API_KEY",
         ),
-        4 => ("ollama", "llama3.1", ""),
+        4 => ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
+        5 => ("gemini-cloudcode", "gemini-2.5-flash", ""),
+        6 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
+        7 => ("deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),
+        8 => ("ollama", "llama3.1", ""),
         _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
     frame.complete_step(StepSummary::done(
@@ -123,6 +131,21 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
                 "API key".to_string()
             };
             (key, summary)
+        }
+    } else if provider_name == "gemini-cloudcode" {
+        println!();
+        println!("  {}", style("Starting Google sign-in...").dim());
+        match crate::auth::google_oauth::run_google_login(fennec_home, false) {
+            Ok(_creds) => {
+                println!("  {}", style("Discovering your Gemini Code Assist project...").dim());
+                let _ = crate::providers::gemini_cloudcode::ensure_project_context(fennec_home);
+                println!("  {} Signed in with Google!", style("✓").green());
+                (String::new(), "OAuth (Google)".to_string())
+            }
+            Err(e) => {
+                println!("  {} Google sign-in failed: {}", style("✗").yellow(), e);
+                (String::new(), "skipped".to_string())
+            }
         }
     } else if !env_var.is_empty() {
         let key = if let Ok(k) = std::env::var(env_var) {
@@ -311,6 +334,10 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         "OpenAI (GPT-4o)",
         "Kimi (Moonshot)",
         "OpenRouter (any model)",
+        "Google Gemini (API key)",
+        "Google Gemini (free — Google sign-in)",
+        "OpenAI Codex (Responses API)",
+        "DeepSeek (V3, R1, V4)",
         "Ollama (local)",
     ];
     let provider_idx = Select::new()
@@ -328,7 +355,11 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
             "anthropic/claude-sonnet-4",
             "OPENROUTER_API_KEY",
         ),
-        4 => ("ollama", "llama3.1", ""),
+        4 => ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
+        5 => ("gemini-cloudcode", "gemini-2.5-flash", ""),
+        6 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
+        7 => ("deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),
+        8 => ("ollama", "llama3.1", ""),
         _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
 
@@ -369,6 +400,20 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
                 .allow_empty(true)
                 .interact_text()?
         }
+    } else if provider_name == "gemini-cloudcode" {
+        println!();
+        println!("  {}", style("Starting Google sign-in...").dim());
+        match crate::auth::google_oauth::run_google_login(fennec_home, false) {
+            Ok(_creds) => {
+                println!("  {}", style("Discovering your Gemini Code Assist project...").dim());
+                let _ = crate::providers::gemini_cloudcode::ensure_project_context(fennec_home);
+                println!("  {} Signed in with Google!", style("✓").green());
+            }
+            Err(e) => {
+                println!("  {} Google sign-in failed: {}", style("✗").red(), e);
+            }
+        }
+        String::new()
     } else if !env_var.is_empty() {
         if let Ok(key) = std::env::var(env_var) {
             println!("  {} Using {} from environment", style("✓").green(), env_var);
@@ -559,7 +604,12 @@ fn build_config_toml(
     let plurum_key_lit = toml_str(plurum_key);
 
     let allowed_users_line = if telegram_user_id.is_empty() {
-        "allowed_users = []".to_string()
+        // Channels default-DENY on an empty allowlist. Leave the empty
+        // list (secure default) but tell the user how to open it up —
+        // otherwise the bot silently ignores them and the only clue is
+        // a gateway log line.
+        "# Empty = nobody may talk to the bot. Add your Telegram user ID,\n# or \"*\" to allow everyone.\nallowed_users = []"
+            .to_string()
     } else {
         format!("allowed_users = [{}]", toml_str(telegram_user_id))
     };
@@ -590,8 +640,9 @@ encrypt_secrets = true
 command_timeout_secs = 60
 
 [agent]
-max_tool_iterations = 15
+max_tool_iterations = 90
 context_window = 200000
+compression_enabled = true
 
 [channels.telegram]
 enabled = {telegram_enabled}

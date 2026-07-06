@@ -113,7 +113,7 @@ pub struct TuiConfig {
     /// present, its value wins over the global `details` mode
     /// for rendering that section. Valid section names:
     /// `thinking`, `tools`, `subagents`, `activity`. Mirrors
-    /// Hermes' `details_mode.*` config keys + `ui.sections`.
+    /// the upstream's `details_mode.*` config keys + `ui.sections`.
     #[serde(default)]
     pub details_sections: std::collections::HashMap<String, String>,
     /// Status bar position. One of `"top"`, `"bottom"`, `"off"`.
@@ -357,7 +357,31 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub temperature: f64,
     pub max_tokens: u32,
+    /// Same-provider failover models, tried in order when the primary
+    /// model fails after retries. Shorthand for [`Self::fallbacks`]
+    /// entries that reuse the primary provider + key.
     pub fallback_models: Vec<String>,
+    /// Full failover chain entries (provider + model + optional
+    /// base_url), tried in order AFTER `fallback_models`. Lets the
+    /// agent fail over across providers (e.g. anthropic → openai),
+    /// matching the upstream's `fallback_model` list semantics. Each
+    /// entry resolves its own API key from the provider's usual env
+    /// var; entries whose key is missing are skipped at startup with
+    /// a warning.
+    pub fallbacks: Vec<FallbackEntry>,
+}
+
+/// One cross-provider failover entry. See [`ProviderConfig::fallbacks`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FallbackEntry {
+    /// Provider name (`anthropic`, `openai`, `openrouter`, …). Empty
+    /// means "same provider as the primary".
+    pub provider: String,
+    /// Model identifier on that provider. Required.
+    pub model: String,
+    /// Optional base URL override for OpenAI-compatible backends.
+    pub base_url: String,
 }
 
 impl Default for ProviderConfig {
@@ -370,6 +394,7 @@ impl Default for ProviderConfig {
             temperature: 0.7,
             max_tokens: 8192,
             fallback_models: Vec::new(),
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -466,14 +491,60 @@ pub struct AgentConfig {
     pub max_tool_iterations: u32,
     pub context_window: u64,
     pub compression_threshold: f64,
+    /// Whether the agent automatically compacts conversation history mid-turn
+    /// when it exceeds `compression_threshold` of the model's context window.
+    /// Default true; set false for strict prompt-cache stability.
+    pub compression_enabled: bool,
+    pub tool_loop_guardrails: ToolLoopGuardrailsConfig,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_tool_iterations: 15,
+            max_tool_iterations: 90,
             context_window: 200_000,
             compression_threshold: 0.50,
+            compression_enabled: true,
+            tool_loop_guardrails: ToolLoopGuardrailsConfig::default(),
+        }
+    }
+}
+
+/// Per-turn tool-call loop guardrails. Warnings nudge the model when
+/// it repeats failing or non-progressing calls; hard stops
+/// (block/halt) are an explicit opt-in circuit breaker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolLoopGuardrailsConfig {
+    /// Append warning guidance to tool results. Never blocks.
+    pub warnings_enabled: bool,
+    /// Enable block/halt circuit-breaker behavior.
+    pub hard_stop_enabled: bool,
+    /// Warn after N FAILED calls with identical arguments.
+    pub exact_failure_warn_after: u32,
+    /// Block the identical call after N failures (hard-stop mode).
+    pub exact_failure_block_after: u32,
+    /// Warn after N failures of the same tool (any arguments).
+    pub same_tool_failure_warn_after: u32,
+    /// Halt the turn after N failures of the same tool (hard-stop mode).
+    pub same_tool_failure_halt_after: u32,
+    /// Warn after a read-only call returns the identical result N times.
+    pub no_progress_warn_after: u32,
+    /// Block that call after N identical results (hard-stop mode).
+    pub no_progress_block_after: u32,
+}
+
+impl Default for ToolLoopGuardrailsConfig {
+    fn default() -> Self {
+        Self {
+            warnings_enabled: true,
+            hard_stop_enabled: false,
+            exact_failure_warn_after: 2,
+            exact_failure_block_after: 5,
+            same_tool_failure_warn_after: 3,
+            same_tool_failure_halt_after: 8,
+            no_progress_warn_after: 2,
+            no_progress_block_after: 5,
         }
     }
 }

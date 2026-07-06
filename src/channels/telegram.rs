@@ -55,6 +55,12 @@ fn redact_telegram_url(url: &str) -> String {
     redacted
 }
 
+/// Cooldown between "send the pairing code" prompts to the same
+/// unknown sender — mirrors the upstream pairing system's per-user
+/// rate limit (one request per 10 minutes) so an unknown chat can't
+/// make the bot spam itself.
+const PAIRING_PROMPT_COOLDOWN: Duration = Duration::from_secs(600);
+
 /// Telegram channel using the Bot API with long-polling and streaming edits.
 pub struct TelegramChannel {
     bot_token: String,
@@ -62,6 +68,13 @@ pub struct TelegramChannel {
     allowed_users: Vec<String>,
     /// Per-chat timestamp of the last edit, used for rate-limiting streaming deltas.
     last_edit: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Optional pairing flow for unknown senders: a 6-digit code
+    /// (printed in the gateway log at startup) pairs a new user
+    /// without editing config. `None` = pairing disabled, unknown
+    /// senders are refused outright.
+    pairing: Option<Arc<Mutex<crate::security::PairingGuard>>>,
+    /// Last time we prompted each unknown sender for a pairing code.
+    pairing_prompts: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl TelegramChannel {
@@ -71,7 +84,88 @@ impl TelegramChannel {
             client: reqwest::Client::new(),
             allowed_users,
             last_edit: Arc::new(Mutex::new(HashMap::new())),
+            pairing: None,
+            pairing_prompts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Enable the pairing flow for unknown senders.
+    pub fn with_pairing(mut self, guard: Arc<Mutex<crate::security::PairingGuard>>) -> Self {
+        self.pairing = Some(guard);
+        self
+    }
+
+    /// Handle a message from a sender the allowlist refused. Returns
+    /// `true` when the message was consumed by the pairing flow (code
+    /// accepted, code rejected, or prompt sent) — the caller skips the
+    /// message either way; this only decides whether we replied.
+    async fn handle_unpaired_sender(&self, sender_id: &str, chat_id: &str, text: &str) -> bool {
+        let Some(guard) = &self.pairing else {
+            return false;
+        };
+
+        let candidate = text.trim();
+        let looks_like_code =
+            candidate.len() == 6 && candidate.chars().all(|c| c.is_ascii_digit());
+
+        if looks_like_code {
+            let verdict = {
+                let mut g = guard.lock();
+                let v = g.verify_code(sender_id, candidate);
+                if v.is_ok() {
+                    g.add_allowed_user(sender_id);
+                    if let Err(e) = g.save() {
+                        tracing::warn!("pairing: failed to persist allowed user: {e}");
+                    }
+                }
+                v
+            };
+            let reply = match verdict {
+                Ok(_) => {
+                    tracing::info!("pairing: telegram user {sender_id} paired successfully");
+                    "✅ Paired! You can talk to this bot now.".to_string()
+                }
+                Err(e) => format!("❌ Pairing failed: {e}"),
+            };
+            let _ = self
+                .send(&SendMessage {
+                    content: reply,
+                    recipient: chat_id.to_string(),
+                    reply_to: None,
+                    metadata: HashMap::new(),
+                    attachments: Vec::new(),
+                })
+                .await;
+            return true;
+        }
+
+        // Not a code — prompt for one, at most once per cooldown window.
+        let should_prompt = {
+            let mut prompts = self.pairing_prompts.lock();
+            let now = Instant::now();
+            match prompts.get(sender_id) {
+                Some(last) if now.duration_since(*last) < PAIRING_PROMPT_COOLDOWN => false,
+                _ => {
+                    prompts.insert(sender_id.to_string(), now);
+                    true
+                }
+            }
+        };
+        if should_prompt {
+            let _ = self
+                .send(&SendMessage {
+                    content: "🔒 You're not authorized to use this bot yet. Send the \
+                              6-digit pairing code (the bot owner finds it in the \
+                              gateway startup log) to pair."
+                        .to_string(),
+                    recipient: chat_id.to_string(),
+                    reply_to: None,
+                    metadata: HashMap::new(),
+                    attachments: Vec::new(),
+                })
+                .await;
+        }
+        true
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -440,6 +534,12 @@ impl Channel for TelegramChannel {
                 }
 
                 if !self.allows_sender(&sender_id) {
+                    // Pairing flow: a 6-digit code pairs a new user
+                    // without config edits; otherwise prompt (rate-
+                    // limited) so the sender knows why nothing happens.
+                    if self.handle_unpaired_sender(&sender_id, &chat_id, &text).await {
+                        continue;
+                    }
                     tracing::debug!("Telegram: ignoring message from disallowed sender {}", sender_id);
                     continue;
                 }
@@ -450,8 +550,14 @@ impl Channel for TelegramChannel {
                     .as_secs();
 
                 // Handle /new and /reset commands as session reset signals.
+                // Whole-token match, not prefix: "/news today?" is a
+                // question for the agent, not a session wipe. Telegram
+                // also suffixes commands with the bot name in groups
+                // ("/new@my_bot"), so accept that form too.
                 let mut metadata = HashMap::new();
-                let content = if text.starts_with("/new") || text.starts_with("/reset") {
+                let first_token = text.split_whitespace().next().unwrap_or("");
+                let base_command = first_token.split('@').next().unwrap_or("");
+                let content = if base_command == "/new" || base_command == "/reset" {
                     metadata.insert("command".to_string(), "reset".to_string());
                     text.clone()
                 } else {
@@ -584,9 +690,24 @@ impl Channel for TelegramChannel {
     }
 
     fn allows_sender(&self, sender_id: &str) -> bool {
-        // Empty list or wildcard "*" means allow all.
+        // Users paired via the pairing-code flow count alongside the
+        // static config allowlist.
+        if let Some(guard) = &self.pairing {
+            if guard.lock().is_allowed(sender_id) {
+                return true;
+            }
+        }
+        // Default-DENY: an empty allowlist refuses everyone. Anyone who
+        // finds the bot's username can otherwise drive a tool-wielding
+        // agent. Explicit "*" opts into allow-everyone.
         if self.allowed_users.is_empty() {
-            return true;
+            tracing::warn!(
+                "Telegram: refusing message from '{sender_id}' — no allowed_users \
+                 configured and sender not paired. Add your user ID to \
+                 [channels.telegram].allowed_users (or \"*\" for everyone), or pair \
+                 with the 6-digit code from the gateway startup log."
+            );
+            return false;
         }
         if self.allowed_users.iter().any(|u| u == "*") {
             return true;
@@ -738,15 +859,48 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_sender_empty_list() {
+    fn test_allows_sender_empty_list_denies() {
+        // Default-deny: an unconfigured allowlist must refuse everyone;
+        // "*" is the explicit allow-everyone opt-in.
         let ch = TelegramChannel::new("token".to_string(), vec![]);
-        assert!(ch.allows_sender("anyone"));
+        assert!(!ch.allows_sender("anyone"));
     }
 
     #[test]
     fn test_allows_sender_wildcard() {
         let ch = TelegramChannel::new("token".to_string(), vec!["*".to_string()]);
         assert!(ch.allows_sender("anyone"));
+    }
+
+    /// A user paired via the pairing-code flow is allowed even with an
+    /// empty config allowlist (which otherwise default-denies).
+    #[test]
+    fn test_paired_user_is_allowed() {
+        let mut guard = crate::security::PairingGuard::new(None);
+        guard.add_allowed_user("12345");
+        let ch = TelegramChannel::new("token".to_string(), vec![])
+            .with_pairing(Arc::new(Mutex::new(guard)));
+        assert!(ch.allows_sender("12345"));
+        assert!(!ch.allows_sender("99999"), "unpaired still denied");
+    }
+
+    /// Reset commands must match the whole first token, not a prefix:
+    /// "/news today?" is a question for the agent, not a session wipe.
+    /// "/new@my_bot" (Telegram's group-command form) still resets.
+    #[test]
+    fn reset_command_is_whole_token_match() {
+        let is_reset = |text: &str| {
+            let first = text.split_whitespace().next().unwrap_or("");
+            let base = first.split('@').next().unwrap_or("");
+            base == "/new" || base == "/reset"
+        };
+        assert!(is_reset("/new"));
+        assert!(is_reset("/new please"));
+        assert!(is_reset("/reset"));
+        assert!(is_reset("/new@my_bot"));
+        assert!(!is_reset("/news today?"));
+        assert!(!is_reset("/resetting the router"));
+        assert!(!is_reset("tell me /new things"));
     }
 
     #[test]

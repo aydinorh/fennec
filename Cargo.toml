@@ -10,7 +10,16 @@ description = "The fastest personal AI agent with collective intelligence"
 license = "MIT"
 
 [features]
-default = []
+default = ["audio"]
+# Microphone capture for the TUI's /voice mode (cpal + hound). On
+# Linux, cpal links against ALSA — building WITH this feature on a
+# headless server requires libasound2-dev. Server deployments that
+# don't need voice capture can skip the system dependency entirely:
+#   cargo build --no-default-features
+# (re-add matrix-e2ee etc. explicitly if you use them). All other
+# voice features (TTS playback via the OS player, transcription of
+# files) are unaffected by this flag.
+audio = ["dep:cpal", "dep:hound"]
 # End-to-end encryption support for the Matrix channel. Layers
 # matrix-sdk-crypto's OlmMachine (pure-Rust Olm/Megolm via
 # vodozemac, audited) and matrix-sdk-sqlite's SqliteCryptoStore
@@ -53,6 +62,10 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Cron-expression parser + matcher. Matches the upstream's croniter-equivalent
+# grammar (standard 5/6-field, names, ranges, lists, steps, plus L/W/#
+# extensions) so cron-scheduled jobs work at parity with the reference agent.
+croner = "3"
 rand = "0.9"
 futures = "0.3"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
@@ -99,11 +112,16 @@ ruma = { version = "0.14", optional = true, default-features = false, features =
 ratatui = "0.30"
 crossterm = "0.29"
 # Audio capture for TUI voice mode.
-cpal = "0.16"
-hound = "3.5"
+cpal = { version = "0.16", optional = true }
+hound = { version = "3.5", optional = true }
 # `tempfile` powers `/edit` (creates a tempdir for the editor's
 # prompt.md) plus the existing `/image`/`/paste` flows under tests.
 tempfile = "3.15"
+
+# Process-group kill for shell-tool timeouts: killing only the spawned
+# `sh` leaves its children running; killpg(2) takes the whole tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
