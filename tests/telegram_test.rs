@@ -66,9 +66,11 @@ fn parse_empty_result() {
 }
 
 #[test]
-fn allows_sender_empty_list_permits_all() {
+fn allows_sender_empty_list_denies_all() {
+    // Default-deny: an unconfigured allowlist refuses everyone;
+    // "*" is the explicit allow-everyone opt-in.
     let ch = TelegramChannel::new("token".into(), vec![]);
-    assert!(fennec::channels::Channel::allows_sender(&ch, "anyone"));
+    assert!(!fennec::channels::Channel::allows_sender(&ch, "anyone"));
 }
 
 #[test]

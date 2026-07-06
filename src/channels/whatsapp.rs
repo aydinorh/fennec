@@ -248,15 +248,24 @@ impl Channel for WhatsAppChannel {
             let messages = WhatsAppChannel::parse_webhook_messages(&body);
 
             for (sender, text, _msg_id) in messages {
-                // Check allowed users
-                if !state.allowed_users.is_empty()
-                    && !state.allowed_users.iter().any(|u| u == "*")
-                    && !state.allowed_users.iter().any(|u| u == &sender)
-                {
-                    tracing::debug!(
-                        "WhatsApp: ignoring message from disallowed sender {}",
-                        sender
-                    );
+                // Check allowed users — default-DENY on an empty list,
+                // mirroring `allows_sender` ("*" opts into everyone).
+                let sender_allowed = !state.allowed_users.is_empty()
+                    && (state.allowed_users.iter().any(|u| u == "*")
+                        || state.allowed_users.iter().any(|u| u == &sender));
+                if !sender_allowed {
+                    if state.allowed_users.is_empty() {
+                        tracing::warn!(
+                            "WhatsApp: refusing message from '{sender}' — no allowed_users \
+                             configured. Add your number to [channels.whatsapp].allowed_users \
+                             (or \"*\" to allow everyone)."
+                        );
+                    } else {
+                        tracing::debug!(
+                            "WhatsApp: ignoring message from disallowed sender {}",
+                            sender
+                        );
+                    }
                     continue;
                 }
 
@@ -320,8 +329,14 @@ impl Channel for WhatsAppChannel {
     }
 
     fn allows_sender(&self, sender_id: &str) -> bool {
+        // Default-DENY: an empty allowlist refuses everyone ("*" opts
+        // into allow-everyone). See the telegram channel for rationale.
         if self.allowed_users.is_empty() {
-            return true;
+            tracing::warn!(
+                "WhatsApp: refusing message from '{sender_id}' — no allowed_users configured. \
+                 Add your number to [channels.whatsapp].allowed_users (or \"*\" to allow everyone)."
+            );
+            return false;
         }
         if self.allowed_users.iter().any(|u| u == "*") {
             return true;
@@ -454,7 +469,7 @@ mod tests {
         assert!(ch.allows_sender("15551234567"));
         assert!(!ch.allows_sender("15559999999"));
 
-        // Empty list allows all
+        // Empty list denies all (default-deny; "*" is the explicit opt-in)
         let ch2 = WhatsAppChannel::new(
             "123".to_string(),
             "token".to_string(),
@@ -463,7 +478,7 @@ mod tests {
             vec![],
             String::new(),
         );
-        assert!(ch2.allows_sender("anyone"));
+        assert!(!ch2.allows_sender("anyone"));
 
         // Wildcard allows all
         let ch3 = WhatsAppChannel::new(

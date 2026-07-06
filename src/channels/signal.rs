@@ -505,8 +505,17 @@ impl SignalChannel {
     }
 
     fn is_dm_sender_allowed(&self, sender: &str) -> bool {
+        // Default-DENY: an empty allowlist refuses everyone ("*" opts
+        // into allow-everyone). See the telegram channel for rationale.
         let allow = &self.config.allowed_users;
         if allow.is_empty() {
+            tracing::warn!(
+                "Signal: refusing DM from '{sender}' — no allowed_users configured. \
+                 Add your number to [channels.signal].allowed_users (or \"*\" to allow everyone)."
+            );
+            return false;
+        }
+        if allow.iter().any(|s| s == "*") {
             return true;
         }
         allow.iter().any(|s| s == sender)
@@ -1153,8 +1162,18 @@ mod tests {
     }
 
     #[test]
-    fn dm_allowlist_empty_allows_anyone() {
+    fn dm_allowlist_empty_denies_anyone() {
+        // Default-deny: an unconfigured allowlist must refuse everyone;
+        // "*" is the explicit allow-everyone opt-in.
         let ch = channel("+15551234567");
+        assert!(!ch.is_dm_sender_allowed("+19998887777"));
+    }
+
+    #[test]
+    fn dm_allowlist_wildcard_allows_anyone() {
+        let mut c = cfg("+15551234567");
+        c.allowed_users = vec!["*".into()];
+        let ch = SignalChannel::from_config(&c).unwrap();
         assert!(ch.is_dm_sender_allowed("+19998887777"));
     }
 
@@ -1202,7 +1221,9 @@ mod tests {
         // Sync message to self that doesn't match any recent
         // outbound timestamp — that's a real Note to Self the
         // user typed on another device.
-        let ch = channel("+15551234567");
+        let mut c = cfg("+15551234567");
+        c.allowed_users = vec!["*".into()];
+        let ch = SignalChannel::from_config(&c).unwrap();
         let env = json!({
             "envelope": {
                 "sourceNumber": "+15551234567",
@@ -1219,7 +1240,9 @@ mod tests {
 
     #[test]
     fn handle_envelope_passes_through_dm() {
-        let ch = channel("+15551234567");
+        let mut c = cfg("+15551234567");
+        c.allowed_users = vec!["*".into()];
+        let ch = SignalChannel::from_config(&c).unwrap();
         let env = json!({
             "envelope": {
                 "sourceNumber": "+19998887777",
@@ -1330,7 +1353,9 @@ mod tests {
     fn handle_envelope_unwraps_jsonrpc_params() {
         // signal-cli's HTTP daemon nests the envelope inside JSON-RPC
         // params. We unwrap.
-        let ch = channel("+15551234567");
+        let mut c = cfg("+15551234567");
+        c.allowed_users = vec!["*".into()];
+        let ch = SignalChannel::from_config(&c).unwrap();
         let raw = json!({
             "jsonrpc": "2.0",
             "method": "receive",

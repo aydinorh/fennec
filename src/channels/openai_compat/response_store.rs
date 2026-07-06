@@ -61,6 +61,7 @@ impl ResponseStore {
         })?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;",
