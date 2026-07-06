@@ -117,6 +117,7 @@ both paths work.
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
+| DeepSeek | OpenAI-shaped | `thinking` + `reasoning_effort` (V4 / R1) |
 
 Switch providers by setting `provider.name` in config; no code changes. The
 `reliable_provider` wrapper (in `src/providers/reliable.rs`) lets you list a
@@ -125,7 +126,15 @@ fallback chain with cooldowns and an overall deadline.
 Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
-`KIMI_API_KEY`).
+`KIMI_API_KEY`, `DEEPSEEK_API_KEY`).
+
+**DeepSeek** (`provider.name = "deepseek"`) uses DeepSeek's OpenAI-compatible
+endpoint (`https://api.deepseek.com/v1`, key `DEEPSEEK_API_KEY`). Thinking-capable
+models (`deepseek-reasoner`, `deepseek-v4-*` and later) get an explicit
+`thinking: {type: enabled|disabled}` field driven by the `/think:<level>`
+setting, so `/think:off` truly disables reasoning; `deepseek-chat` (V3) is a
+plain non-thinking model. The `reasoning_content` echo-back that DeepSeek's
+thinking mode requires across turns is handled automatically.
 
 Gemini has two flavors: `gemini` uses a `GEMINI_API_KEY`, while `gemini-cloudcode`
 signs in with your Google account (`fennec login --provider gemini-cloudcode`)

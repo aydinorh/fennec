@@ -227,6 +227,7 @@ fn resolve_api_key_for(provider_name: &str) -> Result<String> {
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
         "google" | "gemini" => "GEMINI_API_KEY",
         // OAuth-authenticated; the provider resolves a Google bearer token
         // from stored credentials, so there's no API key to read here.
@@ -347,6 +348,27 @@ fn build_failover_providers(
         providers.push(build_provider(&cfg, home_dir, api_key, Some(entry.model.clone())));
     }
     providers
+}
+
+#[cfg(test)]
+mod deepseek_tests {
+    use super::deepseek_context_window;
+
+    #[test]
+    fn known_models_get_1m_window() {
+        assert_eq!(deepseek_context_window("deepseek-chat"), 1_000_000);
+        assert_eq!(deepseek_context_window("deepseek-reasoner"), 1_000_000);
+        assert_eq!(deepseek_context_window("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(deepseek_context_window("deepseek-v4-flash"), 1_000_000);
+        assert_eq!(deepseek_context_window("DeepSeek-V5-Foo"), 1_000_000);
+    }
+
+    #[test]
+    fn v3_and_unknown_fall_back_to_128k() {
+        assert_eq!(deepseek_context_window("deepseek-v3-0324"), 128_000);
+        assert_eq!(deepseek_context_window("deepseek-coder-legacy"), 128_000);
+        assert_eq!(deepseek_context_window(""), 128_000);
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +640,24 @@ fn resolve_provider_with_model(
     Ok(Arc::from(provider))
 }
 
+/// Context window for a DeepSeek model id.
+///
+/// The V4 family (`deepseek-v4-*`, `deepseek-v5-*`, …) and the legacy
+/// `deepseek-chat` / `deepseek-reasoner` aliases (server-mapped to V4
+/// modes) ship a 1M-token window; unknown or older DeepSeek ids fall
+/// back to 128K. Mirrors the upstream's model_metadata DeepSeek table.
+fn deepseek_context_window(model: &str) -> usize {
+    let m = model.trim().to_lowercase();
+    let one_million = m == "deepseek-chat"
+        || m == "deepseek-reasoner"
+        || (m.starts_with("deepseek-v") && !m.starts_with("deepseek-v3"));
+    if one_million {
+        1_000_000
+    } else {
+        128_000
+    }
+}
+
 /// Build the LLM provider based on config.
 fn build_provider(
     config: &FennecConfig,
@@ -668,6 +708,34 @@ fn build_provider(
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
             Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+        }
+        "deepseek" => {
+            // DeepSeek's OpenAI-compatible endpoint. The DeepSeek wire
+            // dialect adds the explicit `thinking` field for V4+/reasoner
+            // models (see OpenAiDialect::DeepSeek); the reasoning_content
+            // echo-back is handled generically by the openai provider.
+            let ds_url =
+                base_url.unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
+            // Back-compat: if the user switched provider to DeepSeek but
+            // kept an Anthropic-flavored default model string, fall back
+            // to DeepSeek's non-thinking default rather than passing a
+            // non-DeepSeek id. (Same pattern as the kimi/gemini arms.)
+            let ds_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "deepseek-chat".to_string()
+            } else {
+                model
+            };
+            // Context window: the V4 family + the deepseek-chat/reasoner
+            // aliases (server-mapped to V4 modes) ship a 1M window;
+            // unknown/older DeepSeek ids fall back to 128K.
+            let ctx = deepseek_context_window(&ds_model);
+            Box::new(
+                OpenAIProvider::new(api_key, Some(ds_model), Some(ds_url), Some(ctx))
+                    .with_dialect(fennec::providers::openai::OpenAiDialect::DeepSeek),
+            )
         }
         "google" | "gemini" => {
             // Back-compat: if the user switched provider to Gemini but kept an
