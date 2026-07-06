@@ -1,4 +1,6 @@
 pub mod jobs;
+pub mod output;
+pub mod script;
 pub use jobs::{
     compute_next_run, grace_seconds_for, parse_schedule, parse_schedule_kind,
     schedule_display_for, AmbiguousJobReference, CronJob, JobStore, JobUpdates, RepeatConfig,
@@ -27,6 +29,14 @@ pub struct CronScheduler {
     /// The env [`MAX_PARALLEL_ENV`] is read each tick and overrides
     /// this; the field is the programmatic fallback.
     max_parallel: Option<usize>,
+    /// Optional override for the scripts dir (`<scripts_dir>/<script>`
+    /// is where job scripts live). Defaults to
+    /// `<jobs_dir>/scripts/`.
+    scripts_dir: Option<std::path::PathBuf>,
+    /// Optional override for the output dir
+    /// (`<output_dir>/<job_id>/{ts}.md`). Defaults to
+    /// `<jobs_dir>/cron_output/`.
+    output_dir: Option<std::path::PathBuf>,
 }
 
 impl CronScheduler {
@@ -40,6 +50,8 @@ impl CronScheduler {
             bus,
             check_interval_secs: check_interval_secs.unwrap_or(30),
             max_parallel: None,
+            scripts_dir: None,
+            output_dir: None,
         }
     }
 
@@ -50,6 +62,39 @@ impl CronScheduler {
     pub fn with_max_parallel(mut self, n: Option<usize>) -> Self {
         self.max_parallel = n;
         self
+    }
+
+    /// Override the scripts directory. Default: `<jobs_dir>/scripts/`.
+    pub fn with_scripts_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.scripts_dir = Some(dir);
+        self
+    }
+
+    /// Override the cron output directory. Default:
+    /// `<jobs_dir>/cron_output/`.
+    pub fn with_output_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.output_dir = Some(dir);
+        self
+    }
+
+    /// Resolve the scripts dir, deriving from the JobStore path when
+    /// no override is configured.
+    fn scripts_dir(&self) -> std::path::PathBuf {
+        self.scripts_dir.clone().unwrap_or_else(|| {
+            self.store
+                .path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("scripts")
+        })
+    }
+
+    /// Resolve the cron output dir, deriving from the JobStore path
+    /// when no override is configured.
+    fn output_dir(&self) -> std::path::PathBuf {
+        self.output_dir
+            .clone()
+            .unwrap_or_else(|| output::default_output_dir_for(self.store.path()))
     }
 
     /// Run the scheduler loop. This blocks until the task is cancelled.
@@ -150,69 +195,65 @@ impl CronScheduler {
             }
         }
 
-        // Publish in parallel (capped, if configured). Bus publish is
-        // mpsc-channel send — concurrency mostly matters once downstream
-        // consumers do real work, but matches the upstream's parallel
-        // tick semantics and prevents head-of-line blocking when one
-        // consumer is slow.
+        // Spawn one task per due job: each runs its pre-script (if any),
+        // applies the wake-gate, prepends script output + context_from
+        // into the prompt, and either publishes to the bus (agent jobs)
+        // or saves the script output (no_agent jobs). Bounded by the
+        // optional concurrency cap so a hundred-job tick doesn't flood
+        // downstream consumers.
         let cap = self.resolve_max_parallel();
         let sem = cap.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
         let bus = self.bus.clone();
+        let scripts_dir = self.scripts_dir();
+        let output_dir = self.output_dir();
+        let script_timeout = script::resolve_script_timeout();
 
         let mut handles = Vec::with_capacity(due_jobs.len());
         for job in due_jobs {
             let bus = bus.clone();
             let sem = sem.clone();
+            let scripts_dir = scripts_dir.clone();
+            let output_dir = output_dir.clone();
             handles.push(tokio::spawn(async move {
-                // Hold the semaphore permit for the duration of the
-                // publish so the cap actually limits concurrent
-                // publishes (not just spawn rate).
-                let _permit = match sem {
-                    Some(s) => Some(s.acquire_owned().await.ok()),
+                let permit = match sem {
+                    Some(s) => s.acquire_owned().await.ok(),
                     None => None,
                 };
-                let now = Utc::now();
-                let msg = InboundMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    sender: format!("cron:{}", job.id),
-                    content: job.command.clone(),
-                    channel: job
-                        .origin_channel
-                        .clone()
-                        .unwrap_or_else(|| "cron".to_string()),
-                    chat_id: job
-                        .origin_chat_id
-                        .clone()
-                        .unwrap_or_else(|| format!("cron:{}", job.id)),
-                    timestamp: now.timestamp() as u64,
-                    reply_to: None,
-                    metadata: {
-                        let mut m = HashMap::new();
-                        m.insert("source".to_string(), "cron".to_string());
-                        m.insert("cron_job_id".to_string(), job.id.clone());
-                        m
-                    },
-                };
-                let result = bus.publish_inbound(msg).await;
-                (job.id, result.err().map(|e| e.to_string()))
+                process_due_job(
+                    job,
+                    bus,
+                    scripts_dir,
+                    output_dir,
+                    script_timeout,
+                    permit,
+                )
+                .await
             }));
         }
 
         // Collect results, then mark each run SEQUENTIALLY so concurrent
         // `mark_job_run` writes can't clobber each other's JobStore
-        // mutations (it saves the whole store JSON per call).
+        // mutations (it saves the whole store JSON per call). After
+        // mark_job_run, if a job was auto-removed (repeat limit) the
+        // output dir is cleaned up too so orphaned output trees don't
+        // accumulate.
+        let output_dir = self.output_dir();
         for h in handles {
             match h.await {
-                Ok((id, err_msg)) => {
-                    let success = err_msg.is_none();
+                Ok((id, success, err_msg)) => {
                     if let Some(ref err) = err_msg {
-                        tracing::error!("Cron job '{}': failed to publish message: {}", id, err);
+                        tracing::error!("Cron job '{}': run error: {}", id, err);
                     }
+                    let was_present = self.store.list_jobs().iter().any(|j| j.id == id);
                     if let Err(e) =
                         self.store
                             .mark_job_run(&id, success, err_msg.as_deref(), None)
                     {
                         tracing::error!("Cron job '{}': mark_job_run failed: {}", id, e);
+                    }
+                    let still_present = self.store.list_jobs().iter().any(|j| j.id == id);
+                    if was_present && !still_present {
+                        output::cleanup_job_output(&output_dir, &id);
                     }
                 }
                 Err(join_err) => {
@@ -286,6 +327,161 @@ impl Drop for LockGuard {
     }
 }
 
+/// Per-job tick worker. Runs the pre-script (if configured), applies
+/// the wake-gate, builds the composite prompt (script output +
+/// `context_from`), and either publishes to the bus (agent jobs) or
+/// saves the script output (no_agent jobs).
+///
+/// Returns `(job_id, success, err_msg)` so the main loop can call
+/// `mark_job_run` sequentially. Mirrors the upstream's `run_job` flow
+/// — script-first, wake-gate-second, context-from-third — adapted for
+/// Fennec's bus-based architecture (cron publishes; downstream
+/// consumers run the agent).
+async fn process_due_job(
+    job: CronJob,
+    bus: MessageBus,
+    scripts_dir: std::path::PathBuf,
+    output_dir: std::path::PathBuf,
+    script_timeout: std::time::Duration,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> (String, bool, Option<String>) {
+    let job_id = job.id.clone();
+    let now = Utc::now();
+    let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut prompt = job.command.clone();
+    let mut script_stdout: Option<String> = None;
+
+    // 1. Pre-script execution.
+    if let Some(script_path) = &job.script {
+        let (ok, out) = script::run_job_script(script_path, &scripts_dir, script_timeout).await;
+        if !ok {
+            // Script failed. For no_agent jobs this is the terminal
+            // outcome — save an error doc and report failure. For
+            // agent jobs, prepend the error into the prompt so the
+            // agent can surface it.
+            if job.no_agent {
+                let doc = format!(
+                    "# Cron Job: {}\n\n**Job ID:** {}\n**Run Time:** {}\n**Mode:** no_agent (script)\n**Status:** script failed\n\n{}\n",
+                    job.name, job_id, now_str, out
+                );
+                if let Err(e) = output::save_job_output(&output_dir, &job_id, &doc) {
+                    tracing::warn!("Cron job '{}': save_job_output failed: {}", job_id, e);
+                }
+                return (job_id, false, Some(out));
+            }
+            prompt = format!(
+                "## Script Error\nThe data-collection script failed. Report this to the user.\n\n```\n{out}\n```\n\n{prompt}"
+            );
+        } else {
+            script_stdout = Some(out.clone());
+
+            // 2. Wake-gate: `{"wakeAgent": false}` short-circuits the
+            // whole job (no publish, silent success). For no_agent
+            // jobs we still save a silent-marker doc so chained
+            // `context_from` consumers can tell the job ran but had
+            // nothing to report.
+            if !script::parse_wake_gate(&out) {
+                if job.no_agent {
+                    let doc = format!(
+                        "# Cron Job: {}\n\n**Job ID:** {}\n**Run Time:** {}\n**Mode:** no_agent (script)\n**Status:** silent (wakeAgent=false)\n",
+                        job.name, job_id, now_str
+                    );
+                    if let Err(e) = output::save_job_output(&output_dir, &job_id, &doc) {
+                        tracing::warn!(
+                            "Cron job '{}': save_job_output failed: {}",
+                            job_id,
+                            e
+                        );
+                    }
+                }
+                tracing::info!(
+                    "Cron job '{}': wakeAgent=false — silent run, no publish",
+                    job_id
+                );
+                return (job_id, true, None);
+            }
+
+            // 3. no_agent + empty stdout = silent (same as wakeAgent=false).
+            if job.no_agent && out.trim().is_empty() {
+                let doc = format!(
+                    "# Cron Job: {}\n\n**Job ID:** {}\n**Run Time:** {}\n**Mode:** no_agent (script)\n**Status:** silent (empty output)\n",
+                    job.name, job_id, now_str
+                );
+                if let Err(e) = output::save_job_output(&output_dir, &job_id, &doc) {
+                    tracing::warn!("Cron job '{}': save_job_output failed: {}", job_id, e);
+                }
+                tracing::info!(
+                    "Cron job '{}': empty script stdout — silent run, no publish",
+                    job_id
+                );
+                return (job_id, true, None);
+            }
+
+            // 4. Agent job with successful script: inject the output as
+            // context (the data-collection pattern).
+            if !job.no_agent {
+                prompt = format!(
+                    "## Script Output\nThe following data was collected by a pre-run script. Use it as context for your analysis.\n\n```\n{out}\n```\n\n{prompt}"
+                );
+            }
+        }
+    }
+
+    // 5. context_from: inject preceding jobs' latest outputs as context.
+    if let Some(refs) = &job.context_from {
+        for ref_id in refs {
+            if let Some(latest) = output::latest_job_output(&output_dir, ref_id) {
+                prompt = format!(
+                    "## Output from job '{ref_id}'\nThe following is the most recent output from a preceding cron job. Use it as context for your analysis.\n\n```\n{latest}\n```\n\n{prompt}"
+                );
+            }
+        }
+    }
+
+    // 6a. no_agent path: persist the script output as the deliverable.
+    //     Real channel delivery is wired up in the delivery PR; for now
+    //     the saved doc is what downstream callers (or the operator)
+    //     pick up. context_from for the next chained job reads it.
+    if job.no_agent {
+        let out = script_stdout.unwrap_or_default();
+        let doc = format!(
+            "# Cron Job: {}\n\n**Job ID:** {}\n**Run Time:** {}\n**Mode:** no_agent (script)\n\n---\n\n{}\n",
+            job.name, job_id, now_str, out
+        );
+        if let Err(e) = output::save_job_output(&output_dir, &job_id, &doc) {
+            tracing::warn!("Cron job '{}': save_job_output failed: {}", job_id, e);
+        }
+        return (job_id, true, None);
+    }
+
+    // 6b. Agent path: publish the composite prompt to the bus.
+    let msg = InboundMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        sender: format!("cron:{}", job_id),
+        content: prompt,
+        channel: job
+            .origin_channel
+            .clone()
+            .unwrap_or_else(|| "cron".to_string()),
+        chat_id: job
+            .origin_chat_id
+            .clone()
+            .unwrap_or_else(|| format!("cron:{}", job_id)),
+        timestamp: now.timestamp() as u64,
+        reply_to: None,
+        metadata: {
+            let mut m = HashMap::new();
+            m.insert("source".to_string(), "cron".to_string());
+            m.insert("cron_job_id".to_string(), job_id.clone());
+            m
+        },
+    };
+    match bus.publish_inbound(msg).await {
+        Ok(_) => (job_id, true, None),
+        Err(e) => (job_id, false, Some(e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +515,9 @@ mod tests {
             paused_reason: None,
             repeat: RepeatConfig::default(),
             schedule_display: String::new(),
+            script: None,
+            no_agent: false,
+            context_from: None,
         }
     }
 
@@ -735,6 +934,161 @@ mod tests {
                 None => std::env::remove_var(MAX_PARALLEL_ENV),
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_job_with_script_prepends_output_to_prompt() {
+        // A pre-script's stdout is injected into the agent's prompt as
+        // context before the bus publish. Verifies the data-collection
+        // pattern works end-to-end through tick().
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = tmp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("data.sh"), "#!/bin/bash\necho VALUE=42\n").unwrap();
+
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("agent_with_script", "every 1m", None, Some(&past));
+        j.command = "Summarize the data.".to_string();
+        j.script = Some("data.sh".to_string());
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30))
+            .with_scripts_dir(scripts.clone())
+            .with_output_dir(tmp.path().join("cron_output"));
+        scheduler.tick().await;
+
+        let msg = rx
+            .inbound_rx
+            .try_recv()
+            .expect("agent job with script should publish");
+        assert!(
+            msg.content.contains("VALUE=42"),
+            "prompt should include script output: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("Summarize the data."),
+            "prompt should include the original command: {}",
+            msg.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_agent_job_saves_output_and_does_not_publish() {
+        // no_agent jobs run the script but don't publish — their script
+        // stdout IS the deliverable. Output saved to <output_dir>/<job_id>/.
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = tmp.path().join("scripts");
+        let output = tmp.path().join("cron_output");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("alert.sh"), "#!/bin/bash\necho disk 92% full\n").unwrap();
+
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("watchdog", "every 1m", None, Some(&past));
+        j.script = Some("alert.sh".to_string());
+        j.no_agent = true;
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30))
+            .with_scripts_dir(scripts)
+            .with_output_dir(output.clone());
+        scheduler.tick().await;
+
+        assert!(
+            rx.inbound_rx.try_recv().is_err(),
+            "no_agent jobs must not publish to the bus"
+        );
+        let saved = output::latest_job_output(&output, "watchdog")
+            .expect("no_agent job must save its script output");
+        assert!(
+            saved.contains("disk 92% full"),
+            "saved output must include script stdout: {saved}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wake_gate_false_skips_publish_silently() {
+        // {"wakeAgent": false} on the last line of script stdout means
+        // "nothing to report, skip the agent". For agent jobs that's a
+        // skipped publish + success mark.
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = tmp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("check.sh"),
+            "#!/bin/bash\necho \"all clear\"\necho '{\"wakeAgent\": false}'\n",
+        )
+        .unwrap();
+
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("checker", "every 1m", None, Some(&past));
+        j.command = "Investigate the check.".to_string();
+        j.script = Some("check.sh".to_string());
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30))
+            .with_scripts_dir(scripts)
+            .with_output_dir(tmp.path().join("cron_output"));
+        scheduler.tick().await;
+
+        assert!(
+            rx.inbound_rx.try_recv().is_err(),
+            "wakeAgent=false must suppress publish"
+        );
+        let j = scheduler
+            .store
+            .list_jobs()
+            .iter()
+            .find(|j| j.id == "checker")
+            .unwrap();
+        assert_eq!(j.last_status.as_deref(), Some("ok"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn context_from_injects_preceding_job_output() {
+        // Plant a saved output for job "feeder", then run "consumer"
+        // with context_from=["feeder"]. The consumer's published prompt
+        // must include the feeder's saved content.
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("cron_output");
+        output::save_job_output(&output, "feeder", "produced: 7 results").unwrap();
+
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("consumer", "every 1m", None, Some(&past));
+        j.command = "Process the feeder results.".to_string();
+        j.context_from = Some(vec!["feeder".to_string()]);
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30))
+            .with_output_dir(output);
+        scheduler.tick().await;
+
+        let msg = rx
+            .inbound_rx
+            .try_recv()
+            .expect("consumer should publish");
+        assert!(
+            msg.content.contains("produced: 7 results"),
+            "context_from must inject upstream output: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("Process the feeder results."),
+            "original command must remain in the prompt: {}",
+            msg.content
+        );
     }
 
     #[cfg(unix)]

@@ -69,6 +69,9 @@ fn sample_job(id: &str, name: &str, schedule: &str) -> CronJob {
         paused_reason: None,
         repeat: RepeatConfig::default(),
         schedule_display: String::new(),
+        script: None,
+        no_agent: false,
+        context_from: None,
     }
 }
 

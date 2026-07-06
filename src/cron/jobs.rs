@@ -71,6 +71,29 @@ pub struct CronJob {
     /// `/cron list` doesn't re-parse the schedule string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub schedule_display: String,
+    /// Path to a script whose stdout feeds the job. Resolved under
+    /// `<cron_dir>/scripts/`. With `no_agent = true` the script IS the
+    /// job — its stdout is delivered verbatim. Without `no_agent`, its
+    /// stdout is injected into the agent's prompt as context (the
+    /// data-collection / change-detection pattern). `.sh` / `.bash`
+    /// files run via bash; everything else runs via the current
+    /// Python interpreter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// Skip the agent entirely — run `script` on schedule and deliver
+    /// its stdout directly. Empty stdout = silent (no delivery).
+    /// Requires `script` to be set. Mirrors the upstream's `no_agent`
+    /// — ideal for classic watchdogs and periodic alerts that don't
+    /// need LLM reasoning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_agent: bool,
+    /// Other job IDs whose most recent output is injected into this
+    /// job's prompt as context before each run. Useful for chaining
+    /// (job A finds data, job B processes it). Output is read from
+    /// `<output_dir>/<job_id>/` (latest `.md` file), truncated to 8K
+    /// chars to avoid prompt bloat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_from: Option<Vec<String>>,
 }
 
 impl CronJob {
@@ -126,6 +149,9 @@ pub struct JobUpdates {
     pub paused_reason: Option<Option<String>>,
     pub repeat: Option<RepeatConfig>,
     pub schedule_display: Option<String>,
+    pub script: Option<Option<String>>,
+    pub no_agent: Option<bool>,
+    pub context_from: Option<Option<Vec<String>>>,
 }
 
 /// Error returned by [`JobStore::resolve_job_ref`] when a name matches
@@ -380,6 +406,15 @@ impl JobStore {
             }
             if let Some(disp) = updates.schedule_display {
                 job.schedule_display = disp;
+            }
+            if let Some(script) = updates.script {
+                job.script = script;
+            }
+            if let Some(no_agent) = updates.no_agent {
+                job.no_agent = no_agent;
+            }
+            if let Some(context_from) = updates.context_from {
+                job.context_from = context_from;
             }
         }
 
@@ -1197,6 +1232,9 @@ mod tests {
             paused_reason: None,
             repeat: RepeatConfig::default(),
             schedule_display: String::new(),
+            script: None,
+            no_agent: false,
+            context_from: None,
         });
         store.save().unwrap();
         // After a clean save, the parent directory must contain exactly
@@ -1269,6 +1307,9 @@ mod tests {
             paused_reason: None,
             repeat: RepeatConfig::default(),
             schedule_display: String::new(),
+            script: None,
+            no_agent: false,
+            context_from: None,
         });
         store.save().unwrap();
 

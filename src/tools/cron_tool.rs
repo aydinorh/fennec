@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::cron::jobs::{
     compute_next_run, parse_schedule_kind, schedule_display_for, CronJob, JobStore, RepeatConfig,
 };
+use crate::cron::output::{cleanup_job_output, default_output_dir_for};
 
 use super::traits::{Tool, ToolResult};
 
@@ -149,6 +150,14 @@ impl CronTool {
             paused_reason: None,
             repeat: RepeatConfig::default(),
             schedule_display: schedule_display_for(&schedule_str),
+            // Per-job script / no_agent / context_from are tool-surface
+            // parameters added in the cron_tool expansion PR; for now
+            // jobs created via this path default to plain agent-prompt
+            // execution. Hand-edited jobs.json that set these fields
+            // load correctly because of the serde defaults on CronJob.
+            script: None,
+            no_agent: false,
+            context_from: None,
         };
 
         let mut store = self.load_store()?;
@@ -215,11 +224,37 @@ impl CronTool {
         };
 
         let mut store = self.load_store()?;
-        if store.remove_job(job_id) {
+        // Accept either an ID or a name. The store handles the
+        // ambiguity case; we surface a clear error if a name matches
+        // multiple jobs so the operator can pick one by ID.
+        let resolved_id = match store.resolve_job_ref(job_id) {
+            Ok(Some(j)) => j.id.clone(),
+            Ok(None) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Job '{}' not found.", job_id)),
+                });
+            }
+            Err(ambiguity) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(ambiguity.to_string()),
+                });
+            }
+        };
+
+        if store.remove_job(&resolved_id) {
             store.save()?;
+            // Orphaned output dir cleanup — matches the upstream's
+            // `remove_job` shutil.rmtree on the per-job output dir.
+            // Best-effort; cleanup errors are logged inside.
+            let output_dir = default_output_dir_for(&self.store_path);
+            cleanup_job_output(&output_dir, &resolved_id);
             Ok(ToolResult {
                 success: true,
-                output: format!("Job '{}' removed.", job_id),
+                output: format!("Job '{}' removed.", resolved_id),
                 error: None,
             })
         } else {
