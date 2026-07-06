@@ -1,3 +1,4 @@
+pub mod child_env;
 pub mod ct;
 pub mod fs;
 pub mod secrets;

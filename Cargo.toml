@@ -109,6 +109,11 @@ hound = "3.5"
 # prompt.md) plus the existing `/image`/`/paste` flows under tests.
 tempfile = "3.15"
 
+# Process-group kill for shell-tool timeouts: killing only the spawned
+# `sh` leaves its children running; killpg(2) takes the whole tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }

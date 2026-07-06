@@ -1651,6 +1651,7 @@ dependencies = [
  "include_dir",
  "inventory",
  "lettre",
+ "libc",
  "matrix-sdk-crypto",
  "matrix-sdk-sqlite",
  "native-tls",
