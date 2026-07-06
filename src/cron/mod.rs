@@ -2,6 +2,7 @@ pub mod delivery;
 pub mod jobs;
 pub mod output;
 pub mod script;
+pub mod skill_inject;
 pub use jobs::{
     compute_next_run, grace_seconds_for, parse_schedule, parse_schedule_kind,
     schedule_display_for, AmbiguousJobReference, CronJob, JobStore, JobUpdates, RepeatConfig,
@@ -38,6 +39,10 @@ pub struct CronScheduler {
     /// (`<output_dir>/<job_id>/{ts}.md`). Defaults to
     /// `<jobs_dir>/cron_output/`.
     output_dir: Option<std::path::PathBuf>,
+    /// Optional override for the skills directory. Defaults to
+    /// `<jobs_dir>/skills/`. Cron jobs with `skills` set load their
+    /// named skill content from here at fire time.
+    skills_dir: Option<std::path::PathBuf>,
 }
 
 impl CronScheduler {
@@ -53,6 +58,7 @@ impl CronScheduler {
             max_parallel: None,
             scripts_dir: None,
             output_dir: None,
+            skills_dir: None,
         }
     }
 
@@ -78,6 +84,12 @@ impl CronScheduler {
         self
     }
 
+    /// Override the skills directory. Default: `<jobs_dir>/skills/`.
+    pub fn with_skills_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.skills_dir = Some(dir);
+        self
+    }
+
     /// Resolve the scripts dir, deriving from the JobStore path when
     /// no override is configured.
     fn scripts_dir(&self) -> std::path::PathBuf {
@@ -96,6 +108,15 @@ impl CronScheduler {
         self.output_dir
             .clone()
             .unwrap_or_else(|| output::default_output_dir_for(self.store.path()))
+    }
+
+    /// Resolve the skills dir, deriving from the JobStore path when
+    /// no override is configured. Cron-fired jobs with `skills` set
+    /// load their named skill content from this directory.
+    fn skills_dir(&self) -> std::path::PathBuf {
+        self.skills_dir
+            .clone()
+            .unwrap_or_else(|| skill_inject::default_skills_dir_for(self.store.path()))
     }
 
     /// Run the scheduler loop. This blocks until the task is cancelled.
@@ -207,6 +228,7 @@ impl CronScheduler {
         let bus = self.bus.clone();
         let scripts_dir = self.scripts_dir();
         let output_dir = self.output_dir();
+        let skills_dir = self.skills_dir();
         let script_timeout = script::resolve_script_timeout();
 
         let mut handles = Vec::with_capacity(due_jobs.len());
@@ -215,6 +237,7 @@ impl CronScheduler {
             let sem = sem.clone();
             let scripts_dir = scripts_dir.clone();
             let output_dir = output_dir.clone();
+            let skills_dir = skills_dir.clone();
             handles.push(tokio::spawn(async move {
                 let permit = match sem {
                     Some(s) => s.acquire_owned().await.ok(),
@@ -225,6 +248,7 @@ impl CronScheduler {
                     bus,
                     scripts_dir,
                     output_dir,
+                    skills_dir,
                     script_timeout,
                     permit,
                 )
@@ -343,6 +367,7 @@ async fn process_due_job(
     bus: MessageBus,
     scripts_dir: std::path::PathBuf,
     output_dir: std::path::PathBuf,
+    skills_dir: std::path::PathBuf,
     script_timeout: std::time::Duration,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> (String, bool, Option<String>) {
@@ -434,6 +459,31 @@ async fn process_due_job(
             if let Some(latest) = output::latest_job_output(&output_dir, ref_id) {
                 prompt = format!(
                     "## Output from job '{ref_id}'\nThe following is the most recent output from a preceding cron job. Use it as context for your analysis.\n\n```\n{latest}\n```\n\n{prompt}"
+                );
+            }
+        }
+    }
+
+    // 5b. Skills: for agent jobs, inject named skill content into the
+    // prompt with the upstream's `[IMPORTANT: ... invoked the "X" skill]`
+    // header. Successful loads bump the skill's usage counter so the
+    // curator sees the skill as actively used. Missing skills produce
+    // the `'⚠️ Skill(s) not found and skipped: ...'` notice the agent
+    // is told to repeat to the user. No-op for no_agent jobs (the
+    // script IS the job; skills don't apply).
+    if !job.no_agent {
+        let skill_names = skill_inject::canonical_skills(
+            job.skill.as_deref(),
+            job.skills.as_deref(),
+        );
+        if !skill_names.is_empty() {
+            let injected = skill_inject::inject_skills(&prompt, &skill_names, &skills_dir);
+            prompt = injected.assembled;
+            if !injected.skipped.is_empty() {
+                tracing::warn!(
+                    "Cron job '{}': skill(s) not found and skipped: {:?}",
+                    job_id,
+                    injected.skipped
                 );
             }
         }
@@ -614,6 +664,8 @@ mod tests {
             profile: None,
             deliver: String::new(),
             wrap_response: None,
+            skill: None,
+            skills: None,
         }
     }
 
@@ -1396,6 +1448,150 @@ mod tests {
         assert!(
             !msg.metadata.contains_key("cron_wrap_response"),
             "wrap_response=Some(false) must not set the wrap flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_job_with_skills_prepends_skill_content() {
+        // A skill named "playbook" gets loaded + prepended to the
+        // prompt before publish. The published InboundMessage's
+        // content should carry both the skill header and the body.
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("playbook.md"),
+            "---\nname: playbook\ndescription: test\n---\n\nDo step 1, then step 2.\n",
+        )
+        .unwrap();
+
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("with_skill", "every 1m", None, Some(&past));
+        j.command = "Investigate the alert.".to_string();
+        j.skills = Some(vec!["playbook".to_string()]);
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30)).with_skills_dir(skills);
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("publishes");
+        assert!(
+            msg.content
+                .contains("[IMPORTANT: The user has invoked the \"playbook\" skill"),
+            "missing skill header: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("Do step 1, then step 2."),
+            "missing skill body: {}",
+            msg.content
+        );
+        assert!(
+            msg.content
+                .contains("alongside the skill invocation: Investigate the alert."),
+            "missing original prompt: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_job_with_missing_skill_emits_skip_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("missing", "every 1m", None, Some(&past));
+        j.skills = Some(vec!["never-installed".to_string()]);
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30)).with_skills_dir(skills);
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("publishes");
+        assert!(
+            msg.content
+                .contains("Skill(s) not found and skipped: never-installed"),
+            "missing skip notice: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn rewrite_skill_refs_consolidates_and_prunes() {
+        use std::collections::{HashMap, HashSet};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+
+        let mut a = job("a", "every 1h", None, None);
+        a.skills = Some(vec!["old".to_string(), "keep".to_string()]);
+        a.skill = Some("old".to_string());
+        store.add_job(a);
+
+        let mut b = job("b", "every 1h", None, None);
+        b.skills = Some(vec!["dead".to_string(), "keep".to_string()]);
+        b.skill = Some("dead".to_string());
+        store.add_job(b);
+
+        let mut c = job("c", "every 1h", None, None);
+        c.skills = Some(vec!["unchanged".to_string()]);
+        c.skill = Some("unchanged".to_string());
+        store.add_job(c);
+
+        let mut consolidated = HashMap::new();
+        consolidated.insert("old".to_string(), "umbrella".to_string());
+        let mut pruned = HashSet::new();
+        pruned.insert("dead".to_string());
+
+        let report = store.rewrite_skill_refs(&consolidated, &pruned).unwrap();
+        assert_eq!(report.jobs_scanned, 3);
+        assert_eq!(report.jobs_updated, 2, "a + b should be updated, c unchanged");
+
+        let a_after = store.list_jobs().iter().find(|j| j.id == "a").unwrap();
+        assert_eq!(
+            a_after.skills.as_ref().unwrap(),
+            &vec!["umbrella".to_string(), "keep".to_string()]
+        );
+        assert_eq!(a_after.skill.as_deref(), Some("umbrella"));
+
+        let b_after = store.list_jobs().iter().find(|j| j.id == "b").unwrap();
+        assert_eq!(
+            b_after.skills.as_ref().unwrap(),
+            &vec!["keep".to_string()]
+        );
+        assert_eq!(b_after.skill.as_deref(), Some("keep"));
+
+        let c_after = store.list_jobs().iter().find(|j| j.id == "c").unwrap();
+        assert_eq!(
+            c_after.skills.as_ref().unwrap(),
+            &vec!["unchanged".to_string()]
+        );
+    }
+
+    #[test]
+    fn rewrite_skill_refs_consolidated_wins_over_pruned() {
+        use std::collections::{HashMap, HashSet};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let mut j_ = job("only", "every 1h", None, None);
+        j_.skills = Some(vec!["disputed".to_string()]);
+        store.add_job(j_);
+
+        let mut consolidated = HashMap::new();
+        consolidated.insert("disputed".to_string(), "merged".to_string());
+        let mut pruned = HashSet::new();
+        pruned.insert("disputed".to_string()); // also listed as pruned
+
+        store.rewrite_skill_refs(&consolidated, &pruned).unwrap();
+        let after = store.list_jobs().iter().find(|j| j.id == "only").unwrap();
+        // Consolidated wins (target is more useful than dropping).
+        assert_eq!(
+            after.skills.as_ref().unwrap(),
+            &vec!["merged".to_string()]
         );
     }
 

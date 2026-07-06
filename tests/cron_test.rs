@@ -80,6 +80,8 @@ fn sample_job(id: &str, name: &str, schedule: &str) -> CronJob {
         profile: None,
         deliver: String::new(),
         wrap_response: None,
+        skill: None,
+        skills: None,
     }
 }
 

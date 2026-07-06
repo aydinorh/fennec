@@ -152,6 +152,22 @@ pub struct CronJob {
     /// to the global default (wrap on, matching upstream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrap_response: Option<bool>,
+    /// Legacy single-skill field kept for back-compat with older
+    /// `jobs.json` files. The canonical store is [`Self::skills`];
+    /// readers should treat this as a fallback when `skills` is empty.
+    /// Writers ([`JobStore::rewrite_skill_refs`], `cron_tool` create /
+    /// update) keep both fields in sync so legacy consumers stay
+    /// happy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// Ordered list of skill names loaded before this job's prompt
+    /// runs. At fire time, each name resolves to a skill in
+    /// `<skills_dir>/`; the content is prepended to the prompt with
+    /// the standard `[IMPORTANT: The user has invoked the "X" skill]`
+    /// header. Missing skills surface a `'⚠️ Skill(s) not found and
+    /// skipped'` notice the agent is told to repeat to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
 }
 
 impl CronJob {
@@ -218,6 +234,8 @@ pub struct JobUpdates {
     pub profile: Option<Option<String>>,
     pub deliver: Option<String>,
     pub wrap_response: Option<Option<bool>>,
+    pub skill: Option<Option<String>>,
+    pub skills: Option<Option<Vec<String>>>,
 }
 
 /// Error returned by [`JobStore::resolve_job_ref`] when a name matches
@@ -505,6 +523,12 @@ impl JobStore {
             }
             if let Some(wrap_response) = updates.wrap_response {
                 job.wrap_response = wrap_response;
+            }
+            if let Some(skill) = updates.skill {
+                job.skill = skill;
+            }
+            if let Some(skills) = updates.skills {
+                job.skills = skills;
             }
         }
 
@@ -814,6 +838,133 @@ impl JobStore {
         }
 
         due
+    }
+}
+
+// =============================================================================
+// Curator integration: skill reference rewriting
+// =============================================================================
+
+/// Per-job entry in a [`SkillRewriteReport`]. Captures what changed
+/// so callers (the curator's invocation site, tests, the operator
+/// log) can show users exactly which jobs were touched.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillRewrite {
+    pub job_id: String,
+    pub job_name: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+    /// Old → new skill name mapping for consolidations.
+    pub mapped: std::collections::HashMap<String, String>,
+    /// Names dropped outright because they were pruned with no
+    /// forwarding target.
+    pub dropped: Vec<String>,
+}
+
+/// Summary returned by [`JobStore::rewrite_skill_refs`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SkillRewriteReport {
+    pub rewrites: Vec<SkillRewrite>,
+    pub jobs_updated: usize,
+    pub jobs_scanned: usize,
+}
+
+impl JobStore {
+    /// Rewrite cron job skill references after a curator consolidation
+    /// pass. Without this, a cron job listing a consolidated /
+    /// pruned skill would silently skip the skill at fire time —
+    /// running without the instructions it was scheduled to follow.
+    ///
+    /// Rules (mirror the upstream's `rewrite_skill_refs`):
+    /// - A skill listed in `consolidated` (old → umbrella) is replaced
+    ///   with its target. If the umbrella is already in the job's
+    ///   list, the stale name is dropped without duplication.
+    /// - A skill listed in `pruned` is dropped outright (no forwarding
+    ///   target). A name listed in both wins as `consolidated` — having
+    ///   a target is more useful than dropping.
+    /// - Ordering of other skills is preserved.
+    /// - The legacy `skill` field is realigned to the first remaining
+    ///   skill (or `None` when the list ends up empty).
+    /// - Best-effort: persisting the rewrite uses [`Self::save`], so
+    ///   IO errors propagate — the curator wraps this in a try/catch
+    ///   at its call site.
+    pub fn rewrite_skill_refs(
+        &mut self,
+        consolidated: &std::collections::HashMap<String, String>,
+        pruned: &std::collections::HashSet<String>,
+    ) -> Result<SkillRewriteReport> {
+        let mut effective_pruned: std::collections::HashSet<String> = pruned.clone();
+        for k in consolidated.keys() {
+            effective_pruned.remove(k);
+        }
+
+        let mut report = SkillRewriteReport {
+            jobs_scanned: self.jobs.len(),
+            ..Default::default()
+        };
+        if consolidated.is_empty() && effective_pruned.is_empty() {
+            return Ok(report);
+        }
+
+        let mut changed = false;
+        for job in &mut self.jobs {
+            let skills_before = crate::cron::skill_inject::canonical_skills(
+                job.skill.as_deref(),
+                job.skills.as_deref(),
+            );
+            if skills_before.is_empty() {
+                continue;
+            }
+
+            let mut mapped: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut dropped: Vec<String> = Vec::new();
+            let mut new_skills: Vec<String> = Vec::new();
+
+            for name in &skills_before {
+                if let Some(target) = consolidated.get(name) {
+                    mapped.insert(name.clone(), target.clone());
+                    if !target.is_empty() && !new_skills.iter().any(|n| n == target) {
+                        new_skills.push(target.clone());
+                    }
+                } else if effective_pruned.contains(name) {
+                    dropped.push(name.clone());
+                } else if !new_skills.iter().any(|n| n == name) {
+                    new_skills.push(name.clone());
+                }
+            }
+
+            if mapped.is_empty() && dropped.is_empty() {
+                continue;
+            }
+
+            job.skill = new_skills.first().cloned();
+            job.skills = if new_skills.is_empty() {
+                None
+            } else {
+                Some(new_skills.clone())
+            };
+            changed = true;
+
+            report.rewrites.push(SkillRewrite {
+                job_id: job.id.clone(),
+                job_name: if job.name.is_empty() {
+                    job.id.clone()
+                } else {
+                    job.name.clone()
+                },
+                before: skills_before,
+                after: new_skills,
+                mapped,
+                dropped,
+            });
+        }
+
+        if changed {
+            self.save()?;
+            report.jobs_updated = report.rewrites.len();
+        }
+        Ok(report)
     }
 }
 
@@ -1508,6 +1659,8 @@ mod tests {
             profile: None,
             deliver: String::new(),
             wrap_response: None,
+            skill: None,
+            skills: None,
         });
         store.save().unwrap();
         // After a clean save, the parent directory must contain exactly
@@ -1591,6 +1744,8 @@ mod tests {
             profile: None,
             deliver: String::new(),
             wrap_response: None,
+            skill: None,
+            skills: None,
         });
         store.save().unwrap();
 
