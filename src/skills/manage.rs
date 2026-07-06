@@ -16,9 +16,10 @@
 //!     supporting file (`write_file` triggers the migration).
 //!   - Bundled and hub-installed skills can be edited and patched —
 //!     the change stays local — but they cannot be deleted (they
-//!     would re-appear on next sync). To remove a bundled skill the
-//!     user must `fennec skills reset --restore` to clear the
-//!     manifest entry.
+//!     would re-appear on next sync). To remove a bundled skill,
+//!     remove its entry from the skills manifest under the Fennec
+//!     home directory by hand (a `fennec skills` management CLI is
+//!     planned but does not exist yet — do not reference one).
 //!
 //! Validation:
 //!
@@ -294,8 +295,8 @@ pub fn delete(
     }
     if target.provenance != SkillProvenance::AgentCreated {
         return Err(ManageError::Conflict(format!(
-            "refusing to delete {} skill {:?}: edit it instead, or run \
-             `fennec skills reset --restore` to clear the manifest entry",
+            "refusing to delete {} skill {:?}: edit it instead (deleting it \
+             would only last until the next sync restores it)",
             match target.provenance {
                 SkillProvenance::Bundled => "bundled",
                 SkillProvenance::HubInstalled => "hub-installed",

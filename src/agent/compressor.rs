@@ -100,15 +100,42 @@ impl ContextCompressor {
                     thinking_level: crate::agent::thinking::ThinkingLevel::Off,
                 };
 
-                if let Ok(response) = provider.chat(request).await {
-                    let summary = response.content.unwrap_or_default();
-                    let summary_msg = ChatMessage::assistant(format!(
-                        "[Context compressed]\n{summary}"
-                    ));
-
-                    // Replace the middle block with a single summary message.
-                    messages.splice(middle_start..middle_end, std::iter::once(summary_msg));
-                    compressed = true;
+                match provider.chat(request).await {
+                    Ok(response) => {
+                        let summary = response.content.unwrap_or_default();
+                        if summary.trim().is_empty() {
+                            // An empty summary would splice the whole
+                            // middle block into nothing — that's data
+                            // loss, not compression. Keep the original
+                            // messages and say why.
+                            tracing::warn!(
+                                "context compression: summarizer returned an empty \
+                                 summary; keeping the original {} messages",
+                                middle_end - middle_start
+                            );
+                        } else {
+                            let summary_msg = ChatMessage::assistant(format!(
+                                "[Context compressed]\n{summary}"
+                            ));
+                            // Replace the middle block with a single summary message.
+                            messages
+                                .splice(middle_start..middle_end, std::iter::once(summary_msg));
+                            compressed = true;
+                        }
+                    }
+                    Err(e) => {
+                        // Compression is best-effort — a summarizer
+                        // failure must not kill the turn — but it was
+                        // previously swallowed with NO log, so every
+                        // subsequent over-threshold call silently
+                        // re-paid the failed LLM call (retry storm)
+                        // and nobody could see why context never
+                        // shrank.
+                        tracing::warn!(
+                            "context compression: summarization call failed ({e}); \
+                             history left unsummarized this round"
+                        );
+                    }
                 }
             }
         }

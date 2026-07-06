@@ -484,7 +484,7 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                     }
                     DetailsMode::Collapsed => {
                         // Header + 160-char preview, matching
-                        // Hermes' THINKING_COT_MAX truncation.
+                        // the upstream's THINKING_COT_MAX truncation.
                         let preview = compact_preview(body, 160);
                         let est_tokens = (body.len() + 3) / 4;
                         let header = format!(
@@ -504,7 +504,7 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                         }
                     }
                     DetailsMode::Expanded => {
-                        // Full text. Hermes wraps `▾ Thinking`
+                        // Full text. the upstream wraps `▾ Thinking`
                         // header + body lines indented 4 spaces.
                         lines.push(Line::from(Span::styled(
                             "    ▾ Thinking",
@@ -522,7 +522,7 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                             // Live cursor at the tail. `▍` blinks
                             // via app.cursor_visible (driven by
                             // ~500ms tick) — close enough to
-                            // Hermes' 420ms cadence for parity.
+                            // the upstream's 420ms cadence for parity.
                             let cur = if app.cursor_visible { "▍" } else { " " };
                             lines.push(Line::from(Span::styled(
                                 format!("      {cur}"),
@@ -989,7 +989,7 @@ fn draw_shortcuts(f: &mut Frame, area: Rect, _app: &App) {
 /// Dispatches to a per-variant renderer; sizing is variant-
 /// specific (approval is small, pager is near-full-screen).
 ///
-/// Mirrors Hermes' `appOverlays.tsx` + per-modal components in
+/// Mirrors the upstream's `appOverlays.tsx` + per-modal components in
 /// `prompts.tsx:14-217`.
 fn draw_modal_overlay(f: &mut Frame, area: Rect, app: &App) {
     use super::modal::Modal;
@@ -1540,7 +1540,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Hermes' `compactPreview` (`lib/text.ts:93-96`): collapse
+/// the upstream's `compactPreview` (`lib/text.ts:93-96`): collapse
 /// whitespace runs to a single space, then truncate to `max`
 /// chars with `…` suffix. Used for the `Collapsed` thinking
 /// mode where we show a single-line preview.

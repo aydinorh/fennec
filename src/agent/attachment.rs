@@ -19,10 +19,10 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
-/// Extensions Hermes' `image.attach` accepts. The provider may
+/// Extensions the upstream's `image.attach` accepts. The provider may
 /// still reject the upload if the format isn't natively
 /// supported (Anthropic doesn't take BMP/SVG/ICO, OpenAI is
-/// similar) — but matching Hermes' acceptance list keeps the
+/// similar) — but matching the upstream's acceptance list keeps the
 /// `/image` UX identical and surfaces the failure as a provider
 /// error rather than a Fennec-side rejection.
 const ALLOWED_EXTENSIONS: &[&str] = &[
@@ -43,7 +43,7 @@ pub struct ImageAttachment {
     pub height: Option<u32>,
     /// Rough cross-provider token cost for the image, computed
     /// at attach time via `ceil(w/512) * ceil(h/512) * 85`
-    /// (matching Hermes' `_image_meta` at cli.py:411-423).
+    /// (matching the upstream's `_image_meta` at cli.py:411-423).
     /// `None` when dimensions couldn't be read.
     pub token_estimate: Option<u32>,
 }
@@ -104,7 +104,7 @@ impl ImageAttachment {
 /// Map a lowercase extension to its MIME type. Falls back to
 /// `application/octet-stream` for unknown types so the provider
 /// can still receive the bytes (the API will likely reject it,
-/// matching Hermes' behavior of letting the upstream complain).
+/// matching the upstream's behavior of letting the upstream complain).
 pub fn mime_for_extension(ext: &str) -> String {
     match ext {
         "png" => "image/png",
@@ -120,7 +120,7 @@ pub fn mime_for_extension(ext: &str) -> String {
     .to_string()
 }
 
-/// Token cost estimate matching Hermes' `_image_meta`
+/// Token cost estimate matching the upstream's `_image_meta`
 /// (`cli.py:411-423`): `ceil(w/512) * ceil(h/512) * 85`. Cheap
 /// to compute and stable across providers; actual cost may
 /// differ but the user gets a useful order-of-magnitude check.
@@ -135,7 +135,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn estimate_matches_hermes_formula() {
+    fn estimate_matches_upstream_formula() {
         // 1024x1024: 2*2*85 = 340
         assert_eq!(estimate_image_tokens(1024, 1024), 340);
         // 512x512: 1*1*85 = 85

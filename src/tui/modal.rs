@@ -1,6 +1,6 @@
 //! Modal overlays for human-in-the-loop prompts.
 //!
-//! Six modal types matching upstream Hermes' `prompts.tsx`:
+//! Six modal types matching the upstream's `prompts.tsx`:
 //!
 //! 1. **Approval** — agent wants to run a privileged command;
 //!    user picks `Once` / `Session` / `Always` / `Deny`.
@@ -20,7 +20,7 @@
 //! when the modal is dismissed. Once resolved the modal is
 //! cleared from `App.modal`.
 //!
-//! Hermes anchors: `ui-tui/src/components/prompts.tsx:14-217`,
+//! Upstream anchors: `ui-tui/src/components/prompts.tsx:14-217`,
 //! `ui-tui/src/app/overlayStore.ts`, `ui-tui/src/app/useInputHandlers.ts:70-108`
 //! (cancelOverlayFromCtrlC).
 
@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 
 use crate::agent::callbacks::{ApprovalRequest, ClarifyRequest, SecretRequest};
 
-/// A privilege-approval choice. Maps onto Hermes' four quick-pick
+/// A privilege-approval choice. Maps onto the upstream's four quick-pick
 /// options. `Once` and `Deny` are per-request; `Session` and
 /// `Always` are intended to be remembered (session-scoped or
 /// config-persisted respectively) — the policy engine that
@@ -49,7 +49,7 @@ impl ApprovalChoice {
     }
 
     /// Numeric quick-pick (1-indexed) matching the modal's
-    /// rendered order — Hermes uses 1=Once, 2=Session, 3=Always,
+    /// rendered order — the upstream uses 1=Once, 2=Session, 3=Always,
     /// 4=Deny.
     pub fn from_quick_pick(n: u8) -> Option<Self> {
         match n {

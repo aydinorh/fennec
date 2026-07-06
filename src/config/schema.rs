@@ -113,7 +113,7 @@ pub struct TuiConfig {
     /// present, its value wins over the global `details` mode
     /// for rendering that section. Valid section names:
     /// `thinking`, `tools`, `subagents`, `activity`. Mirrors
-    /// Hermes' `details_mode.*` config keys + `ui.sections`.
+    /// the upstream's `details_mode.*` config keys + `ui.sections`.
     #[serde(default)]
     pub details_sections: std::collections::HashMap<String, String>,
     /// Status bar position. One of `"top"`, `"bottom"`, `"off"`.

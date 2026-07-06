@@ -1,7 +1,7 @@
 //! `.env` reload support for the `/reload` slash command.
 //!
-//! Mirrors Hermes' `reload.env` RPC (`tui_gateway/server.py:4147-4165`)
-//! which calls `hermes_cli.config.reload_env()` to refresh
+//! Mirrors the upstream's `reload.env` RPC (`tui_gateway/server.py:4147-4165`)
+//! which calls `the upstream's env-reload helper` to refresh
 //! environment variables in the running process so credentials
 //! changed on disk take effect on the next provider call without
 //! a restart.
@@ -16,10 +16,10 @@ use std::path::Path;
 /// Re-read `path` as a `.env` file, applying every key to the
 /// current process via [`std::env::set_var`]. Returns the count
 /// of vars applied. Missing file is *not* an error — returns 0,
-/// matching Hermes' silent-no-op behavior when `~/.hermes/.env`
+/// matching the upstream's silent-no-op behavior when `its env file`
 /// doesn't exist.
 ///
-/// Already-set env vars are *overwritten* (Hermes' default; the
+/// Already-set env vars are *overwritten* (the upstream's default; the
 /// rationale is that the user explicitly asked to reload and
 /// expects their on-disk value to win).
 pub fn reload_env_file(path: &Path) -> Result<usize> {
@@ -34,7 +34,7 @@ pub fn reload_env_file(path: &Path) -> Result<usize> {
         // SAFETY: set_var is unsafe in newer Rust due to threading
         // concerns. /reload runs on the submit task while no other
         // thread mutates the env, and the user has explicitly asked
-        // for the refresh — same contract Hermes uses with os.environ.
+        // for the refresh — same contract the upstream uses with os.environ.
         unsafe {
             std::env::set_var(&k, &v);
         }

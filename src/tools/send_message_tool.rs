@@ -23,7 +23,7 @@
 //!
 //! Layering a home-chat default + a directory-of-seen-chats on top
 //! gives the LLM a curated menu to pick from. Numeric chat_id still
-//! passes through (matches the analogous Hermes-agent design and
+//! passes through (matches the analogous upstream-agent design and
 //! covers legitimate "I learned this id from a webhook" cases) but the
 //! tool's *typical* path is "ask, then send to a known chat."
 //!
