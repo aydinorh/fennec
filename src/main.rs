@@ -198,11 +198,20 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
             .context("decrypting API key from config")?;
         return Ok(decrypted);
     }
+    resolve_api_key_for(&config.provider.name)
+}
 
+/// Resolve the API key for `provider_name` from its usual environment
+/// variable. Used directly by failover-chain entries (the
+/// `provider.api_key` config value belongs to the PRIMARY provider
+/// only — a cross-provider fallback must not inherit it).
+fn resolve_api_key_for(provider_name: &str) -> Result<String> {
     // Azure can authenticate with an API key OR keyless Entra ID — so accept
     // an Azure key from env if present, but don't error when absent (the
-    // provider falls back to Entra: az CLI / service principal).
-    if matches!(config.provider.name.as_str(), "azure" | "foundry") {
+    // provider falls back to Entra: az CLI / service principal). Living
+    // here (rather than only in resolve_api_key) also makes Azure usable
+    // as a failover-chain target.
+    if matches!(provider_name, "azure" | "foundry") {
         for key_var in ["AZURE_OPENAI_API_KEY", "AZURE_FOUNDRY_API_KEY"] {
             if let Ok(v) = std::env::var(key_var) {
                 if !v.is_empty() {
@@ -213,8 +222,7 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         return Ok(String::new()); // Entra mode — no key
     }
 
-    // Fall back to provider-specific environment variable.
-    let env_var = match config.provider.name.as_str() {
+    let env_var = match provider_name {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
@@ -236,6 +244,229 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
 
     std::env::var(env_var)
         .with_context(|| format!("API key not found: set provider.api_key in config or {} env var", env_var))
+}
+
+/// One planned failover-chain entry, after normalization + dedup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedFallback {
+    provider: String,
+    model: String,
+    base_url: String,
+}
+
+/// Normalize the config's failover settings into an ordered, deduped
+/// chain. Mirrors the upstream's chain seeding: `fallback_models`
+/// (same-provider shorthand) first, then the full `fallbacks` entries;
+/// entries that resolve to the PRIMARY backend or duplicate an earlier
+/// entry are dropped — falling back to the backend that just failed
+/// only loops the failure.
+fn plan_failover_chain(provider_cfg: &fennec::config::ProviderConfig) -> Vec<PlannedFallback> {
+    let primary_provider = provider_cfg.name.trim().to_lowercase();
+    let primary_model = provider_cfg.model.trim().to_string();
+
+    let mut chain: Vec<PlannedFallback> = Vec::new();
+    let mut push = |entry: PlannedFallback| {
+        if entry.model.is_empty() {
+            return; // model is required; skip invalid entries
+        }
+        if entry.provider == primary_provider && entry.model == primary_model {
+            return; // same backend as primary
+        }
+        if chain.iter().any(|e| *e == entry) {
+            return; // duplicate of an earlier chain entry
+        }
+        chain.push(entry);
+    };
+
+    for model in &provider_cfg.fallback_models {
+        push(PlannedFallback {
+            provider: primary_provider.clone(),
+            model: model.trim().to_string(),
+            base_url: provider_cfg.base_url.trim().to_string(),
+        });
+    }
+    for fb in &provider_cfg.fallbacks {
+        let provider = {
+            let p = fb.provider.trim().to_lowercase();
+            if p.is_empty() { primary_provider.clone() } else { p }
+        };
+        push(PlannedFallback {
+            provider,
+            model: fb.model.trim().to_string(),
+            base_url: fb.base_url.trim().to_string(),
+        });
+    }
+    chain
+}
+
+/// Build the failover providers for the planned chain. Entries whose
+/// API key can't be resolved are skipped with a warning (the upstream
+/// skips invalid chain entries the same way) — a missing fallback key
+/// must not prevent startup.
+fn build_failover_providers(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    secret_store: &SecretStore,
+    chain: &[PlannedFallback],
+) -> Vec<Box<dyn Provider>> {
+    let primary_provider = config.provider.name.trim().to_lowercase();
+    let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+    for entry in chain {
+        // Same-provider fallbacks (the `fallback_models` shorthand — a
+        // different model on the SAME backend) share the primary's
+        // credentials, so resolve their key from the decrypted config
+        // exactly like the primary does. Only CROSS-provider fallbacks fall
+        // through to the env-only path, since `provider.api_key` belongs to
+        // the primary backend and must not be handed to a different one.
+        //
+        // Without this, a config-only install (key in config.toml, nothing
+        // in env — the default onboarding flow) had its whole chain skipped
+        // at startup: every same-provider fallback resolved to an empty env
+        // key, so failover silently never engaged.
+        let key_result = if entry.provider == primary_provider {
+            resolve_api_key(config, secret_store)
+        } else {
+            resolve_api_key_for(&entry.provider)
+        };
+        let api_key = match key_result {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(
+                    "failover entry {}/{} skipped: {e}",
+                    entry.provider,
+                    entry.model
+                );
+                continue;
+            }
+        };
+        // Reuse build_provider's routing by overlaying the entry onto a
+        // clone of the config's provider section.
+        let mut cfg = config.clone();
+        cfg.provider.name = entry.provider.clone();
+        cfg.provider.base_url = entry.base_url.clone();
+        providers.push(build_provider(&cfg, home_dir, api_key, Some(entry.model.clone())));
+    }
+    providers
+}
+
+#[cfg(test)]
+mod failover_chain_tests {
+    use super::{plan_failover_chain, PlannedFallback};
+    use fennec::config::{FallbackEntry, ProviderConfig};
+
+    fn cfg() -> ProviderConfig {
+        ProviderConfig {
+            name: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_config_yields_empty_chain() {
+        assert!(plan_failover_chain(&cfg()).is_empty());
+    }
+
+    #[test]
+    fn same_provider_fallback_uses_config_key_without_env() {
+        use super::{build_failover_providers, plan_failover_chain};
+        use fennec::config::FennecConfig;
+        use fennec::security::SecretStore;
+
+        // Config-only install: primary key in config, NOTHING in env, and a
+        // same-provider fallback model. The fallback must still build,
+        // because it inherits the primary's decrypted config key. (Before
+        // the fix, env-only resolution skipped it and failover never
+        // engaged.)
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(tmp.path().to_path_buf()).unwrap();
+
+        let mut config = FennecConfig::default();
+        config.provider.name = "anthropic".into();
+        config.provider.model = "claude-sonnet-4-6".into();
+        config.provider.api_key = "sk-test-primary".into(); // plaintext passthrough
+        config.provider.fallback_models = vec!["claude-haiku-4-5".into()];
+
+        let chain = plan_failover_chain(&config.provider);
+        assert_eq!(chain.len(), 1, "one same-provider fallback planned");
+
+        let providers = build_failover_providers(&config, tmp.path(), &store, &chain);
+        assert_eq!(
+            providers.len(),
+            1,
+            "same-provider fallback should build from the config key with no env var set"
+        );
+    }
+
+    #[test]
+    fn fallback_models_use_primary_provider() {
+        let mut c = cfg();
+        c.fallback_models = vec!["claude-haiku-4-5".into()];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(
+            chain,
+            vec![PlannedFallback {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5".into(),
+                base_url: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn cross_provider_entries_follow_same_provider_shorthand() {
+        let mut c = cfg();
+        c.fallback_models = vec!["claude-haiku-4-5".into()];
+        c.fallbacks = vec![FallbackEntry {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].provider, "anthropic");
+        assert_eq!(chain[1].provider, "openai");
+    }
+
+    /// Entries equal to the primary backend are dropped — falling back
+    /// to the backend that just failed only loops the failure (mirrors
+    /// the upstream's same-backend dedup).
+    #[test]
+    fn primary_backend_and_duplicates_are_deduped() {
+        let mut c = cfg();
+        c.fallback_models = vec![
+            "claude-sonnet-4-6".into(), // == primary → dropped
+            "claude-haiku-4-5".into(),
+            "claude-haiku-4-5".into(), // duplicate → dropped
+        ];
+        c.fallbacks = vec![FallbackEntry {
+            provider: "ANTHROPIC".into(), // case-normalized
+            model: "claude-haiku-4-5".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain.len(), 1, "{chain:?}");
+        assert_eq!(chain[0].model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn empty_provider_in_entry_means_primary() {
+        let mut c = cfg();
+        c.fallbacks = vec![FallbackEntry {
+            provider: String::new(),
+            model: "claude-haiku-4-5".into(),
+            base_url: String::new(),
+        }];
+        let chain = plan_failover_chain(&c);
+        assert_eq!(chain[0].provider, "anthropic");
+    }
+
+    #[test]
+    fn entries_without_model_are_skipped() {
+        let mut c = cfg();
+        c.fallbacks = vec![FallbackEntry::default()];
+        assert!(plan_failover_chain(&c).is_empty());
+    }
 }
 
 /// Build the auxiliary client. Used by background tasks (curator,
@@ -303,6 +534,7 @@ fn build_auxiliary_client(
                 temperature: 0.7,
                 max_tokens: 8192,
                 fallback_models: Vec::new(),
+                fallbacks: Vec::new(),
             },
             ..config.clone()
         };
@@ -620,6 +852,41 @@ async fn build_agent_with_callbacks(
     } else {
         let api_key = resolve_api_key(config, &secret_store)?;
         build_provider(config, home_dir, api_key, model_override)
+    };
+
+    // Failover: when the config declares fallback models/providers,
+    // wrap the primary in a ReliableProvider that tries each chain
+    // entry in order (rate-limit cooldowns + retry/backoff inside).
+    // Mirrors the upstream's fallback-chain activation when the
+    // current model keeps failing after retries.
+    let provider: Box<dyn Provider> = {
+        let chain = plan_failover_chain(&config.provider);
+        if chain.is_empty() {
+            provider
+        } else {
+            let fallback_providers =
+                build_failover_providers(config, home_dir, &secret_store, &chain);
+            if fallback_providers.is_empty() {
+                tracing::warn!(
+                    "failover configured but no chain entry was buildable; running without failover"
+                );
+                provider
+            } else {
+                tracing::info!(
+                    "provider failover enabled: primary {} + {} fallback(s): {}",
+                    config.provider.name,
+                    fallback_providers.len(),
+                    chain
+                        .iter()
+                        .map(|e| format!("{}/{}", e.provider, e.model))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let mut all = vec![provider];
+                all.extend(fallback_providers);
+                Box::new(fennec::providers::ReliableProvider::new(all, None))
+            }
+        }
     };
 
     // Promote the provider to `Arc` so it can be shared with DelegateTool

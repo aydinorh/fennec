@@ -357,7 +357,31 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub temperature: f64,
     pub max_tokens: u32,
+    /// Same-provider failover models, tried in order when the primary
+    /// model fails after retries. Shorthand for [`Self::fallbacks`]
+    /// entries that reuse the primary provider + key.
     pub fallback_models: Vec<String>,
+    /// Full failover chain entries (provider + model + optional
+    /// base_url), tried in order AFTER `fallback_models`. Lets the
+    /// agent fail over across providers (e.g. anthropic → openai),
+    /// matching the upstream's `fallback_model` list semantics. Each
+    /// entry resolves its own API key from the provider's usual env
+    /// var; entries whose key is missing are skipped at startup with
+    /// a warning.
+    pub fallbacks: Vec<FallbackEntry>,
+}
+
+/// One cross-provider failover entry. See [`ProviderConfig::fallbacks`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FallbackEntry {
+    /// Provider name (`anthropic`, `openai`, `openrouter`, …). Empty
+    /// means "same provider as the primary".
+    pub provider: String,
+    /// Model identifier on that provider. Required.
+    pub model: String,
+    /// Optional base URL override for OpenAI-compatible backends.
+    pub base_url: String,
 }
 
 impl Default for ProviderConfig {
@@ -370,6 +394,7 @@ impl Default for ProviderConfig {
             temperature: 0.7,
             max_tokens: 8192,
             fallback_models: Vec::new(),
+            fallbacks: Vec::new(),
         }
     }
 }

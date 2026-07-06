@@ -116,6 +116,13 @@ impl Provider for ReliableProvider {
         "reliable"
     }
 
+    fn model(&self) -> &str {
+        // /usage pricing lookup + /model panel header read this; an
+        // empty default would break both the moment failover wraps
+        // the primary.
+        self.providers.first().map(|p| p.model()).unwrap_or("")
+    }
+
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
         let start = Instant::now();
         let mut last_error: Option<anyhow::Error> = None;
