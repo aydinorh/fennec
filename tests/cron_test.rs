@@ -201,7 +201,19 @@ async fn test_scheduler_tick_fires_due_job() {
         .expect("expected an inbound message from cron");
     assert_eq!(msg.channel, "cron");
     assert!(msg.sender.contains("fire_me"));
-    assert_eq!(msg.content, "run test_fire");
+    // Agent jobs get the cron execution hint prepended (delivery is
+    // automatic + [SILENT] semantics); the command follows it.
+    assert!(
+        msg.content
+            .starts_with("[IMPORTANT: You are running as a scheduled cron job."),
+        "missing cron hint: {}",
+        msg.content
+    );
+    assert!(
+        msg.content.ends_with("run test_fire"),
+        "missing original command: {}",
+        msg.content
+    );
 }
 
 #[tokio::test]

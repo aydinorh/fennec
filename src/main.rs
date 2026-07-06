@@ -3718,6 +3718,24 @@ async fn run_gateway(
                     });
                 }
 
+                // Cron-sourced messages run with cron-mode safety: the
+                // protected tools (`cronjob` — recursive scheduling,
+                // `send_message` — interactive messaging, `ask_user` —
+                // blocks on a user who isn't there) are disabled for the
+                // duration of the turn, layered on top of whatever the
+                // user already disabled, then restored. Per-job
+                // `enabled_toolsets` overrides can never widen past this
+                // set. The message also carries `cron_auto_approve=1`
+                // (set by the scheduler): the gateway's callbacks
+                // auto-approve by default today, so there is no gate to
+                // bypass here — the flag is the contract for any future
+                // interactive approval system.
+                let is_cron = msg
+                    .metadata
+                    .get("source")
+                    .map(|s| s.as_str())
+                    == Some("cron");
+
                 // Hold the agent lock only for the LLM turn itself. All
                 // subsequent I/O (typing-indicator abort, streaming
                 // delivery, bus publish) runs without the lock so that
@@ -3726,7 +3744,19 @@ async fn run_gateway(
                 // publish.
                 let turn_result = {
                     let mut agent_lock = agent.lock().await;
-                    agent_lock.turn(&msg.content).await
+                    if is_cron {
+                        let prior = agent_lock.disabled_tool_names();
+                        agent_lock.set_disabled_tools(
+                            fennec::cron::safety::resolve_cron_disabled_tools(
+                                prior.iter().map(|s| s.as_str()),
+                            ),
+                        );
+                        let result = agent_lock.turn(&msg.content).await;
+                        agent_lock.set_disabled_tools(prior);
+                        result
+                    } else {
+                        agent_lock.turn(&msg.content).await
+                    }
                 };
                 match turn_result {
                     Ok(response) => {
@@ -3751,11 +3781,6 @@ async fn run_gateway(
                         // batched delivery (matches the upstream's
                         // non-streaming `_deliver_result` path) and a
                         // multi-target tick can't sensibly stream.
-                        let is_cron = msg
-                            .metadata
-                            .get("source")
-                            .map(|s| s.as_str())
-                            == Some("cron");
                         if is_cron {
                             // local: agent ran (so we recorded a turn)
                             // but no outbound is sent.
