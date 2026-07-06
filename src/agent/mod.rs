@@ -9,6 +9,7 @@ pub mod pricing;
 pub mod scrub;
 pub mod subagent;
 pub mod thinking;
+pub mod title_generator;
 
 pub use agent::{Agent, AgentBuilder, TokenUsage, TurnWithHistoryResult};
 pub use callbacks::{

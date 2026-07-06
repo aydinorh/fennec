@@ -1575,6 +1575,9 @@ async fn run_tui(
                 .iter()
                 .cloned()
                 .collect();
+            // Grab an auxiliary-client handle before releasing the agent lock —
+            // used below to auto-title a new session in the background.
+            let aux_for_title = agent_guard.auxiliary_client().clone();
             drop(agent_guard);
             if let (Some(store), Some(sid)) = (submit_store.as_ref(), session_id) {
                 for msg in &appended {
@@ -1629,6 +1632,32 @@ async fn run_tui(
                     .await
                 {
                     tracing::warn!("checkpoint record failed: {e}");
+                }
+
+                // Auto-title a brand-new session from its opening exchange.
+                // `history_before == 0` means this was the session's very first
+                // turn (resumed sessions hydrate history, so they're skipped).
+                // Best-effort + background so it never blocks the loop.
+                if history_before == 0 && assistant_preview.as_str() != "<no reply>" {
+                    let aux = aux_for_title.clone();
+                    let store = std::sync::Arc::clone(store);
+                    let sid = sid.clone();
+                    let user_text = prompt.to_string();
+                    let assistant_text = assistant_preview.clone();
+                    tokio::spawn(async move {
+                        if let Some(title) = fennec::agent::title_generator::generate_title(
+                            &aux,
+                            &user_text,
+                            &assistant_text,
+                        )
+                        .await
+                        {
+                            match store.set_session_title(&sid, &title).await {
+                                Ok(_) => tracing::debug!("auto-titled session: {title}"),
+                                Err(e) => tracing::debug!("auto-title set failed: {e}"),
+                            }
+                        }
+                    });
                 }
             }
 
