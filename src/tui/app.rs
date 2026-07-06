@@ -1231,6 +1231,16 @@ impl App {
             self.handle_key_modal(code, modifiers);
             return;
         }
+        // Global quit chords. Deliberately AFTER overlay/modal routing:
+        // a modal Ctrl-C denies the pending request (handled above)
+        // instead of killing the app. q/Esc are NOT global — `q` is a
+        // letter the user types in the composer; Esc/q quit only from
+        // the non-typing panes (see the focus handlers).
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(code, KeyCode::Char('c') | KeyCode::Char('d')) {
+            self.should_quit = true;
+            return;
+        }
         // Global hotkeys.
         if matches!(code, KeyCode::Tab) {
             self.cycle_focus();
@@ -1874,6 +1884,8 @@ impl App {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.prev_session(),
             KeyCode::Down | KeyCode::Char('j') => self.next_session(),
+            // Non-typing pane: q / Esc quit the TUI.
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             _ => {}
         }
     }
@@ -1892,6 +1904,8 @@ impl App {
             KeyCode::Down => {
                 self.chat_scroll = self.chat_scroll.saturating_sub(1);
             }
+            // Non-typing pane: q / Esc quit the TUI.
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             _ => {}
         }
     }
@@ -1949,6 +1963,17 @@ impl App {
             KeyCode::Up => self.input.move_up(),
             KeyCode::Down if self.input.at_last_row() => self.input.history_next(),
             KeyCode::Down => self.input.move_down(),
+
+            // Esc in the composer: clear a non-empty input; quit when
+            // already empty (Esc-Esc exits without leaving the keyboard).
+            KeyCode::Esc => {
+                if self.input.text().is_empty() {
+                    self.should_quit = true;
+                } else {
+                    self.input.clear();
+                    self.set_status("input cleared (Esc again to quit)".to_string());
+                }
+            }
 
             // Char input. Skipping ASCII control chars (0x00-0x1F)
             // so Ctrl-key combos we don't bind don't spew junk.
@@ -2068,6 +2093,71 @@ mod tests {
             Some("test pager".into()),
             lines.into_iter().map(String::from).collect(),
         );
+    }
+
+    // -- Quit-key routing (regression: q/Esc/Ctrl-C were intercepted
+    // -- by the event loop BEFORE the app saw them, so typing "q" in
+    // -- the composer exited the TUI and Esc killed the app mid-modal).
+
+    #[test]
+    fn typing_q_in_composer_inserts_not_quits() {
+        let mut app = App::new();
+        app.focus = Focus::Input;
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.should_quit, "typing 'q' must not quit");
+        assert_eq!(app.input.text(), "q");
+    }
+
+    #[test]
+    fn esc_in_composer_clears_then_quits() {
+        let mut app = App::new();
+        app.focus = Focus::Input;
+        app.handle_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.should_quit, "first Esc clears, must not quit");
+        assert!(app.input.text().is_empty());
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit, "Esc on an empty composer quits");
+    }
+
+    #[test]
+    fn q_and_esc_quit_from_non_typing_panes() {
+        let mut app = App::new();
+        app.focus = Focus::Chat;
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.should_quit);
+
+        let mut app = App::new();
+        app.focus = Focus::Sessions;
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_globally_but_not_inside_modals() {
+        let mut app = App::new();
+        app.focus = Focus::Input;
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit, "Ctrl-C quits from the main surface");
+
+        // With a modal up, Ctrl-C resolves the modal (deny/close path)
+        // instead of quitting the app.
+        let mut app = App::new();
+        install_pager(&mut app, vec!["line"]);
+        assert!(app.is_blocked());
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit, "modal must consume Ctrl-C");
+    }
+
+    #[test]
+    fn esc_inside_modal_closes_modal_not_app() {
+        let mut app = App::new();
+        install_pager(&mut app, vec!["line"]);
+        assert!(app.is_blocked());
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.should_quit, "Esc must reach the modal, not quit");
+        assert!(!app.is_blocked(), "pager closes on Esc");
     }
 
     #[test]
