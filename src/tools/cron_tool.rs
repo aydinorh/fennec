@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -7,7 +6,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 
-use crate::cron::jobs::{parse_schedule_kind, CronJob, JobStore, ScheduleKind};
+use crate::cron::jobs::{
+    compute_next_run, parse_schedule_kind, schedule_display_for, CronJob, JobStore, RepeatConfig,
+};
 
 use super::traits::{Tool, ToolResult};
 
@@ -79,19 +80,16 @@ impl CronTool {
         // timestamp is a one-shot at that moment. Matches the reference
         // agent's semantics so prompts written for either work the same.
         let schedule_str = schedule_raw.trim().to_string();
-        let kind = match parse_schedule_kind(&schedule_str) {
-            Some(k) => k,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "invalid schedule '{}'. Use:\n  - Duration (one-shot):    '30m', '2h', '1d'\n  - Interval (recurring):   'every 30m', 'every 2h'\n  - Cron expression:        '0 9 * * 1-5', '*/15 * * * *'\n  - Timestamp (one-shot):   '2026-02-03T14:00:00'",
-                        schedule_raw
-                    )),
-                });
-            }
-        };
+        if parse_schedule_kind(&schedule_str).is_none() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "invalid schedule '{}'. Use:\n  - Duration (one-shot):    '30m', '2h', '1d'\n  - Interval (recurring):   'every 30m', 'every 2h'\n  - Cron expression:        '0 9 * * 1-5', '*/15 * * * *'\n  - Timestamp (one-shot):   '2026-02-03T14:00:00'",
+                    schedule_raw
+                )),
+            });
+        }
 
         // Read origin from shared state.
         //
@@ -116,44 +114,41 @@ impl CronTool {
         let job_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
 
-        // Per-kind "next run" display. For Recurring/OneShot the value
-        // is `now + delay`; for Cron we ask croner; for AtTimestamp we
-        // already have it. Falls back to `now` only if croner can't
-        // compute (shouldn't happen — parse_schedule_kind already
-        // validated the expression).
-        let next_run = match &kind {
-            ScheduleKind::Recurring { interval_secs } => {
-                now + chrono::Duration::seconds(*interval_secs as i64)
-            }
-            ScheduleKind::OneShot { delay_secs } => {
-                now + chrono::Duration::seconds(*delay_secs as i64)
-            }
-            ScheduleKind::Cron(expr) => croner::Cron::from_str(expr)
-                .ok()
-                .and_then(|c| c.find_next_occurrence(&now, false).ok())
-                .unwrap_or(now),
-            ScheduleKind::AtTimestamp(ts) => *ts,
-        };
-
-        // AtTimestamp jobs must fire at the scheduled moment, so they
-        // start with `last_run = None` — anchoring to `now` would mark
-        // them as already-fired. Recurring / OneShot / Cron still anchor
-        // here so the scheduler doesn't fire them on the immediately-next
-        // tick after creation.
-        let initial_last_run = match &kind {
-            ScheduleKind::AtTimestamp(_) => None,
-            _ => Some(now.to_rfc3339()),
-        };
-
+        // Compute the next-run timestamp via the shared helper so this
+        // path matches the scheduler's own semantics exactly (cron
+        // expressions ask croner; one-shots return their delay or
+        // timestamp; recurring returns now + interval). `last_run=None`
+        // because the job has never fired yet.
+        let next_run_str = compute_next_run(&schedule_str, None).unwrap_or_else(|| {
+            // Schedule validated above, so this branch is unreachable
+            // in practice — keep a safe fallback so the tool never panics.
+            now.to_rfc3339()
+        });
+        let next_run_dt =
+            chrono::DateTime::parse_from_rfc3339(&next_run_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
         let job = CronJob {
             id: job_id.clone(),
             name: prompt.chars().take(60).collect::<String>(),
             schedule: schedule_str.clone(),
             command: prompt.to_string(),
             enabled: true,
-            last_run: initial_last_run,
+            // No anchor — last_run is set by `mark_job_run` after the
+            // first real fire. next_run_at carries the scheduling state.
+            last_run: None,
             origin_channel: origin.as_ref().map(|o| o.channel.clone()),
             origin_chat_id: origin.as_ref().map(|o| o.chat_id.clone()),
+            state: "scheduled".to_string(),
+            created_at: Some(now.to_rfc3339()),
+            next_run_at: Some(next_run_str.clone()),
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            paused_at: None,
+            paused_reason: None,
+            repeat: RepeatConfig::default(),
+            schedule_display: schedule_display_for(&schedule_str),
         };
 
         let mut store = self.load_store()?;
@@ -164,7 +159,7 @@ impl CronTool {
             "Scheduled job created.\n  ID: {}\n  Schedule: {}\n  Next run: {}\n  Prompt: {}",
             job_id,
             schedule_str,
-            next_run.format("%Y-%m-%d %H:%M:%S UTC"),
+            next_run_dt.format("%Y-%m-%d %H:%M:%S UTC"),
             prompt,
         );
 

@@ -27,7 +27,129 @@ pub struct CronJob {
     /// The chat ID within the origin channel to deliver results to.
     #[serde(default)]
     pub origin_chat_id: Option<String>,
+    /// Lifecycle state: `"scheduled"` | `"paused"` | `"error"` | `"completed"`.
+    /// Legacy jobs without this field are treated as `"scheduled"` when
+    /// enabled and `"paused"` when disabled (see [`CronJob::effective_state`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    /// Creation timestamp (RFC3339). Populated at create time; legacy
+    /// jobs without this stay `None` and consumers must tolerate the
+    /// absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// Next scheduled run time (RFC3339). Persisted so jobs don't drift
+    /// across scheduler restarts and so missed windows can be fast-forwarded
+    /// — matches the upstream's at-most-once + stale-fast-forward semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    /// Outcome of the most recent run: `"ok"` | `"error"`. None before
+    /// the first run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    /// Error message from the most recent failed run. Cleared on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Error message from the most recent failed delivery attempt
+    /// (separate from `last_error` — a job can succeed but fail
+    /// delivery, e.g. when the destination platform is down).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivery_error: Option<String>,
+    /// When the job was paused (RFC3339). None when not paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    /// Why the job was paused. None when not paused or no reason given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<String>,
+    /// Run-count gate. `times = None` means run forever; otherwise the
+    /// job is auto-removed once `completed >= times` (mirrors the
+    /// upstream's `repeat: {times, completed}` field).
+    #[serde(default)]
+    pub repeat: RepeatConfig,
+    /// Human-readable schedule label for UI/list display (e.g.
+    /// `"every 30m"`, `"once in 30m"`, `"once at 2026-02-03 14:00"`, or
+    /// the cron expression itself). Computed at create time so a
+    /// `/cron list` doesn't re-parse the schedule string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schedule_display: String,
 }
+
+impl CronJob {
+    /// Resolve the lifecycle state, treating an empty stored `state` as
+    /// `"scheduled"` when enabled and `"paused"` when disabled — matches
+    /// the upstream's `_normalize_job_record` fallback so legacy jobs
+    /// don't appear in an "unknown" limbo.
+    pub fn effective_state(&self) -> &str {
+        if !self.state.is_empty() {
+            return &self.state;
+        }
+        if self.enabled {
+            "scheduled"
+        } else {
+            "paused"
+        }
+    }
+}
+
+/// Repeat-count gate for a cron job. `times = None` ⇒ run forever;
+/// otherwise the scheduler auto-removes the job once
+/// `completed >= times` after its final run.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RepeatConfig {
+    /// Requested total runs. `None` means run forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub times: Option<u32>,
+    /// Completed runs so far.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub completed: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Subset of job fields that callers can update via [`JobStore::update_job`].
+/// Each `Option` wraps a single update; outer `None` = leave unchanged.
+/// For nullable fields, an outer `Some(None)` clears the field to `None`.
+#[derive(Debug, Clone, Default)]
+pub struct JobUpdates {
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub command: Option<String>,
+    pub enabled: Option<bool>,
+    pub state: Option<String>,
+    pub next_run_at: Option<Option<String>>,
+    pub last_run: Option<Option<String>>,
+    pub last_status: Option<Option<String>>,
+    pub last_error: Option<Option<String>>,
+    pub last_delivery_error: Option<Option<String>>,
+    pub paused_at: Option<Option<String>>,
+    pub paused_reason: Option<Option<String>>,
+    pub repeat: Option<RepeatConfig>,
+    pub schedule_display: Option<String>,
+}
+
+/// Error returned by [`JobStore::resolve_job_ref`] when a name matches
+/// more than one job. Mirrors the upstream's `AmbiguousJobReference` —
+/// callers should surface the matching IDs so the user can disambiguate.
+#[derive(Debug)]
+pub struct AmbiguousJobReference {
+    pub reference: String,
+    pub matches: Vec<String>,
+}
+
+impl std::fmt::Display for AmbiguousJobReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "job name '{}' is ambiguous — matches {} jobs: {}. Use the job ID instead.",
+            self.reference,
+            self.matches.len(),
+            self.matches.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousJobReference {}
 
 pub struct JobStore {
     jobs: Vec<CronJob>,
@@ -87,6 +209,11 @@ impl JobStore {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating parent dir {}", parent.display()))?;
+                // Tighten the cron directory to owner-only access (0700) on
+                // Unix. Matches the upstream's `_secure_dir` — cron jobs can
+                // carry credentials in their command/prompt, so the store
+                // should never be group/world-readable. No-op on Windows.
+                secure_dir(parent);
             }
         }
         let data = serde_json::to_string_pretty(&self.jobs)
@@ -109,6 +236,11 @@ impl JobStore {
 
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp_path);
+        } else {
+            // Lock the final file to 0600 — owner-only read/write — for the
+            // same reason as the parent dir above. Matches the upstream's
+            // `_secure_file`.
+            secure_file(&self.path);
         }
         result
     }
@@ -138,6 +270,425 @@ impl JobStore {
     /// The file path this store persists to.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl JobStore {
+    /// Resolve a job reference (ID or name) to a job. Exact ID match
+    /// wins first; otherwise case-insensitive name match. Returns
+    /// [`AmbiguousJobReference`] when a name matches more than one job
+    /// so the caller can surface the matching IDs rather than silently
+    /// picking one — mirrors the upstream's `resolve_job_ref`.
+    pub fn resolve_job_ref(
+        &self,
+        reference: &str,
+    ) -> Result<Option<&CronJob>, AmbiguousJobReference> {
+        let ref_trim = reference.trim();
+        if ref_trim.is_empty() {
+            return Ok(None);
+        }
+        if let Some(job) = self.jobs.iter().find(|j| j.id == ref_trim) {
+            return Ok(Some(job));
+        }
+        let ref_lower = ref_trim.to_lowercase();
+        let name_matches: Vec<&CronJob> = self
+            .jobs
+            .iter()
+            .filter(|j| j.name.to_lowercase() == ref_lower)
+            .collect();
+        match name_matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(name_matches[0])),
+            _ => Err(AmbiguousJobReference {
+                reference: ref_trim.to_string(),
+                matches: name_matches.iter().map(|j| j.id.clone()).collect(),
+            }),
+        }
+    }
+
+    /// Get a job by ID or name. Returns a clone for ergonomics; callers
+    /// needing a mutable handle use [`JobStore::get_mut`] or
+    /// [`JobStore::update_job`].
+    pub fn get_job(&self, reference: &str) -> Result<Option<CronJob>, AmbiguousJobReference> {
+        self.resolve_job_ref(reference).map(|opt| opt.cloned())
+    }
+
+    /// Remove a job by ID or name. Returns the boolean removal result
+    /// inside `Result` so name ambiguity can be reported to the caller.
+    pub fn remove_by_ref(&mut self, reference: &str) -> Result<bool, AmbiguousJobReference> {
+        let id = match self.resolve_job_ref(reference)? {
+            Some(job) => job.id.clone(),
+            None => return Ok(false),
+        };
+        Ok(self.remove_job(&id))
+    }
+
+    /// Update fields on a job in place. The `id` field is immutable —
+    /// it's a filesystem path component for output directories (see
+    /// PR 3 / output persistence), so allowing renames leaks
+    /// path-escape values into output writes/deletes (matches the
+    /// upstream's `_IMMUTABLE_JOB_FIELDS` guard).
+    ///
+    /// Schedule changes auto-recompute `schedule_display` and
+    /// `next_run_at`. Persists immediately.
+    pub fn update_job(&mut self, id: &str, updates: JobUpdates) -> Result<Option<CronJob>> {
+        let Some(idx) = self.jobs.iter().position(|j| j.id == id) else {
+            return Ok(None);
+        };
+        let schedule_changed = updates.schedule.is_some();
+
+        {
+            let job = &mut self.jobs[idx];
+            if let Some(name) = updates.name {
+                job.name = name;
+            }
+            if let Some(schedule) = updates.schedule {
+                job.schedule = schedule;
+            }
+            if let Some(command) = updates.command {
+                job.command = command;
+            }
+            if let Some(enabled) = updates.enabled {
+                job.enabled = enabled;
+            }
+            if let Some(state) = updates.state {
+                job.state = state;
+            }
+            if let Some(next) = updates.next_run_at {
+                job.next_run_at = next;
+            }
+            if let Some(last) = updates.last_run {
+                job.last_run = last;
+            }
+            if let Some(s) = updates.last_status {
+                job.last_status = s;
+            }
+            if let Some(e) = updates.last_error {
+                job.last_error = e;
+            }
+            if let Some(d) = updates.last_delivery_error {
+                job.last_delivery_error = d;
+            }
+            if let Some(p) = updates.paused_at {
+                job.paused_at = p;
+            }
+            if let Some(r) = updates.paused_reason {
+                job.paused_reason = r;
+            }
+            if let Some(repeat) = updates.repeat {
+                job.repeat = repeat;
+            }
+            if let Some(disp) = updates.schedule_display {
+                job.schedule_display = disp;
+            }
+        }
+
+        if schedule_changed {
+            let (display, next) = {
+                let job = &self.jobs[idx];
+                (
+                    schedule_display_for(&job.schedule),
+                    if job.state != "paused" {
+                        compute_next_run(&job.schedule, job.last_run.as_deref())
+                    } else {
+                        job.next_run_at.clone()
+                    },
+                )
+            };
+            let job = &mut self.jobs[idx];
+            job.schedule_display = display;
+            if job.state != "paused" {
+                job.next_run_at = next;
+            }
+        }
+
+        // Re-arm next_run_at if the job ended up enabled, scheduled, and
+        // missing it (e.g. resume_job from a state where it was cleared).
+        let needs_rearm = {
+            let job = &self.jobs[idx];
+            job.enabled && job.state != "paused" && job.next_run_at.is_none()
+        };
+        if needs_rearm {
+            let (schedule, last) = {
+                let job = &self.jobs[idx];
+                (job.schedule.clone(), job.last_run.clone())
+            };
+            self.jobs[idx].next_run_at = compute_next_run(&schedule, last.as_deref());
+        }
+
+        let updated = self.jobs[idx].clone();
+        self.save()?;
+        Ok(Some(updated))
+    }
+
+    /// Pause a job (by ID or name) without removing it. Sets
+    /// `state="paused"`, `enabled=false`, records `paused_at` and
+    /// `paused_reason`. Mirrors the upstream's `pause_job`.
+    pub fn pause_job(&mut self, reference: &str, reason: Option<&str>) -> Result<Option<CronJob>> {
+        let id = match self
+            .resolve_job_ref(reference)
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            Some(job) => job.id.clone(),
+            None => return Ok(None),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let updates = JobUpdates {
+            enabled: Some(false),
+            state: Some("paused".to_string()),
+            paused_at: Some(Some(now)),
+            paused_reason: Some(reason.map(|s| s.to_string())),
+            ..Default::default()
+        };
+        self.update_job(&id, updates)
+    }
+
+    /// Resume a paused job (by ID or name). Clears pause fields,
+    /// re-enables, and recomputes the next run. Mirrors the upstream's
+    /// `resume_job`.
+    pub fn resume_job(&mut self, reference: &str) -> Result<Option<CronJob>> {
+        let id = match self
+            .resolve_job_ref(reference)
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            Some(job) => job.id.clone(),
+            None => return Ok(None),
+        };
+        let next_run = {
+            let job = self
+                .jobs
+                .iter()
+                .find(|j| j.id == id)
+                .expect("resolve_job_ref returned id that's no longer in store");
+            compute_next_run(&job.schedule, job.last_run.as_deref())
+        };
+        let updates = JobUpdates {
+            enabled: Some(true),
+            state: Some("scheduled".to_string()),
+            paused_at: Some(None),
+            paused_reason: Some(None),
+            next_run_at: Some(next_run),
+            ..Default::default()
+        };
+        self.update_job(&id, updates)
+    }
+
+    /// Trigger a job to run on the next scheduler tick (by ID or name).
+    /// Sets `next_run_at = now` so the next tick picks it up regardless
+    /// of the schedule. Mirrors the upstream's `trigger_job`.
+    pub fn trigger_job(&mut self, reference: &str) -> Result<Option<CronJob>> {
+        let id = match self
+            .resolve_job_ref(reference)
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            Some(job) => job.id.clone(),
+            None => return Ok(None),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let updates = JobUpdates {
+            enabled: Some(true),
+            state: Some("scheduled".to_string()),
+            paused_at: Some(None),
+            paused_reason: Some(None),
+            next_run_at: Some(Some(now)),
+            ..Default::default()
+        };
+        self.update_job(&id, updates)
+    }
+
+    /// Mark a job as having run. Updates `last_run`, `last_status`,
+    /// `last_error`, `last_delivery_error`; increments `repeat.completed`
+    /// and removes the job if the repeat limit is reached; recomputes
+    /// `next_run_at` and sets the lifecycle state accordingly.
+    ///
+    /// Important parity detail: a recurring job whose `next_run_at`
+    /// can't be computed is left enabled with `state="error"` rather
+    /// than silently disabled — a missing croner / a runtime regression
+    /// shouldn't quietly turn a daily reminder into "completed".
+    /// Mirrors the upstream's `mark_job_run` (and its bug-fix history).
+    pub fn mark_job_run(
+        &mut self,
+        id: &str,
+        success: bool,
+        error: Option<&str>,
+        delivery_error: Option<&str>,
+    ) -> Result<()> {
+        let Some(idx) = self.jobs.iter().position(|j| j.id == id) else {
+            tracing::warn!("mark_job_run: job id '{}' not found, skipping save", id);
+            return Ok(());
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule_str = self.jobs[idx].schedule.clone();
+
+        {
+            let job = &mut self.jobs[idx];
+            job.last_run = Some(now.clone());
+            job.last_status = Some(if success { "ok" } else { "error" }.to_string());
+            job.last_error = if success {
+                None
+            } else {
+                error.map(|s| s.to_string())
+            };
+            job.last_delivery_error = delivery_error.map(|s| s.to_string());
+            job.repeat.completed = job.repeat.completed.saturating_add(1);
+
+            if let Some(times) = job.repeat.times {
+                if times > 0 && job.repeat.completed >= times {
+                    self.jobs.remove(idx);
+                    return self.save();
+                }
+            }
+        }
+
+        let next = compute_next_run(&schedule_str, Some(&now));
+        let kind = parse_schedule_kind(&schedule_str);
+        let is_recurring = matches!(
+            kind,
+            Some(ScheduleKind::Recurring { .. } | ScheduleKind::Cron(_))
+        );
+
+        let job = &mut self.jobs[idx];
+        job.next_run_at = next.clone();
+
+        if next.is_none() {
+            if is_recurring {
+                job.state = "error".to_string();
+                if job.last_error.is_none() {
+                    job.last_error = Some(
+                        "Failed to compute next run for recurring schedule".to_string(),
+                    );
+                }
+                tracing::error!(
+                    "Cron job '{}' ({}): could not compute next_run_at — leaving enabled and marking state=error so the job is not silently disabled",
+                    job.name, job.id
+                );
+            } else {
+                job.enabled = false;
+                job.state = "completed".to_string();
+            }
+        } else if job.state != "paused" {
+            job.state = "scheduled".to_string();
+        }
+
+        self.save()
+    }
+
+    /// Preemptively advance `next_run_at` for a recurring job BEFORE it
+    /// fires. Converts the scheduler from at-least-once to at-most-once
+    /// for recurring jobs — a crash mid-execution loses one run rather
+    /// than refiring on next restart. One-shots are left unchanged so
+    /// they can still retry on restart. Returns true if advanced.
+    /// Mirrors the upstream's `advance_next_run`.
+    pub fn advance_next_run(&mut self, id: &str) -> Result<bool> {
+        let Some(idx) = self.jobs.iter().position(|j| j.id == id) else {
+            return Ok(false);
+        };
+        let schedule_str = self.jobs[idx].schedule.clone();
+        let kind = parse_schedule_kind(&schedule_str);
+        if !matches!(
+            kind,
+            Some(ScheduleKind::Recurring { .. } | ScheduleKind::Cron(_))
+        ) {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let new_next = compute_next_run(&schedule_str, Some(&now));
+        if let Some(new_next) = new_next {
+            let job = &mut self.jobs[idx];
+            if job.next_run_at.as_deref() != Some(new_next.as_str()) {
+                job.next_run_at = Some(new_next);
+                self.save()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Return all jobs that are due to run now.
+    ///
+    /// For recurring jobs whose `next_run_at` is more than the
+    /// schedule-period-aware grace window in the past (e.g. the
+    /// scheduler was offline overnight), fast-forwards to the next
+    /// future occurrence and skips this run — preventing a burst of
+    /// stale fires on restart. Mirrors the upstream's `get_due_jobs`
+    /// + `_compute_grace_seconds` behaviour.
+    ///
+    /// May save the store as a side effect (recovered or fast-forwarded
+    /// `next_run_at` values).
+    pub fn get_due_jobs(&mut self) -> Vec<CronJob> {
+        let now = chrono::Utc::now();
+        let mut due: Vec<CronJob> = Vec::new();
+        let mut dirty = false;
+
+        for idx in 0..self.jobs.len() {
+            if !self.jobs[idx].enabled {
+                continue;
+            }
+            let id = self.jobs[idx].id.clone();
+            let schedule = self.jobs[idx].schedule.clone();
+            let last_run = self.jobs[idx].last_run.clone();
+            let mut next_run_at = self.jobs[idx].next_run_at.clone();
+
+            // Recovery: a missing next_run_at on an enabled job (legacy
+            // import, hand-edited jobs.json, or a one-shot that never
+            // anchored) — recompute from the schedule + last_run.
+            if next_run_at.is_none() {
+                if let Some(recovered) = compute_next_run(&schedule, last_run.as_deref()) {
+                    next_run_at = Some(recovered.clone());
+                    self.jobs[idx].next_run_at = Some(recovered);
+                    dirty = true;
+                } else {
+                    continue;
+                }
+            }
+
+            let next = next_run_at.expect("just set");
+            let Ok(next_dt) = chrono::DateTime::parse_from_rfc3339(&next) else {
+                tracing::warn!(
+                    "Cron job '{}': invalid next_run_at '{}', skipping",
+                    id,
+                    next
+                );
+                continue;
+            };
+            let next_dt = next_dt.with_timezone(&chrono::Utc);
+
+            if next_dt > now {
+                continue; // not yet due
+            }
+
+            // Past due — for recurring jobs, check stale fast-forward.
+            let kind = parse_schedule_kind(&schedule);
+            let is_recurring = matches!(
+                kind,
+                Some(ScheduleKind::Recurring { .. } | ScheduleKind::Cron(_))
+            );
+            if is_recurring {
+                let lateness = (now - next_dt).num_seconds();
+                let grace = grace_seconds_for(&schedule);
+                if lateness > grace {
+                    if let Some(fast_fwd) = compute_next_run(&schedule, Some(&now.to_rfc3339())) {
+                        tracing::info!(
+                            "Cron job '{}': missed scheduled time {} (grace {}s, late {}s) — fast-forwarding to {}",
+                            id, next, grace, lateness, fast_fwd
+                        );
+                        self.jobs[idx].next_run_at = Some(fast_fwd);
+                        dirty = true;
+                        continue;
+                    }
+                }
+            }
+
+            due.push(self.jobs[idx].clone());
+        }
+
+        if dirty {
+            if let Err(e) = self.save() {
+                tracing::error!("get_due_jobs: failed to save recovery updates: {}", e);
+            }
+        }
+
+        due
     }
 }
 
@@ -305,6 +856,175 @@ pub fn parse_schedule(schedule: &str) -> Option<u64> {
     parse_schedule_kind(schedule).map(|k| k.seconds())
 }
 
+// =============================================================================
+// Next-run computation + grace windows + display helpers
+// =============================================================================
+
+/// Grace window for one-shot timestamp jobs (seconds). A job scheduled
+/// for HH:MM still fires if the scheduler tick happens within this many
+/// seconds after the moment — matches the upstream's `ONESHOT_GRACE_SECONDS`.
+pub const ONESHOT_GRACE_SECS: i64 = 120;
+
+/// Floor for the recurring stale-fast-forward window (seconds). A daily
+/// job missed by less than 2 minutes still fires; missed by 2h doesn't.
+const MIN_RECURRING_GRACE_SECS: i64 = 120;
+/// Ceiling for the recurring stale-fast-forward window (seconds, = 2h).
+const MAX_RECURRING_GRACE_SECS: i64 = 7200;
+
+/// Compute the next scheduled run time for a job, given its schedule
+/// string and the last-run timestamp (if any). Returns an RFC3339 string
+/// or `None` if the job has no more runs (e.g. a one-shot that already
+/// fired).
+///
+/// Semantics, mirroring the upstream's `compute_next_run`:
+/// - **Recurring interval**: `last_run + interval` (or `now + interval`
+///   if never run). Each call returns a future timestamp.
+/// - **One-shot duration** (`"30m"`): `now + delay` if never run; `None`
+///   once fired.
+/// - **Cron expression**: next occurrence after `last_run` (or `now` if
+///   never run).
+/// - **Timestamp one-shot**: the timestamp itself if never run; `None`
+///   once fired.
+pub fn compute_next_run(schedule: &str, last_run_at: Option<&str>) -> Option<String> {
+    let kind = parse_schedule_kind(schedule)?;
+    let now = chrono::Utc::now();
+    let last = last_run_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    match kind {
+        ScheduleKind::Recurring { interval_secs } => {
+            let base = last.unwrap_or(now);
+            Some((base + chrono::Duration::seconds(interval_secs as i64)).to_rfc3339())
+        }
+        ScheduleKind::OneShot { delay_secs } => {
+            if last.is_some() {
+                None
+            } else {
+                Some((now + chrono::Duration::seconds(delay_secs as i64)).to_rfc3339())
+            }
+        }
+        ScheduleKind::Cron(expr) => {
+            let cron = croner::Cron::from_str(&expr).ok()?;
+            let base = last.unwrap_or(now);
+            cron.find_next_occurrence(&base, false)
+                .ok()
+                .map(|dt| dt.to_rfc3339())
+        }
+        ScheduleKind::AtTimestamp(ts) => {
+            if last.is_some() {
+                None
+            } else {
+                Some(ts.to_rfc3339())
+            }
+        }
+    }
+}
+
+/// Stale-fast-forward grace window (seconds) for a recurring job.
+///
+/// A recurring job missed by less than this window still fires on the
+/// next tick (catch-up). Missed by more, the scheduler fast-forwards to
+/// the next future occurrence instead of replaying a stale run.
+///
+/// Uses *half the schedule period*, clamped to [120s, 2h] — matches the
+/// upstream's `_compute_grace_seconds`. One-shot kinds return the fixed
+/// [`ONESHOT_GRACE_SECS`].
+pub fn grace_seconds_for(schedule: &str) -> i64 {
+    let Some(kind) = parse_schedule_kind(schedule) else {
+        return MIN_RECURRING_GRACE_SECS;
+    };
+    match kind {
+        ScheduleKind::OneShot { .. } | ScheduleKind::AtTimestamp(_) => ONESHOT_GRACE_SECS,
+        ScheduleKind::Recurring { interval_secs } => {
+            let period = interval_secs as i64;
+            let half = period / 2;
+            half.clamp(MIN_RECURRING_GRACE_SECS, MAX_RECURRING_GRACE_SECS)
+        }
+        ScheduleKind::Cron(expr) => {
+            // Approximate the cron job's period via two successive occurrences
+            // after now; fall back to MIN_RECURRING_GRACE_SECS on parse/iter
+            // failure so the scheduler never blocks on a fancy expression.
+            let now = chrono::Utc::now();
+            (|| -> Option<i64> {
+                let cron = croner::Cron::from_str(&expr).ok()?;
+                let first = cron.find_next_occurrence(&now, false).ok()?;
+                let second = cron.find_next_occurrence(&first, false).ok()?;
+                let period = (second - first).num_seconds();
+                let half = period / 2;
+                Some(half.clamp(MIN_RECURRING_GRACE_SECS, MAX_RECURRING_GRACE_SECS))
+            })()
+            .unwrap_or(MIN_RECURRING_GRACE_SECS)
+        }
+    }
+}
+
+/// Compose a user-friendly schedule label for `cron list` and similar UI.
+/// Mirrors the upstream's `display` field in the parsed schedule dict.
+pub fn schedule_display_for(schedule: &str) -> String {
+    let trimmed = schedule.trim();
+    let Some(kind) = parse_schedule_kind(trimmed) else {
+        return trimmed.to_string();
+    };
+    match kind {
+        ScheduleKind::Recurring { interval_secs } => {
+            format!("every {}", humanize_seconds(interval_secs))
+        }
+        ScheduleKind::OneShot { delay_secs } => {
+            format!("once in {}", humanize_seconds(delay_secs))
+        }
+        ScheduleKind::Cron(expr) => expr,
+        ScheduleKind::AtTimestamp(ts) => format!(
+            "once at {}",
+            ts.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+        ),
+    }
+}
+
+// =============================================================================
+// Secure filesystem helpers
+// =============================================================================
+
+/// Tighten a directory to owner-only (0700) on Unix. No-op on Windows
+/// and on permission-denied (we don't own the parent — best-effort).
+#[cfg(unix)]
+fn secure_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn secure_dir(_path: &Path) {}
+
+/// Tighten a regular file to owner-only read+write (0600) on Unix.
+/// No-op on Windows.
+#[cfg(unix)]
+fn secure_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if path.exists() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) {}
+
+/// Pick the most-compact "Nu" representation for `secs`: "7d" over
+/// "168h" when divisible, etc.
+fn humanize_seconds(secs: u64) -> String {
+    if secs == 0 {
+        return "0s".to_string();
+    }
+    if secs.is_multiple_of(86400) {
+        format!("{}d", secs / 86400)
+    } else if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +1187,16 @@ mod tests {
             last_run: None,
             origin_channel: None,
             origin_chat_id: None,
+            state: String::new(),
+            created_at: None,
+            next_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            paused_at: None,
+            paused_reason: None,
+            repeat: RepeatConfig::default(),
+            schedule_display: String::new(),
         });
         store.save().unwrap();
         // After a clean save, the parent directory must contain exactly
@@ -529,6 +1259,16 @@ mod tests {
             last_run: None,
             origin_channel: Some("telegram".into()),
             origin_chat_id: Some("123".into()),
+            state: String::new(),
+            created_at: None,
+            next_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            paused_at: None,
+            paused_reason: None,
+            repeat: RepeatConfig::default(),
+            schedule_display: String::new(),
         });
         store.save().unwrap();
 

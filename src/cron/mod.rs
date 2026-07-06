@@ -1,18 +1,15 @@
 pub mod jobs;
-pub use jobs::{parse_schedule, parse_schedule_kind, CronJob, JobStore, ScheduleKind};
+pub use jobs::{
+    compute_next_run, grace_seconds_for, parse_schedule, parse_schedule_kind,
+    schedule_display_for, AmbiguousJobReference, CronJob, JobStore, JobUpdates, RepeatConfig,
+    ScheduleKind, ONESHOT_GRACE_SECS,
+};
 
 use std::collections::HashMap;
-use std::str::FromStr;
 
 use chrono::Utc;
 
 use crate::bus::{InboundMessage, MessageBus};
-
-/// Grace window for one-shot timestamp jobs: a job scheduled for HH:MM
-/// still fires if the scheduler tick happens within this many seconds
-/// after the scheduled moment. Past that, the job is skipped as stale
-/// and disabled so the scheduler stops re-evaluating it every tick.
-const ONESHOT_GRACE_SECS: i64 = 120;
 
 pub struct CronScheduler {
     store: JobStore,
@@ -52,192 +49,70 @@ impl CronScheduler {
         }
     }
 
-    /// Execute a single scheduler tick: check all enabled jobs and fire those
-    /// that are due.
+    /// Execute a single scheduler tick: ask the store for all due jobs,
+    /// advance their `next_run_at` (at-most-once for recurring jobs),
+    /// publish each job's command to the bus, and mark the run.
+    ///
+    /// The heavy lifting — recovery of missing `next_run_at`, stale
+    /// fast-forward, repeat counting, lifecycle state — lives in
+    /// [`JobStore`] so this loop stays thin and the same semantics work
+    /// for any future tick entry point (CLI, gateway, tests).
     pub async fn tick(&mut self) {
-        let now = Utc::now();
-        let mut dirty = false;
+        let due_jobs = self.store.get_due_jobs();
+        if due_jobs.is_empty() {
+            return;
+        }
 
-        // Snapshot the state we need before we mutate. Holding an
-        // iterator over store.list_jobs() while taking a &mut to the
-        // store would require gymnastics; a small clone is fine.
-        let jobs: Vec<(String, String, String, Option<String>, Option<String>, Option<String>)> =
-            self.store
-                .list_jobs()
-                .iter()
-                .filter(|j| j.enabled)
-                .map(|j| {
-                    (
-                        j.id.clone(),
-                        j.schedule.clone(),
-                        j.command.clone(),
-                        j.last_run.clone(),
-                        j.origin_channel.clone(),
-                        j.origin_chat_id.clone(),
-                    )
-                })
-                .collect();
-
-        for (id, schedule, command, last_run, origin_channel, origin_chat_id) in jobs {
-            let kind = match parse_schedule_kind(&schedule) {
-                Some(k) => k,
-                None => {
-                    tracing::warn!("Cron job '{}': invalid schedule '{}'", id, schedule);
-                    continue;
-                }
-            };
-
-            // Resolve the baseline timestamp to measure "elapsed since …"
-            // against. If the job has never run (`last_run == None`), anchor
-            // the baseline to NOW on first observation — recording it as the
-            // synthetic last_run so the first real fire is an interval later.
-            // The old code treated `last_run == None` as "fire immediately,"
-            // which meant adding a new `"every 24h"` job caused it to fire
-            // within 30 seconds instead of 24 hours later.
-            let last_dt_opt: Option<chrono::DateTime<chrono::Utc>> = last_run
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc));
-
-            // Per-kind due-check + first-tick behavior.
-            //
-            // Recurring / OneShot / Cron all anchor-and-skip on first
-            // observation so a newly-created job doesn't fire on the very
-            // next tick ("every 24h" added at noon should fire ~24h later,
-            // not 30s later).
-            //
-            // AtTimestamp is different: it must fire at the scheduled
-            // wall-clock time regardless of when the job was created, and
-            // is allowed a small grace window to catch up if the scheduler
-            // tick lands slightly after the moment.
-            let (is_due, is_one_shot) = match &kind {
-                ScheduleKind::Recurring { interval_secs } => {
-                    let Some(last_dt) = last_dt_opt else {
-                        if let Some(job) = self.store.get_mut(&id) {
-                            job.last_run = Some(now.to_rfc3339());
-                        }
-                        dirty = true;
-                        continue;
-                    };
-                    let elapsed = now
-                        .signed_duration_since(last_dt)
-                        .num_seconds()
-                        .max(0) as u64;
-                    (elapsed >= *interval_secs, false)
-                }
-                ScheduleKind::OneShot { delay_secs } => {
-                    let Some(last_dt) = last_dt_opt else {
-                        if let Some(job) = self.store.get_mut(&id) {
-                            job.last_run = Some(now.to_rfc3339());
-                        }
-                        dirty = true;
-                        continue;
-                    };
-                    let elapsed = now
-                        .signed_duration_since(last_dt)
-                        .num_seconds()
-                        .max(0) as u64;
-                    (elapsed >= *delay_secs, true)
-                }
-                ScheduleKind::Cron(expr) => {
-                    let Some(last_dt) = last_dt_opt else {
-                        if let Some(job) = self.store.get_mut(&id) {
-                            job.last_run = Some(now.to_rfc3339());
-                        }
-                        dirty = true;
-                        continue;
-                    };
-                    let cron = match croner::Cron::from_str(expr) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Cron job '{}': invalid cron expression '{}': {}",
-                                id, expr, e
-                            );
-                            continue;
-                        }
-                    };
-                    match cron.find_next_occurrence(&last_dt, false) {
-                        Ok(next) => (now >= next, false),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Cron job '{}': failed to compute next occurrence for '{}': {}",
-                                id, expr, e
-                            );
-                            continue;
-                        }
-                    }
-                }
-                ScheduleKind::AtTimestamp(ts) => {
-                    // Already fired (last_run is set) — done.
-                    if last_dt_opt.is_some() {
-                        continue;
-                    }
-                    if *ts > now {
-                        // Not yet due — wait without anchoring so we
-                        // re-check on the next tick.
-                        continue;
-                    }
-                    if now.signed_duration_since(*ts).num_seconds() > ONESHOT_GRACE_SECS {
-                        // Stale (past the grace window) — mark handled +
-                        // disable so we stop re-evaluating it.
-                        tracing::warn!(
-                            "Cron job '{}': skipping stale one-shot scheduled for {} (more than {}s past due)",
-                            id, ts, ONESHOT_GRACE_SECS
-                        );
-                        if let Some(job) = self.store.get_mut(&id) {
-                            job.last_run = Some(now.to_rfc3339());
-                            job.enabled = false;
-                        }
-                        dirty = true;
-                        continue;
-                    }
-                    // Within grace window — fire.
-                    (true, true)
-                }
-            };
-
-            if !is_due {
-                continue;
+        for job in due_jobs {
+            // Pre-advance recurring jobs' next_run_at BEFORE we publish
+            // anything. If we crash between publish and mark_job_run, we
+            // lose one run instead of refiring on every restart —
+            // at-most-once semantics for recurring schedules.
+            if let Err(e) = self.store.advance_next_run(&job.id) {
+                tracing::error!("Cron job '{}': advance_next_run failed: {}", job.id, e);
             }
 
+            let now = Utc::now();
             let msg = InboundMessage {
                 id: uuid::Uuid::new_v4().to_string(),
-                sender: format!("cron:{}", id),
-                content: command,
-                channel: origin_channel.clone().unwrap_or_else(|| "cron".to_string()),
-                chat_id: origin_chat_id.clone().unwrap_or_else(|| format!("cron:{}", id)),
+                sender: format!("cron:{}", job.id),
+                content: job.command.clone(),
+                channel: job
+                    .origin_channel
+                    .clone()
+                    .unwrap_or_else(|| "cron".to_string()),
+                chat_id: job
+                    .origin_chat_id
+                    .clone()
+                    .unwrap_or_else(|| format!("cron:{}", job.id)),
                 timestamp: now.timestamp() as u64,
                 reply_to: None,
                 metadata: {
                     let mut m = HashMap::new();
                     m.insert("source".to_string(), "cron".to_string());
-                    m.insert("cron_job_id".to_string(), id.clone());
+                    m.insert("cron_job_id".to_string(), job.id.clone());
                     m
                 },
             };
 
-            if let Err(e) = self.bus.publish_inbound(msg).await {
-                tracing::error!("Cron job '{}': failed to publish message: {}", id, e);
-                continue;
-            }
-
-            // Update last_run; for one-shot jobs, also disable so the next
-            // tick skips them entirely instead of re-firing every tick
-            // (the headline bug this branch fixes).
-            if let Some(job) = self.store.get_mut(&id) {
-                job.last_run = Some(now.to_rfc3339());
-                if is_one_shot {
-                    job.enabled = false;
-                    tracing::debug!("Cron job '{}': one-shot fired, disabling", id);
+            let (success, err_msg) = match self.bus.publish_inbound(msg).await {
+                Ok(_) => (true, None),
+                Err(e) => {
+                    tracing::error!("Cron job '{}': failed to publish message: {}", job.id, e);
+                    (false, Some(e.to_string()))
                 }
-            }
-            dirty = true;
-        }
+            };
 
-        if dirty {
-            if let Err(e) = self.store.save() {
-                tracing::error!("Failed to save job store after cron tick: {}", e);
+            // mark_job_run handles last_run / last_status / last_error /
+            // last_delivery_error, repeat counting (+ auto-remove), and
+            // recomputes next_run_at + state. delivery_error is None for
+            // the bus-publish path — true remote-delivery error tracking
+            // arrives with the delivery system (later PR).
+            if let Err(e) =
+                self.store
+                    .mark_job_run(&job.id, success, err_msg.as_deref(), None)
+            {
+                tracing::error!("Cron job '{}': mark_job_run failed: {}", job.id, e);
             }
         }
     }
@@ -248,7 +123,15 @@ mod tests {
     use super::*;
     use crate::bus::MessageBus;
 
-    fn job(id: &str, schedule: &str, last_run: Option<&str>) -> CronJob {
+    /// Build a test job with explicit `last_run` / `next_run_at` so each
+    /// case can pin the scheduler's view of the world without timing
+    /// flakiness. All other fields take sensible defaults.
+    fn job(
+        id: &str,
+        schedule: &str,
+        last_run: Option<&str>,
+        next_run_at: Option<&str>,
+    ) -> CronJob {
         CronJob {
             id: id.into(),
             name: id.into(),
@@ -258,90 +141,122 @@ mod tests {
             last_run: last_run.map(|s| s.to_string()),
             origin_channel: None,
             origin_chat_id: None,
+            state: String::new(),
+            created_at: None,
+            next_run_at: next_run_at.map(|s| s.to_string()),
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            paused_at: None,
+            paused_reason: None,
+            repeat: RepeatConfig::default(),
+            schedule_display: String::new(),
         }
     }
 
     #[tokio::test]
     async fn newly_added_recurring_job_does_not_fire_immediately() {
-        // Regression: the old tick() treated last_run=None as "fire now"
-        // which meant a newly-added `"every 24h"` job fired within the
-        // first 30-second scheduler tick.
+        // A new "every 24h" job has no next_run_at; get_due_jobs recovery
+        // computes it as `now + 24h` and the job is correctly NOT due.
         let tmp = tempfile::tempdir().unwrap();
         let mut store = JobStore::new(tmp.path().join("jobs.json"));
-        store.add_job(job("j1", "every 24h", None));
+        store.add_job(job("j1", "every 24h", None, None));
 
         let (bus, mut rx) = MessageBus::new(16);
         let mut scheduler = CronScheduler::new(store, bus, Some(30));
         scheduler.tick().await;
 
-        // No inbound message should have been published.
         assert!(
             rx.inbound_rx.try_recv().is_err(),
             "newly added job fired on first tick — regression"
         );
-
-        // last_run must have been anchored so future ticks can compute
-        // elapsed correctly.
-        let anchored = scheduler
+        let j = scheduler
             .store
             .list_jobs()
             .iter()
             .find(|j| j.id == "j1")
-            .unwrap()
-            .last_run
-            .clone();
-        assert!(anchored.is_some(), "last_run must be anchored");
+            .unwrap();
+        assert!(
+            j.next_run_at.is_some(),
+            "next_run_at must be populated by get_due_jobs recovery"
+        );
     }
 
     #[tokio::test]
-    async fn recurring_job_fires_after_interval_elapsed() {
+    async fn recurring_job_fires_when_next_run_at_is_past() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = JobStore::new(tmp.path().join("jobs.json"));
-        // last_run 2 hours ago — every 1h schedule should fire.
-        let old = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-        store.add_job(job("j2", "every 1h", Some(&old)));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        store.add_job(job("j2", "every 1h", None, Some(&past)));
 
         let (bus, mut rx) = MessageBus::new(16);
         let mut scheduler = CronScheduler::new(store, bus, Some(30));
         scheduler.tick().await;
 
-        let msg = rx
-            .inbound_rx
-            .try_recv()
-            .expect("recurring job past its interval should fire");
+        let msg = rx.inbound_rx.try_recv().expect("due job should fire");
         assert_eq!(msg.sender, "cron:j2");
     }
 
     #[tokio::test]
-    async fn one_shot_disables_after_firing() {
-        // Regression for the headline T2-B bug: `"5m"` used to fire on
-        // every scheduler tick after the first because `elapsed >= 300`
-        // stayed true forever. The scheduler must now set enabled=false
-        // after the first fire.
+    async fn stale_recurring_job_is_fast_forwarded_not_fired() {
+        // "every 1h" missed by 2h — more than the half-period grace
+        // (30min, clamped to [120s, 7200s]). Must be fast-forwarded
+        // instead of firing a stale run.
         let tmp = tempfile::tempdir().unwrap();
         let mut store = JobStore::new(tmp.path().join("jobs.json"));
-        // last_run 1 hour ago — one-shot "5m" should have fired long ago.
-        let old = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        store.add_job(job("once", "5m", Some(&old)));
+        let two_hours_ago = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        store.add_job(job("stale", "every 1h", None, Some(&two_hours_ago)));
 
         let (bus, mut rx) = MessageBus::new(16);
         let mut scheduler = CronScheduler::new(store, bus, Some(30));
         scheduler.tick().await;
 
-        // Fires once.
+        assert!(
+            rx.inbound_rx.try_recv().is_err(),
+            "stale recurring job must be fast-forwarded, not fired"
+        );
+        let j = scheduler
+            .store
+            .list_jobs()
+            .iter()
+            .find(|j| j.id == "stale")
+            .unwrap();
+        let new_next = chrono::DateTime::parse_from_rfc3339(j.next_run_at.as_ref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(
+            new_next > Utc::now(),
+            "fast-forward must move next_run_at into the future"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_completes_after_firing() {
+        // A one-shot whose next_run_at is in the past fires once,
+        // mark_job_run sets state=completed + enabled=false, and the
+        // next tick does NOT re-fire.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        store.add_job(job("once", "5m", None, Some(&past)));
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
         let msg = rx.inbound_rx.try_recv().expect("one-shot fires once");
         assert_eq!(msg.sender, "cron:once");
 
-        // After firing, the job must be disabled.
-        let disabled = scheduler
+        let j = scheduler
             .store
             .list_jobs()
             .iter()
             .find(|j| j.id == "once")
             .unwrap();
-        assert!(!disabled.enabled, "one-shot job must be disabled after firing");
+        assert!(!j.enabled, "one-shot must be disabled after firing");
+        assert_eq!(j.state, "completed");
+        assert_eq!(j.repeat.completed, 1, "repeat counter must increment");
 
-        // Second tick: must NOT fire again.
         scheduler.tick().await;
         assert!(
             rx.inbound_rx.try_recv().is_err(),
@@ -351,16 +266,190 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_schedule_does_not_crash_scheduler() {
-        // A job with an unparseable schedule should be logged and skipped,
-        // not crash the whole tick.
         let tmp = tempfile::tempdir().unwrap();
         let mut store = JobStore::new(tmp.path().join("jobs.json"));
-        store.add_job(job("bad", "every 0s", None));
-        store.add_job(job("good", "every 1h", None));
+        store.add_job(job("bad", "every 0s", None, None));
+        store.add_job(job("good", "every 1h", None, None));
 
         let (bus, _rx) = MessageBus::new(16);
         let mut scheduler = CronScheduler::new(store, bus, Some(30));
-        // Must not panic. No assertion needed beyond "this returns".
         scheduler.tick().await;
+    }
+
+    #[tokio::test]
+    async fn repeat_limit_auto_removes_job() {
+        // A job with repeat.times=2 fires twice, then disappears.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("limit", "every 1m", None, Some(&past));
+        j.repeat.times = Some(2);
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+
+        // Fire 1.
+        scheduler.tick().await;
+        let _ = rx.inbound_rx.try_recv().expect("fire 1");
+        // Re-arm next_run_at to past for fire 2.
+        if let Some(j) = scheduler.store.get_mut("limit") {
+            j.next_run_at = Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        }
+        scheduler.tick().await;
+        let _ = rx.inbound_rx.try_recv().expect("fire 2");
+
+        assert!(
+            scheduler
+                .store
+                .list_jobs()
+                .iter()
+                .all(|j| j.id != "limit"),
+            "job must be auto-removed after repeat limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_once_advance_before_publish() {
+        // advance_next_run runs BEFORE publish. After tick, next_run_at
+        // is in the future even though the job just fired.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        store.add_job(job("a1", "every 1h", None, Some(&past)));
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+        let _ = rx.inbound_rx.try_recv().expect("fires");
+
+        let j = scheduler
+            .store
+            .list_jobs()
+            .iter()
+            .find(|j| j.id == "a1")
+            .unwrap();
+        let next = chrono::DateTime::parse_from_rfc3339(j.next_run_at.as_ref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(
+            next > Utc::now(),
+            "next_run_at must be advanced into the future after fire"
+        );
+        assert_eq!(j.last_status.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn pause_resume_trigger_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        store.add_job(job("p1", "every 1h", None, None));
+
+        // Pause by ID.
+        let paused = store
+            .pause_job("p1", Some("for maintenance"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.state, "paused");
+        assert!(!paused.enabled);
+        assert_eq!(paused.paused_reason.as_deref(), Some("for maintenance"));
+        assert!(paused.paused_at.is_some());
+
+        // Resume by ID — re-enables, clears pause, recomputes next_run_at.
+        let resumed = store.resume_job("p1").unwrap().unwrap();
+        assert_eq!(resumed.state, "scheduled");
+        assert!(resumed.enabled);
+        assert!(resumed.paused_at.is_none());
+        assert!(resumed.next_run_at.is_some());
+
+        // Trigger — sets next_run_at = now (immediately due).
+        let triggered = store.trigger_job("p1").unwrap().unwrap();
+        let triggered_at =
+            chrono::DateTime::parse_from_rfc3339(triggered.next_run_at.as_ref().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        let drift = (Utc::now() - triggered_at).num_seconds().abs();
+        assert!(drift < 5, "trigger should set next_run_at to ~now");
+    }
+
+    #[test]
+    fn resolve_job_ref_by_name_and_ambiguity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let mut j1 = job("id1", "every 1h", None, None);
+        j1.name = "Daily Review".to_string();
+        let mut j2 = job("id2", "every 24h", None, None);
+        j2.name = "Daily Review".to_string();
+        let mut j3 = job("id3", "every 30m", None, None);
+        j3.name = "Unique".to_string();
+        store.add_job(j1);
+        store.add_job(j2);
+        store.add_job(j3);
+
+        // By exact ID — wins over any name match.
+        let by_id = store.resolve_job_ref("id1").unwrap().unwrap();
+        assert_eq!(by_id.id, "id1");
+
+        // By unique name (case-insensitive).
+        let by_name = store.resolve_job_ref("unique").unwrap().unwrap();
+        assert_eq!(by_name.id, "id3");
+
+        // By ambiguous name — error with both matching IDs.
+        let err = store.resolve_job_ref("daily review").unwrap_err();
+        assert_eq!(err.matches.len(), 2);
+        assert!(err.matches.contains(&"id1".to_string()));
+        assert!(err.matches.contains(&"id2".to_string()));
+    }
+
+    #[test]
+    fn update_job_immutable_id_and_schedule_recompute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        store.add_job(job("j1", "every 1h", None, None));
+
+        // Schedule change recomputes display + next_run_at.
+        let updates = JobUpdates {
+            schedule: Some("every 2h".to_string()),
+            ..Default::default()
+        };
+        let updated = store.update_job("j1", updates).unwrap().unwrap();
+        assert_eq!(updated.schedule, "every 2h");
+        assert_eq!(updated.schedule_display, "every 2h");
+        assert!(updated.next_run_at.is_some());
+    }
+
+    #[test]
+    fn remove_by_ref_supports_id_and_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let mut j = job("id1", "every 1h", None, None);
+        j.name = "MyReminder".to_string();
+        store.add_job(j);
+        store.add_job(job("id2", "every 30m", None, None));
+
+        // Remove by name.
+        assert!(store.remove_by_ref("MyReminder").unwrap());
+        assert_eq!(store.list_jobs().len(), 1);
+
+        // Remove by ID.
+        assert!(store.remove_by_ref("id2").unwrap());
+        assert_eq!(store.list_jobs().len(), 0);
+
+        // Non-existent ref: Ok(false).
+        assert!(!store.remove_by_ref("nope").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_secures_jobs_json_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("jobs.json");
+        let mut store = JobStore::new(path.clone());
+        store.add_job(job("j1", "every 1h", None, None));
+        store.save().unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "jobs.json must be 0600 on Unix");
     }
 }
