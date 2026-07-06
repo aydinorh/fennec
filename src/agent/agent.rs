@@ -1328,6 +1328,32 @@ impl Agent {
                 });
             }
         }
+        // Session-end memory consolidation: extract a daily summary +
+        // core facts from the ending conversation into persistent
+        // memory before the history is wiped. Best-effort + detached
+        // (a slow/failed extraction can't block `/new`), skipped for
+        // trivial sessions. All four reset paths (gateway /new, TUI
+        // reset, HTTP session reset) funnel through clear_history, so
+        // this is the single choke point.
+        if self.history.len() >= 4 {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let provider = Arc::clone(&self.provider);
+                let memory = Arc::clone(&self.memory);
+                let history = self.history.clone();
+                let session_id = self.session_id.clone();
+                handle.spawn(async move {
+                    let consolidator =
+                        crate::memory::consolidation::MemoryConsolidator::from_arc(provider);
+                    if let Err(e) = consolidator
+                        .consolidate(memory.as_ref(), &history, &session_id)
+                        .await
+                    {
+                        tracing::warn!("session-end memory consolidation failed: {e}");
+                    }
+                });
+            }
+        }
+
         self.history.clear();
         self.system_prompt = None;
         self.session_id = uuid::Uuid::new_v4().to_string();
@@ -1544,8 +1570,19 @@ impl Agent {
             anyhow::bail!("provider returned empty summary");
         }
 
+        // Memory-provider pre-compress hook: an active provider can
+        // contribute text it wants preserved across compression (e.g.
+        // facts it extracted from the soon-to-be-dropped messages).
+        // Fired on the OLD history so the provider sees what's about
+        // to be summarized away.
+        let provider_context = self.memory_manager.on_pre_compress(&self.history).await;
+
         // Replace older history with a single system message.
-        let summary_marker = format!("[/compress summary] {summary}");
+        let mut summary_marker = format!("[/compress summary] {summary}");
+        if !provider_context.trim().is_empty() {
+            summary_marker.push_str("\n\n[memory-provider context]\n");
+            summary_marker.push_str(provider_context.trim());
+        }
         let mut new_history = Vec::with_capacity(recent.len() + 1);
         new_history.push(ChatMessage::system(&summary_marker));
         new_history.extend(recent);
@@ -2189,6 +2226,23 @@ async fn run_tool_call(
     } else {
         (executed, success)
     };
+
+    // Memory-write observer: mirror successful built-in memory writes
+    // to the active memory provider (if any) so a hosted index stays in
+    // sync with the local store.
+    if success && (name == "memory_store" || name == "memory_forget") {
+        let action = if name == "memory_store" {
+            crate::plugins::MemoryWriteAction::Store
+        } else {
+            crate::plugins::MemoryWriteAction::Forget
+        };
+        let key = effective_args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let content = effective_args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        memory_manager.on_memory_write(action, key, content).await;
+    }
 
     (output, success, started.elapsed())
 }

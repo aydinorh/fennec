@@ -19,7 +19,7 @@ const MAX_KEY_BYTES: usize = 256;
 
 /// Extracts structured information from conversations and stores it in memory.
 pub struct MemoryConsolidator {
-    provider: Box<dyn Provider>,
+    provider: std::sync::Arc<dyn Provider>,
 }
 
 /// JSON schema returned by the extraction prompt.
@@ -39,6 +39,15 @@ struct CoreFact {
 impl MemoryConsolidator {
     /// Create a consolidator that uses the given (cheap) provider for extraction.
     pub fn new(provider: Box<dyn Provider>) -> Self {
+        Self {
+            provider: std::sync::Arc::from(provider),
+        }
+    }
+
+    /// Like [`Self::new`] but shares an existing provider handle — used
+    /// by the agent's session-end consolidation, which holds its
+    /// provider behind an `Arc`.
+    pub fn from_arc(provider: std::sync::Arc<dyn Provider>) -> Self {
         Self { provider }
     }
 
