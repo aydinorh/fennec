@@ -495,6 +495,7 @@ pub struct AgentConfig {
     /// when it exceeds `compression_threshold` of the model's context window.
     /// Default true; set false for strict prompt-cache stability.
     pub compression_enabled: bool,
+    pub tool_loop_guardrails: ToolLoopGuardrailsConfig,
 }
 
 impl Default for AgentConfig {
@@ -504,6 +505,46 @@ impl Default for AgentConfig {
             context_window: 200_000,
             compression_threshold: 0.50,
             compression_enabled: true,
+            tool_loop_guardrails: ToolLoopGuardrailsConfig::default(),
+        }
+    }
+}
+
+/// Per-turn tool-call loop guardrails. Warnings nudge the model when
+/// it repeats failing or non-progressing calls; hard stops
+/// (block/halt) are an explicit opt-in circuit breaker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolLoopGuardrailsConfig {
+    /// Append warning guidance to tool results. Never blocks.
+    pub warnings_enabled: bool,
+    /// Enable block/halt circuit-breaker behavior.
+    pub hard_stop_enabled: bool,
+    /// Warn after N FAILED calls with identical arguments.
+    pub exact_failure_warn_after: u32,
+    /// Block the identical call after N failures (hard-stop mode).
+    pub exact_failure_block_after: u32,
+    /// Warn after N failures of the same tool (any arguments).
+    pub same_tool_failure_warn_after: u32,
+    /// Halt the turn after N failures of the same tool (hard-stop mode).
+    pub same_tool_failure_halt_after: u32,
+    /// Warn after a read-only call returns the identical result N times.
+    pub no_progress_warn_after: u32,
+    /// Block that call after N identical results (hard-stop mode).
+    pub no_progress_block_after: u32,
+}
+
+impl Default for ToolLoopGuardrailsConfig {
+    fn default() -> Self {
+        Self {
+            warnings_enabled: true,
+            hard_stop_enabled: false,
+            exact_failure_warn_after: 2,
+            exact_failure_block_after: 5,
+            same_tool_failure_warn_after: 3,
+            same_tool_failure_halt_after: 8,
+            no_progress_warn_after: 2,
+            no_progress_block_after: 5,
         }
     }
 }

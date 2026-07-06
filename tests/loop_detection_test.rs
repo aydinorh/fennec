@@ -1,81 +1,109 @@
+//! Integration tests for the per-turn tool-loop guardrails.
+//!
+//! The guard is failure- and result-aware (ported from the upstream's
+//! controller): it reacts to repeated FAILED calls and to read-only
+//! calls returning IDENTICAL results — never to mere repetition, which
+//! the previous detector punished even when every call succeeded and
+//! made progress.
+
 use serde_json::json;
 
-use fennec::agent::loop_::{LoopDetector, LoopStatus};
+use fennec::agent::loop_::{GuardAction, LoopGuard, LoopGuardConfig};
 
-#[test]
-fn test_normal_sequence_returns_ok() {
-    let mut d = LoopDetector::new(20);
-    d.record("read_file", &json!({"path": "/a.txt"}));
-    d.record("shell", &json!({"cmd": "ls"}));
-    d.record("write_file", &json!({"path": "/b.txt"}));
-    assert_eq!(d.check(), LoopStatus::Ok);
+fn hard_stop_guard() -> LoopGuard {
+    LoopGuard::new(LoopGuardConfig {
+        hard_stop_enabled: true,
+        ..LoopGuardConfig::default()
+    })
 }
 
 #[test]
-fn test_three_exact_repeats_returns_warning() {
-    let mut d = LoopDetector::new(20);
-    let args = json!({"path": "/a.txt"});
-    d.record("read_file", &args);
-    d.record("read_file", &args);
-    d.record("read_file", &args);
+fn normal_mixed_sequence_stays_allowed() {
+    let mut g = hard_stop_guard();
+    assert_eq!(
+        g.after_call("read_file", &json!({"path": "/a.txt"}), "contents a", false, true),
+        GuardAction::Allow
+    );
+    assert_eq!(
+        g.after_call("shell", &json!({"cmd": "ls"}), "files", false, false),
+        GuardAction::Allow
+    );
+    assert_eq!(
+        g.after_call("write_file", &json!({"path": "/b.txt"}), "ok", false, false),
+        GuardAction::Allow
+    );
+}
 
-    match d.check() {
-        LoopStatus::Warning(msg) => {
-            assert!(msg.contains("read_file"), "message should name the tool: {msg}");
-            assert!(msg.contains("3"), "message should mention count: {msg}");
+#[test]
+fn repeated_identical_failures_warn_then_block() {
+    let mut g = hard_stop_guard();
+    let args = json!({"path": "/a.txt"});
+    assert_eq!(g.after_call("patch", &args, "no match", true, false), GuardAction::Allow);
+    match g.after_call("patch", &args, "no match", true, false) {
+        GuardAction::Warn(msg) => {
+            assert!(msg.contains("patch"), "message should name the tool: {msg}");
+            assert!(msg.contains('2'), "message should mention count: {msg}");
         }
-        other => panic!("expected Warning, got {other:?}"),
+        other => panic!("expected Warn, got {other:?}"),
     }
+    for _ in 0..3 {
+        g.after_call("patch", &args, "no match", true, false);
+    }
+    assert!(matches!(g.before_call("patch", &args), GuardAction::Block(_)));
+    assert!(g.halt_message().is_some());
 }
 
 #[test]
-fn test_five_exact_repeats_returns_break() {
-    let mut d = LoopDetector::new(20);
+fn successful_repetition_never_triggers() {
+    // The old detector's headline false positive: re-reading a file
+    // after edits / re-running a passing command tripped it. The
+    // guard only reacts to failures and identical read-only results.
+    let mut g = hard_stop_guard();
     let args = json!({"path": "/a.txt"});
+    for i in 0..12 {
+        let result = format!("contents v{i}");
+        assert_eq!(
+            g.after_call("read_file", &args, &result, false, true),
+            GuardAction::Allow,
+            "changing results must stay allowed"
+        );
+    }
+    assert_eq!(g.before_call("read_file", &args), GuardAction::Allow);
+}
+
+#[test]
+fn identical_readonly_results_block_in_hard_stop_mode() {
+    let mut g = hard_stop_guard();
+    let args = json!({"q": "same search"});
     for _ in 0..5 {
-        d.record("read_file", &args);
+        g.after_call("web_search", &args, "same ten results", false, true);
     }
-
-    match d.check() {
-        LoopStatus::Break(msg) => {
-            assert!(msg.contains("read_file"), "message should name the tool: {msg}");
-            assert!(msg.contains("5"), "message should mention count: {msg}");
-        }
-        other => panic!("expected Break, got {other:?}"),
-    }
+    assert!(matches!(g.before_call("web_search", &args), GuardAction::Block(_)));
 }
 
 #[test]
-fn test_ping_pong_detected() {
-    let mut d = LoopDetector::new(20);
-    for i in 0..8 {
-        if i % 2 == 0 {
-            d.record("read_file", &json!({"i": i}));
-        } else {
-            d.record("write_file", &json!({"i": i}));
-        }
+fn warnings_only_by_default_no_blocks() {
+    let mut g = LoopGuard::default();
+    let args = json!({"path": "/a.txt"});
+    for _ in 0..10 {
+        g.after_call("patch", &args, "no match", true, false);
     }
-
-    match d.check() {
-        LoopStatus::Break(msg) => {
-            assert!(msg.contains("Ping-pong"), "message should say ping-pong: {msg}");
-        }
-        other => panic!("expected Break for ping-pong, got {other:?}"),
-    }
+    assert_eq!(g.before_call("patch", &args), GuardAction::Allow);
+    assert!(g.halt_message().is_none());
 }
 
 #[test]
-fn test_same_tool_different_args_flagged() {
-    let mut d = LoopDetector::new(20);
-    for i in 0..5 {
-        d.record("shell", &json!({"cmd": format!("ls {i}")}));
-    }
-
-    match d.check() {
-        LoopStatus::Warning(msg) => {
-            assert!(msg.contains("No-progress"), "message should say no-progress: {msg}");
-            assert!(msg.contains("shell"), "message should name the tool: {msg}");
+fn same_tool_failures_across_args_halt_in_hard_stop_mode() {
+    let mut g = hard_stop_guard();
+    let mut halted = false;
+    for i in 0..9 {
+        if matches!(
+            g.after_call("terminal", &json!({"cmd": format!("try {i}")}), "exit 1", true, false),
+            GuardAction::Halt(_)
+        ) {
+            halted = true;
+            break;
         }
-        other => panic!("expected Warning for no-progress, got {other:?}"),
     }
+    assert!(halted, "8 same-tool failures must halt in hard-stop mode");
 }
