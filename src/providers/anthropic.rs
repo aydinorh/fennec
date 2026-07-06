@@ -227,7 +227,55 @@ impl AnthropicProvider {
             "anthropic",
         );
 
+        Self::add_cache_breakpoints(&mut body);
+
         body
+    }
+
+    /// Add `cache_control` breakpoints so Anthropic caches the static request
+    /// prefix. The system prompt is already marked above; this also caches the
+    /// tools block (stable for the whole session) and the conversation prefix
+    /// (a rolling breakpoint on the last message). On multi-turn tool loops
+    /// this cuts re-billed input tokens sharply — and a stale/short prefix
+    /// simply misses the cache rather than erroring, so it's always safe.
+    /// Stays within Anthropic's 4-breakpoint limit (system + tools + prefix).
+    fn add_cache_breakpoints(body: &mut Value) {
+        let ephemeral = || json!({ "type": "ephemeral" });
+
+        // Cache the tools block (mark the last tool).
+        if let Some(last_tool) = body
+            .get_mut("tools")
+            .and_then(|t| t.as_array_mut())
+            .and_then(|tools| tools.last_mut())
+        {
+            last_tool["cache_control"] = ephemeral();
+        }
+
+        // Cache the conversation prefix (mark the last content block of the
+        // last message). String content is promoted to a text block so the
+        // marker has somewhere to live.
+        if let Some(last_msg) = body
+            .get_mut("messages")
+            .and_then(|m| m.as_array_mut())
+            .and_then(|msgs| msgs.last_mut())
+        {
+            match last_msg.get_mut("content") {
+                Some(Value::Array(blocks)) => {
+                    if let Some(last_block) = blocks.last_mut() {
+                        last_block["cache_control"] = ephemeral();
+                    }
+                }
+                Some(content @ Value::String(_)) => {
+                    let text = content.as_str().unwrap_or("").to_string();
+                    *content = json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": ephemeral(),
+                    }]);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Parse a single SSE event from Anthropic's streaming API and emit
@@ -692,6 +740,64 @@ mod tests {
             e,
             StreamEvent::ToolCallDelta { id, .. } if id == expected_id
         )
+    }
+
+    #[test]
+    fn cache_breakpoints_on_system_tools_and_prefix() {
+        let p = AnthropicProvider::new("k".to_string(), Some("claude-sonnet-4-6".to_string()));
+        let messages = vec![ChatMessage::user("hello there")];
+        let specs = vec![
+            crate::tools::traits::ToolSpec {
+                name: "a".to_string(),
+                description: "first".to_string(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            },
+            crate::tools::traits::ToolSpec {
+                name: "b".to_string(),
+                description: "last".to_string(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            },
+        ];
+        let request = ChatRequest {
+            system: Some("be terse"),
+            messages: &messages,
+            tools: Some(&specs),
+            max_tokens: 1024,
+            temperature: 0.7,
+            thinking_level: crate::agent::thinking::ThinkingLevel::Off,
+        };
+        let body = p.build_request_body(&request, false);
+
+        // System block is cached.
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // The LAST tool is cached (and only the last).
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+        // The last message's content (string) was promoted to a cached text block.
+        let last_content = &body["messages"][0]["content"];
+        assert_eq!(last_content[0]["type"], "text");
+        assert_eq!(last_content[0]["text"], "hello there");
+        assert_eq!(last_content[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_breakpoint_marks_last_block_of_array_content() {
+        // A tool-result turn (array content) gets the marker on its last block.
+        let p = AnthropicProvider::new("k".to_string(), Some("claude-sonnet-4-6".to_string()));
+        let messages = vec![ChatMessage::tool_result("tc_1", "the result")];
+        let request = ChatRequest {
+            system: None,
+            messages: &messages,
+            tools: None,
+            max_tokens: 512,
+            temperature: 0.5,
+            thinking_level: crate::agent::thinking::ThinkingLevel::Off,
+        };
+        let body = p.build_request_body(&request, false);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.last().unwrap()["type"], "tool_result");
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
     }
 
     #[tokio::test]
