@@ -903,6 +903,35 @@ async fn build_agent_with_callbacks(
         builder = builder.tool(Box::new(t));
     }
 
+    // Session search/list tools — let the agent search its own past
+    // conversations (FTS5 over the shared `sessions.db`). The store opens in
+    // WAL mode, so this read-mostly handle is safe alongside the TUI/gateway's
+    // writer handle on the same file. Best-effort: if the store can't open,
+    // skip the tools rather than fail agent startup.
+    {
+        let session_db = home_dir.join("sessions.db");
+        match tokio::task::spawn_blocking(move || {
+            fennec::sessions::store::SessionStore::new(&session_db)
+        })
+        .await
+        {
+            Ok(Ok(store)) => {
+                let store = Arc::new(store);
+                builder = builder
+                    .tool(Box::new(fennec::tools::session_tools::SessionSearchTool::new(
+                        store.clone(),
+                    )))
+                    .tool(Box::new(fennec::tools::session_tools::SessionListTool::new(store)));
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("session search/list tools disabled: store open failed: {e}");
+            }
+            Err(e) => {
+                tracing::debug!("session search/list tools disabled: join error: {e}");
+            }
+        }
+    }
+
     // Shared turn-context handles. These are returned from build_agent so
     // the gateway's inbound dispatch can keep them populated.
     let pending_replies = fennec::bus::PendingReplies::new();
