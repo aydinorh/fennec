@@ -7,7 +7,23 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::Rng;
 
+use super::error_classifier::{classify, ErrorClass};
 use super::traits::{ChatRequest, ChatResponse, Provider, StreamEvent};
+
+/// What the failover loop should do with a failed attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum FailoverAction {
+    /// Provider is throttled/busy — cool it down and move to the next.
+    Cooldown,
+    /// This provider can't serve the request (auth/billing/model) — move to
+    /// the next without retrying.
+    NextProvider,
+    /// Transient — retry this provider (with backoff) before moving on.
+    Retry,
+    /// Retrying or failing over won't help (context-overflow / malformed) —
+    /// surface the error immediately.
+    Abort,
+}
 
 /// Default cooldown duration for rate-limited providers (60 seconds).
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
@@ -70,10 +86,19 @@ impl ReliableProvider {
         cooldowns.insert(index, Instant::now() + RATE_LIMIT_COOLDOWN);
     }
 
-    /// Check if an error looks like a rate limit (429).
-    fn is_rate_limit_error(err: &anyhow::Error) -> bool {
-        let msg = err.to_string().to_lowercase();
-        msg.contains("429") || msg.contains("rate limit")
+    /// Decide what the failover loop should do with a failed attempt, based on
+    /// the error's classification.
+    fn failover_action(err: &anyhow::Error) -> FailoverAction {
+        match classify(err) {
+            ErrorClass::RateLimit | ErrorClass::Overloaded => FailoverAction::Cooldown,
+            ErrorClass::Auth
+            | ErrorClass::InsufficientCredits
+            | ErrorClass::ModelNotFound => FailoverAction::NextProvider,
+            ErrorClass::ContextOverflow | ErrorClass::FormatError => FailoverAction::Abort,
+            ErrorClass::ServerError | ErrorClass::Network | ErrorClass::Unknown => {
+                FailoverAction::Retry
+            }
+        }
     }
 
     /// Apply ±20% jitter to `base` to avoid thundering-herd retries when
@@ -137,41 +162,55 @@ impl Provider for ReliableProvider {
 
                 match provider.chat(req).await {
                     Ok(response) => return Ok(response),
-                    Err(err) => {
-                        if Self::is_rate_limit_error(&err) {
+                    Err(err) => match Self::failover_action(&err) {
+                        FailoverAction::Cooldown => {
                             tracing::warn!(
-                                "Provider {} rate limited, applying cooldown",
+                                "Provider {} throttled/overloaded, applying cooldown",
                                 provider.name()
                             );
                             self.mark_rate_limited(index);
                             last_error = Some(err);
                             break; // Move to next provider.
                         }
-
-                        tracing::warn!(
-                            "Provider {} attempt {}/{} failed: {}",
-                            provider.name(),
-                            attempt + 1,
-                            self.max_retries,
-                            err
-                        );
-                        last_error = Some(err);
-
-                        // Exponential backoff with jitter. Cap the sleep
-                        // at the remaining deadline budget so we don't
-                        // "sleep past" the caller's deadline.
-                        if attempt + 1 < self.max_retries {
-                            let base = Duration::from_secs(1 << attempt);
-                            let jittered = Self::jitter(base);
-                            let remaining =
-                                self.max_total_duration.saturating_sub(start.elapsed());
-                            let sleep_for = jittered.min(remaining);
-                            if sleep_for.is_zero() {
-                                break;
-                            }
-                            tokio::time::sleep(sleep_for).await;
+                        FailoverAction::NextProvider => {
+                            tracing::warn!(
+                                "Provider {} can't serve request ({}); trying next",
+                                provider.name(),
+                                err
+                            );
+                            last_error = Some(err);
+                            break; // Move to next provider, no retry.
                         }
-                    }
+                        FailoverAction::Abort => {
+                            // Context-overflow / malformed request — retrying
+                            // or failing over won't help; surface immediately.
+                            return Err(err);
+                        }
+                        FailoverAction::Retry => {
+                            tracing::warn!(
+                                "Provider {} attempt {}/{} failed: {}",
+                                provider.name(),
+                                attempt + 1,
+                                self.max_retries,
+                                err
+                            );
+                            last_error = Some(err);
+
+                            // Exponential backoff with jitter, capped at the
+                            // remaining deadline budget.
+                            if attempt + 1 < self.max_retries {
+                                let base = Duration::from_secs(1 << attempt);
+                                let jittered = Self::jitter(base);
+                                let remaining =
+                                    self.max_total_duration.saturating_sub(start.elapsed());
+                                let sleep_for = jittered.min(remaining);
+                                if sleep_for.is_zero() {
+                                    break;
+                                }
+                                tokio::time::sleep(sleep_for).await;
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -253,38 +292,51 @@ impl Provider for ReliableProvider {
 
                 match provider.chat_stream(req).await {
                     Ok(rx) => return Ok(rx),
-                    Err(err) => {
-                        if Self::is_rate_limit_error(&err) {
+                    Err(err) => match Self::failover_action(&err) {
+                        FailoverAction::Cooldown => {
                             tracing::warn!(
-                                "Streaming provider {} rate limited, applying cooldown",
+                                "Streaming provider {} throttled/overloaded, applying cooldown",
                                 provider.name()
                             );
                             self.mark_rate_limited(index);
                             last_error = Some(err);
                             break; // Move to next provider.
                         }
-
-                        tracing::warn!(
-                            "Streaming provider {} attempt {}/{} failed: {}",
-                            provider.name(),
-                            attempt + 1,
-                            self.max_retries,
-                            err
-                        );
-                        last_error = Some(err);
-
-                        if attempt + 1 < self.max_retries {
-                            let base = Duration::from_secs(1 << attempt);
-                            let jittered = Self::jitter(base);
-                            let remaining =
-                                self.max_total_duration.saturating_sub(start.elapsed());
-                            let sleep_for = jittered.min(remaining);
-                            if sleep_for.is_zero() {
-                                break;
-                            }
-                            tokio::time::sleep(sleep_for).await;
+                        FailoverAction::NextProvider => {
+                            tracing::warn!(
+                                "Streaming provider {} can't serve request ({}); trying next",
+                                provider.name(),
+                                err
+                            );
+                            last_error = Some(err);
+                            break;
                         }
-                    }
+                        FailoverAction::Abort => {
+                            return Err(err);
+                        }
+                        FailoverAction::Retry => {
+                            tracing::warn!(
+                                "Streaming provider {} attempt {}/{} failed: {}",
+                                provider.name(),
+                                attempt + 1,
+                                self.max_retries,
+                                err
+                            );
+                            last_error = Some(err);
+
+                            if attempt + 1 < self.max_retries {
+                                let base = Duration::from_secs(1 << attempt);
+                                let jittered = Self::jitter(base);
+                                let remaining =
+                                    self.max_total_duration.saturating_sub(start.elapsed());
+                                let sleep_for = jittered.min(remaining);
+                                if sleep_for.is_zero() {
+                                    break;
+                                }
+                                tokio::time::sleep(sleep_for).await;
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -331,18 +383,20 @@ mod tests {
     }
 
     #[test]
-    fn is_rate_limit_error_matches_common_phrasings() {
-        assert!(ReliableProvider::is_rate_limit_error(&anyhow::anyhow!(
-            "HTTP 429 Too Many Requests"
-        )));
-        assert!(ReliableProvider::is_rate_limit_error(&anyhow::anyhow!(
-            "rate limit exceeded on tier 1"
-        )));
-        assert!(ReliableProvider::is_rate_limit_error(&anyhow::anyhow!(
-            "RATE LIMIT"
-        )));
-        assert!(!ReliableProvider::is_rate_limit_error(&anyhow::anyhow!(
-            "service unavailable"
-        )));
+    fn failover_action_maps_errors_correctly() {
+        let act = |s: &str| ReliableProvider::failover_action(&anyhow::anyhow!("{}", s));
+        // Throttled / overloaded → cooldown + rotate.
+        assert_eq!(act("HTTP 429 Too Many Requests"), FailoverAction::Cooldown);
+        assert_eq!(act("Anthropic API error (529): overloaded"), FailoverAction::Cooldown);
+        // Can't-serve-here → next provider, no retry.
+        assert_eq!(act("OpenAI API error (401): invalid api key"), FailoverAction::NextProvider);
+        // Pointless to retry or fail over.
+        assert_eq!(
+            act("API error (400): prompt is too long: too many tokens"),
+            FailoverAction::Abort
+        );
+        // Transient → retry.
+        assert_eq!(act("API error (500): internal server error"), FailoverAction::Retry);
+        assert_eq!(act("error sending request: connection reset"), FailoverAction::Retry);
     }
 }

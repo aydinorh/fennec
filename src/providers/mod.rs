@@ -11,6 +11,7 @@ pub mod aws_sigv4;
 pub mod bedrock;
 pub mod copilot;
 pub mod ollama;
+pub mod error_classifier;
 pub mod reliable;
 pub mod router;
 pub mod auxiliary;
