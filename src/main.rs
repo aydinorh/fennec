@@ -3748,20 +3748,67 @@ async fn run_gateway(
                 // gateway HTTP /chat — which also takes agent.lock() —
                 // doesn't serialize behind a finished agent's outbound
                 // publish.
+                //
+                // The turn runs under a wall-clock timeout: a hung
+                // provider call (network black hole, provider outage)
+                // would otherwise hold the agent mutex forever and
+                // freeze every channel. The gateway HTTP path has its
+                // own 600s request timeout; this bus path had none.
+                // Cron-sourced messages honour FENNEC_CRON_TIMEOUT,
+                // everything else FENNEC_TURN_TIMEOUT_SECS (both
+                // default 600s; 0 disables). The timeout covers only
+                // the turn, not the lock wait, so queued messages
+                // behind a slow turn don't mis-report as timed out.
+                // On expiry the in-flight provider future is dropped
+                // (request cancelled); the agent's history may keep
+                // the user message without an assistant reply — an
+                // accepted cost vs. a permanently frozen gateway.
+                let turn_timeout = resolve_turn_timeout(is_cron);
                 let turn_result = {
                     let mut agent_lock = agent.lock().await;
                     if is_cron {
+                        // Cron turn: protected-tool swap AROUND the
+                        // timeout-wrapped turn, so the restore always
+                        // runs — including on a timeout.
                         let prior = agent_lock.disabled_tool_names();
                         agent_lock.set_disabled_tools(
                             fennec::cron::safety::resolve_cron_disabled_tools(
                                 prior.iter().map(|s| s.as_str()),
                             ),
                         );
-                        let result = agent_lock.turn(&msg.content).await;
+                        let result = match turn_timeout {
+                            Some(limit) => {
+                                match tokio::time::timeout(limit, agent_lock.turn(&msg.content))
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => Err(anyhow::anyhow!(
+                                        "agent turn timed out after {}s — the provider call was cancelled. \
+                                         Set FENNEC_CRON_TIMEOUT to adjust (0 disables).",
+                                        limit.as_secs(),
+                                    )),
+                                }
+                            }
+                            None => agent_lock.turn(&msg.content).await,
+                        };
                         agent_lock.set_disabled_tools(prior);
                         result
                     } else {
-                        agent_lock.turn(&msg.content).await
+                        match turn_timeout {
+                            Some(limit) => {
+                                match tokio::time::timeout(limit, agent_lock.turn(&msg.content))
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => Err(anyhow::anyhow!(
+                                        "agent turn timed out after {}s — the provider call was cancelled. \
+                                         Set FENNEC_TURN_TIMEOUT_SECS to adjust (0 disables).",
+                                        limit.as_secs(),
+                                    )),
+                                }
+                            }
+                            None => agent_lock.turn(&msg.content).await,
+                        }
                     }
                 };
                 match turn_result {
@@ -4025,6 +4072,65 @@ async fn run_gateway(
     dispatch_handle.abort();
 
     Ok(())
+}
+
+/// Resolve the wall-clock timeout for one bus-driven agent turn.
+///
+/// Cron-fired turns read `FENNEC_CRON_TIMEOUT` (mirrors the upstream's
+/// cron kill switch); user-initiated turns read
+/// `FENNEC_TURN_TIMEOUT_SECS`. Both default to 600 seconds — matching
+/// the gateway HTTP path's request timeout — and `0` (or any
+/// unparseable value being absent) disables the limit entirely.
+fn resolve_turn_timeout(is_cron: bool) -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 600;
+    let var = if is_cron {
+        "FENNEC_CRON_TIMEOUT"
+    } else {
+        "FENNEC_TURN_TIMEOUT_SECS"
+    };
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod turn_timeout_tests {
+    use super::resolve_turn_timeout;
+
+    /// Env-mutating tests serialize through a lock to avoid races with
+    /// parallel test threads.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn defaults_to_600s_for_both_paths() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("FENNEC_CRON_TIMEOUT");
+            std::env::remove_var("FENNEC_TURN_TIMEOUT_SECS");
+        }
+        assert_eq!(
+            resolve_turn_timeout(false).map(|d| d.as_secs()),
+            Some(600)
+        );
+        assert_eq!(resolve_turn_timeout(true).map(|d| d.as_secs()), Some(600));
+    }
+
+    #[test]
+    fn zero_disables_and_env_overrides() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("FENNEC_TURN_TIMEOUT_SECS", "0");
+            std::env::set_var("FENNEC_CRON_TIMEOUT", "120");
+        }
+        assert_eq!(resolve_turn_timeout(false), None);
+        assert_eq!(resolve_turn_timeout(true).map(|d| d.as_secs()), Some(120));
+        unsafe {
+            std::env::remove_var("FENNEC_TURN_TIMEOUT_SECS");
+            std::env::remove_var("FENNEC_CRON_TIMEOUT");
+        }
+    }
 }
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM and log which one fired.
