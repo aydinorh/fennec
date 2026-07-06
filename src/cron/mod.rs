@@ -455,6 +455,15 @@ async fn process_due_job(
     }
 
     // 6b. Agent path: publish the composite prompt to the bus.
+    //
+    // Per-job overrides (model / provider / base_url / enabled_toolsets
+    // / workdir / profile) ride along in the message metadata under
+    // `cron_override_<field>` keys. Downstream agent consumers can read
+    // them to reconfigure the agent per-message — Fennec's current
+    // gateway loop uses a shared `Arc<Mutex<Agent>>` and doesn't honour
+    // these yet (cross-subsystem follow-up), but the data is in place
+    // so wiring it is a read-from-metadata change rather than a
+    // protocol change.
     let msg = InboundMessage {
         id: uuid::Uuid::new_v4().to_string(),
         sender: format!("cron:{}", job_id),
@@ -473,6 +482,30 @@ async fn process_due_job(
             let mut m = HashMap::new();
             m.insert("source".to_string(), "cron".to_string());
             m.insert("cron_job_id".to_string(), job_id.clone());
+            if let Some(model) = &job.model {
+                m.insert("cron_override_model".to_string(), model.clone());
+            }
+            if let Some(provider) = &job.provider {
+                m.insert("cron_override_provider".to_string(), provider.clone());
+            }
+            if let Some(base_url) = &job.base_url {
+                m.insert("cron_override_base_url".to_string(), base_url.clone());
+            }
+            if let Some(toolsets) = &job.enabled_toolsets {
+                // Comma-joined — agents that consume this should split
+                // on `,` and trim. Matches the upstream's habit of
+                // serialising small lists through env vars.
+                m.insert(
+                    "cron_override_enabled_toolsets".to_string(),
+                    toolsets.join(","),
+                );
+            }
+            if let Some(workdir) = &job.workdir {
+                m.insert("cron_override_workdir".to_string(), workdir.clone());
+            }
+            if let Some(profile) = &job.profile {
+                m.insert("cron_override_profile".to_string(), profile.clone());
+            }
             m
         },
     };
@@ -518,6 +551,12 @@ mod tests {
             script: None,
             no_agent: false,
             context_from: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            enabled_toolsets: None,
+            workdir: None,
+            profile: None,
         }
     }
 
@@ -1089,6 +1128,90 @@ mod tests {
             "original command must remain in the prompt: {}",
             msg.content
         );
+    }
+
+    #[tokio::test]
+    async fn per_job_overrides_propagate_via_metadata() {
+        // A cron job with model/provider/base_url/enabled_toolsets/
+        // workdir/profile overrides set must surface those values in
+        // the published InboundMessage's metadata so downstream agent
+        // consumers can read + apply them.
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut j = job("with_overrides", "every 1m", None, Some(&past));
+        j.model = Some("claude-sonnet-4-6".to_string());
+        j.provider = Some("anthropic".to_string());
+        j.base_url = Some("https://api.example.com".to_string());
+        j.enabled_toolsets = Some(vec!["filesystem".to_string(), "web".to_string()]);
+        j.workdir = Some(workdir.to_string_lossy().to_string());
+        j.profile = Some("alt-profile".to_string());
+        store.add_job(j);
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("should publish");
+        assert_eq!(
+            msg.metadata.get("cron_override_model").map(|s| s.as_str()),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            msg.metadata.get("cron_override_provider").map(|s| s.as_str()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            msg.metadata.get("cron_override_base_url").map(|s| s.as_str()),
+            Some("https://api.example.com")
+        );
+        assert_eq!(
+            msg.metadata
+                .get("cron_override_enabled_toolsets")
+                .map(|s| s.as_str()),
+            Some("filesystem,web")
+        );
+        assert_eq!(
+            msg.metadata.get("cron_override_workdir").map(|s| s.as_str()),
+            Some(workdir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            msg.metadata.get("cron_override_profile").map(|s| s.as_str()),
+            Some("alt-profile")
+        );
+    }
+
+    #[tokio::test]
+    async fn job_without_overrides_has_no_override_metadata() {
+        // Make sure we don't accidentally emit empty/sentinel override
+        // keys for jobs that never set them — downstream consumers
+        // should see only the core `source` + `cron_job_id` keys.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = JobStore::new(tmp.path().join("jobs.json"));
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        store.add_job(job("plain", "every 1m", None, Some(&past)));
+
+        let (bus, mut rx) = MessageBus::new(16);
+        let mut scheduler = CronScheduler::new(store, bus, Some(30));
+        scheduler.tick().await;
+
+        let msg = rx.inbound_rx.try_recv().expect("should publish");
+        for key in [
+            "cron_override_model",
+            "cron_override_provider",
+            "cron_override_base_url",
+            "cron_override_enabled_toolsets",
+            "cron_override_workdir",
+            "cron_override_profile",
+        ] {
+            assert!(
+                !msg.metadata.contains_key(key),
+                "metadata must not contain {key} for a job that didn't set it"
+            );
+        }
     }
 
     #[cfg(unix)]

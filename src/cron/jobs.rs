@@ -94,6 +94,41 @@ pub struct CronJob {
     /// chars to avoid prompt bloat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_from: Option<Vec<String>>,
+    /// Per-job model override (e.g. `"claude-sonnet-4-6"`). When set,
+    /// the downstream agent consumer should run this job under the
+    /// named model instead of the global default. Mirrors upstream's
+    /// `create_job(..., model=...)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Per-job provider override (e.g. `"anthropic"`, `"openrouter"`).
+    /// Mirrors upstream's `create_job(..., provider=...)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Per-job base URL override for the provider (e.g. a proxy
+    /// endpoint). Trailing slashes are stripped at create time.
+    /// Mirrors upstream's `create_job(..., base_url=...)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Per-job toolset allowlist. When `Some`, the agent consumer
+    /// loads only tools from these toolsets — reduces token overhead
+    /// and lets a watchdog job avoid expensive / interactive tools.
+    /// Mirrors upstream's `enabled_toolsets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_toolsets: Option<Vec<String>>,
+    /// Per-job working directory (absolute path). When set, the job
+    /// runs as if launched from that directory: project context files
+    /// (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are injected into
+    /// the system prompt, and the terminal/file/code-exec tools use
+    /// it as their working directory. Validated at create time
+    /// ([`normalize_workdir`]). Mirrors upstream's `workdir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Per-job Fennec profile name. When set, the job runs under
+    /// that profile's `FENNEC_HOME` so profile-specific config,
+    /// credentials, scripts, skills, and memory paths resolve
+    /// consistently. Mirrors upstream's `profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl CronJob {
@@ -152,6 +187,12 @@ pub struct JobUpdates {
     pub script: Option<Option<String>>,
     pub no_agent: Option<bool>,
     pub context_from: Option<Option<Vec<String>>>,
+    pub model: Option<Option<String>>,
+    pub provider: Option<Option<String>>,
+    pub base_url: Option<Option<String>>,
+    pub enabled_toolsets: Option<Option<Vec<String>>>,
+    pub workdir: Option<Option<String>>,
+    pub profile: Option<Option<String>>,
 }
 
 /// Error returned by [`JobStore::resolve_job_ref`] when a name matches
@@ -415,6 +456,24 @@ impl JobStore {
             }
             if let Some(context_from) = updates.context_from {
                 job.context_from = context_from;
+            }
+            if let Some(model) = updates.model {
+                job.model = model;
+            }
+            if let Some(provider) = updates.provider {
+                job.provider = provider;
+            }
+            if let Some(base_url) = updates.base_url {
+                job.base_url = base_url;
+            }
+            if let Some(enabled_toolsets) = updates.enabled_toolsets {
+                job.enabled_toolsets = enabled_toolsets;
+            }
+            if let Some(workdir) = updates.workdir {
+                job.workdir = workdir;
+            }
+            if let Some(profile) = updates.profile {
+                job.profile = profile;
             }
         }
 
@@ -1016,6 +1075,100 @@ pub fn schedule_display_for(schedule: &str) -> String {
 }
 
 // =============================================================================
+// Per-job override validation
+// =============================================================================
+
+/// Validate + canonicalise a per-job workdir override.
+///
+/// Rules (mirror the upstream's `_normalize_workdir`):
+/// - `None` / empty / whitespace ⇒ `Ok(None)` (feature off — preserves
+///   the no-workdir behaviour).
+/// - `~` is expanded; relative paths are rejected because cron jobs run
+///   detached from any shell cwd, so a relative path has no stable
+///   meaning at fire time.
+/// - The path must exist and be a directory at create/update time. We
+///   intentionally do NOT re-check at run time — a temporarily
+///   unmounted directory should log a warning downstream rather than
+///   prevent scheduling.
+pub fn normalize_workdir(workdir: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = workdir else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // Manual `~` expansion: keep this dep-free. Anything more complex
+    // (`~user`, env-var substitution) is rejected as ambiguous.
+    let expanded: std::path::PathBuf = if let Some(stripped) = trimmed.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cron workdir uses ~ but HOME is not set; pass an absolute path"
+                )
+            })?;
+        home.join(stripped)
+    } else if trimmed == "~" {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("cron workdir is ~ but HOME is not set"))?
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+
+    if !expanded.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "cron workdir must be an absolute path (got {:?}). \
+             Cron jobs run detached from any shell cwd, so relative paths are ambiguous.",
+            raw
+        ));
+    }
+    let resolved = expanded
+        .canonicalize()
+        .with_context(|| format!("cron workdir does not exist: {}", expanded.display()))?;
+    if !resolved.is_dir() {
+        return Err(anyhow::anyhow!(
+            "cron workdir is not a directory: {}",
+            resolved.display()
+        ));
+    }
+    Ok(Some(resolved.to_string_lossy().to_string()))
+}
+
+/// Normalise an optional per-job string override: trim, return `None`
+/// for empty. Trailing slashes are stripped if `strip_trailing_slash`
+/// is set (use for `base_url`).
+pub fn normalize_optional_str(value: Option<&str>, strip_trailing_slash: bool) -> Option<String> {
+    let raw = value?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if strip_trailing_slash {
+        Some(trimmed.trim_end_matches('/').to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Normalise a per-job string-list override: trim each entry, drop
+/// empties, return `None` for an empty result.
+pub fn normalize_optional_list(value: Option<&[String]>) -> Option<Vec<String>> {
+    let raw = value?;
+    let cleaned: Vec<String> = raw
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+// =============================================================================
 // Secure filesystem helpers
 // =============================================================================
 
@@ -1172,6 +1325,87 @@ mod tests {
     }
 
     #[test]
+    fn normalize_workdir_handles_empty_and_missing() {
+        assert_eq!(normalize_workdir(None).unwrap(), None);
+        assert_eq!(normalize_workdir(Some("")).unwrap(), None);
+        assert_eq!(normalize_workdir(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_workdir_rejects_relative_paths() {
+        let err = normalize_workdir(Some("relative/path")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absolute"),
+            "expected absolute-path error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn normalize_workdir_rejects_nonexistent_dir() {
+        let err = normalize_workdir(Some("/this/definitely/does/not/exist/anywhere")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist") || msg.contains("No such"),
+            "expected does-not-exist error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn normalize_workdir_accepts_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+        let resolved = normalize_workdir(Some(&path_str)).unwrap().unwrap();
+        // canonicalize may add /private on macOS for /tmp paths; compare
+        // resolved-against-resolved instead of substring matching.
+        let expected = tmp.path().canonicalize().unwrap();
+        assert_eq!(std::path::PathBuf::from(&resolved), expected);
+    }
+
+    #[test]
+    fn normalize_workdir_rejects_file_not_dir() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let err = normalize_workdir(Some(&tmp.path().to_string_lossy())).unwrap_err();
+        assert!(err.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn normalize_optional_str_trims_and_strips_slash() {
+        assert_eq!(normalize_optional_str(None, false), None);
+        assert_eq!(normalize_optional_str(Some(""), false), None);
+        assert_eq!(normalize_optional_str(Some("  "), false), None);
+        assert_eq!(
+            normalize_optional_str(Some(" claude-opus "), false),
+            Some("claude-opus".to_string())
+        );
+        // base_url trailing-slash strip.
+        assert_eq!(
+            normalize_optional_str(Some("https://api.example.com/"), true),
+            Some("https://api.example.com".to_string())
+        );
+        assert_eq!(
+            normalize_optional_str(Some("https://api.example.com///"), true),
+            Some("https://api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_optional_list_trims_and_drops_empties() {
+        let input = vec![
+            "  filesystem  ".to_string(),
+            "".to_string(),
+            "web".to_string(),
+            "   ".to_string(),
+        ];
+        let out = normalize_optional_list(Some(&input)).unwrap();
+        assert_eq!(out, vec!["filesystem".to_string(), "web".to_string()]);
+        // All-empty input collapses to None.
+        let all_empty = vec!["".to_string(), "   ".to_string()];
+        assert_eq!(normalize_optional_list(Some(&all_empty)), None);
+        assert_eq!(normalize_optional_list(None), None);
+    }
+
+    #[test]
     fn schedule_kind_is_one_shot_classification() {
         assert!(!ScheduleKind::Recurring { interval_secs: 60 }.is_one_shot());
         assert!(ScheduleKind::OneShot { delay_secs: 60 }.is_one_shot());
@@ -1235,6 +1469,12 @@ mod tests {
             script: None,
             no_agent: false,
             context_from: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            enabled_toolsets: None,
+            workdir: None,
+            profile: None,
         });
         store.save().unwrap();
         // After a clean save, the parent directory must contain exactly
@@ -1310,6 +1550,12 @@ mod tests {
             script: None,
             no_agent: false,
             context_from: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            enabled_toolsets: None,
+            workdir: None,
+            profile: None,
         });
         store.save().unwrap();
 

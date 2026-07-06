@@ -72,6 +72,12 @@ fn sample_job(id: &str, name: &str, schedule: &str) -> CronJob {
         script: None,
         no_agent: false,
         context_from: None,
+        model: None,
+        provider: None,
+        base_url: None,
+        enabled_toolsets: None,
+        workdir: None,
+        profile: None,
     }
 }
 

@@ -150,14 +150,22 @@ impl CronTool {
             paused_reason: None,
             repeat: RepeatConfig::default(),
             schedule_display: schedule_display_for(&schedule_str),
-            // Per-job script / no_agent / context_from are tool-surface
-            // parameters added in the cron_tool expansion PR; for now
-            // jobs created via this path default to plain agent-prompt
-            // execution. Hand-edited jobs.json that set these fields
-            // load correctly because of the serde defaults on CronJob.
+            // Per-job script / no_agent / context_from / model /
+            // provider / base_url / enabled_toolsets / workdir /
+            // profile are agent-facing parameters surfaced in the
+            // cron_tool expansion PR; for now jobs created via this
+            // path default to plain agent-prompt execution.
+            // Hand-edited jobs.json that sets any of these loads
+            // correctly because of the serde defaults on CronJob.
             script: None,
             no_agent: false,
             context_from: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            enabled_toolsets: None,
+            workdir: None,
+            profile: None,
         };
 
         let mut store = self.load_store()?;
